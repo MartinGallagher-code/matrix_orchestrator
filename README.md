@@ -247,6 +247,35 @@ convoy on the GIL and make it *worse*. The same work in four processes
 runs at 1.09M pps. Watch the `agent` column in `mx summarize`; as it
 approaches 100% that worker is saturated.
 
+### One core pegged while the rest of the box idles
+
+Workers can never outnumber flows, and by default a pair is **one socket,
+one 4-tuple**. Everything that spreads load downstream — our workers, the
+NIC's receive queues, the fabric's ECMP hash — does it by hashing that
+tuple. So a mesh with 3 peers puts 3 cores to work no matter how many the
+box has, and those cores sit at 100% while the rest idle.
+
+`--streams N` gives each pair N sockets instead of one. The pair's packet
+rate is **split** across them, so the offered load is identical; what
+changes is that there are now N times as many tuples to spread. Measured
+on 4 workers with one peer, unpaced:
+
+| `--streams` | workers used | achieved | busiest worker |
+|---|---|---|---|
+| 1 | 2 | 203.8 kpps | **100% of a core** |
+| 4 | 4 | 323.2 kpps | 51% |
+| 8 | 4 | 359.5 kpps | 56% |
+
+So the recipe for a big box against a small mesh is to raise both:
+
+```bash
+mx start --streams 8 --workers 32
+```
+
+`mx summarize` detects this case by itself — when a worker is pegged and
+the worker count is already at the flow-count cap, it says so and names
+the flag.
+
 ---
 
 ## Leaving no trace
@@ -283,6 +312,9 @@ mx gen --servers servers.txt --gbps 10 --tx-size 1400
 # Pin everything to one NIC (interface name or address, both work)
 mx start --bind eth1
 
+# The complete flag reference, generated from the real parsers
+mx help
+
 # Watch it live
 mx status --watch 5
 
@@ -294,7 +326,29 @@ Every fleet command takes `--user`, `--jobs`, `--remote-dir`, `--python`
 and `--dry-run`; each has an `MX_*` environment variable
 (`MX_USER`, `MX_JOBS`, `MX_REMOTE_DIR`, `MX_PYTHON`, `MX_MATRIX`,
 `MX_SERVERS`, `MX_REPORTS`). `--dry-run` prints the ssh and scp commands
-instead of running them.
+instead of running them. `mx help` prints every switch of every command
+on one page.
+
+### How `--bind` really works (the two-NIC case)
+
+Fleets usually have a management NIC (the addresses in `servers.txt`,
+where ssh goes) and a data NIC (the one you want to load). Binding the
+local sockets to the data NIC is only half the job: the *destinations*
+have to be the peers' data-NIC addresses too, or every request goes to
+an address nobody is listening on and the run reports 100% loss that has
+nothing to do with the network.
+
+So `mx start --bind eth1` does both halves, the same way
+`iperf-orchestrator` does: it resolves the pattern **on every host over
+ssh** (substring match against that host's `ip -o -4 addr show`), then
+deploys a matrix retargeted at those data-plane addresses — ssh keeps
+using the login addresses, the traffic rides the bound NIC end to end.
+If any host has no matching interface, `start` aborts up front and names
+the hosts, before launching a mesh that cannot work.
+
+A hand-run `mx agent --bind ...` whose bound address does not match what
+the matrix tells peers refuses to start, with the explanation, instead
+of running a guaranteed-100%-loss test.
 
 ---
 

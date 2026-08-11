@@ -185,6 +185,73 @@ test_a_matrix_by_another_name_is_still_deployed_as_matrix_csv() {
     run_mx stop --matrix custom.csv
 }
 
+test_streams_and_workers_reach_the_remote_agents() {
+    # Runtime knobs have to survive the trip through ssh into the agent
+    # command line, or they silently do nothing on the fleet.
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    run_mx start --interval 2 --duration 20 --workers 3 --streams 4
+    assert_status 0 "$RUN_RC" || return 1
+    local sent; sent=$(grep -c -- "--streams 4" "$FAKE_ROOT/calls.log")
+    [ "$sent" -ge 1 ] || { echo "--streams never reached the hosts" >&2; return 1; }
+    sleep 4
+    run_mx logs
+    assert_contains "$(cat logs/alpha.log)" "streams=4" \
+        "the agent should report the stream count it was given" || return 1
+    assert_contains "$(cat logs/alpha.log)" "workers=3" || return 1
+    run_mx stop
+}
+
+test_bind_retargets_the_matrix_at_data_plane_addresses() {
+    # The two-NIC trap: the server list carries login addresses, --bind
+    # names the data NIC. start must probe each host's data-plane IP over
+    # ssh and retarget the deployed matrix at those, or every request
+    # goes to an address nobody listens on (100% loss). Here the "login"
+    # addresses are 127.0.0.x and each host's "eth1" is 127.0.1.x --
+    # both loopback, so traffic on the retargeted addresses really flows.
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    cat > "$FAKE_BIN/ip" <<'EOF'
+#!/usr/bin/env bash
+# Per-host fake `ip -o -4 addr show`: eth0 carries the login address,
+# eth1 a distinct data-plane address derived from it.
+addr="${FAKE_HOST_ADDR:-127.0.0.1}"
+data="127.0.1.${addr##*.}"
+echo "2: eth0    inet ${addr}/8 scope global eth0"
+echo "3: eth1    inet ${data}/8 scope global eth1"
+EOF
+    chmod +x "$FAKE_BIN/ip"
+    run_mx start --interval 2 --duration 25 --bind eth1
+    assert_status 0 "$RUN_RC" "start with --bind should succeed" || return 1
+    assert_contains "$RUN_OUT" "retargeted" "start says what it did" || return 1
+    local deployed; deployed="$(cat "$(host_dir 127.0.0.1)/matrix.csv")"
+    assert_contains "$deployed" "127.0.1.1" \
+        "deployed matrix targets the data-plane IPs" || return 1
+    assert_contains "$deployed" "127.0.1.2" || return 1
+    assert_not_contains "$deployed" "alpha=127.0.0.1" \
+        "login addresses are gone from the deployed matrix" || return 1
+    # And the mesh actually carries traffic on those addresses.
+    sleep 5
+    run_mx status
+    assert_contains "$RUN_OUT" "tx=" || return 1
+    run_mx stop
+}
+
+test_bind_pattern_matching_no_host_fails_before_starting() {
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    cat > "$FAKE_BIN/ip" <<'EOF'
+#!/usr/bin/env bash
+echo "2: eth0    inet ${FAKE_HOST_ADDR:-127.0.0.1}/8 scope global eth0"
+EOF
+    chmod +x "$FAKE_BIN/ip"
+    run_mx start --interval 2 --bind eth9
+    assert_status 2 "$RUN_RC" "an unmatched bind pattern must abort" || return 1
+    assert_contains "$RUN_OUT" "matches no interface" || return 1
+    run_mx status
+    assert_contains "$RUN_OUT" "NOT-DEPLOYED" "nothing was deployed" || return 1
+}
+
+run_test test_bind_retargets_the_matrix_at_data_plane_addresses
+run_test test_bind_pattern_matching_no_host_fails_before_starting
+run_test test_streams_and_workers_reach_the_remote_agents
 run_test test_start_deploys_agent_and_matrix
 run_test test_start_returns_instead_of_hanging_on_the_agent
 run_test test_status_shows_running_then_not_running

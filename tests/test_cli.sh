@@ -104,6 +104,30 @@ test_summarize_without_reports_explains_itself() {
     assert_contains "$RUN_OUT" "mx status" "the error suggests the next step" || return 1
 }
 
+test_full_help_lists_every_switch_of_every_command() {
+    run_mx help
+    assert_status 0 "$RUN_RC" || return 1
+    # One flag from each shared group and each command-specific set: if
+    # any of these vanish from `mx help`, the reference has drifted.
+    local flag
+    for flag in --servers --pps --gbps --tx-size --rx-size --port --output \
+                --nic-gbps --nic-mpps --pps-per-host --gbps-per-host \
+                --matrix --user --jobs --remote-dir --python --dry-run \
+                --interval --duration --workers --streams --bind --sndbuf \
+                --rcvbuf --no-deploy --watch --reports --window --top \
+                --top-hosts --grid --no-collect --for --keep --yes --host \
+                --report; do
+        assert_contains "$RUN_OUT" "$flag" "mx help must document $flag" || return 1
+    done
+    # Every command appears as a usage line.
+    local c
+    for c in gen check hints start status summarize collect stop logs clean run doctor agent; do
+        assert_contains "$RUN_OUT" "usage: mx $c" "mx help covers $c" || return 1
+    done
+    assert_contains "$RUN_OUT" "MX_MATRIX" "env vars are listed" || return 1
+}
+
+run_test test_full_help_lists_every_switch_of_every_command
 run_test test_bare_invocation_points_somewhere
 run_test test_every_command_is_dispatchable_and_documented
 run_test test_version
