@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Martin J. Gallagher
+# Matrix generation, parsing, config-header round-tripping, and the
+# admissibility check.
+
+set -u
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=test_helper.bash
+source "$DIR/test_helper.bash"
+
+test_gen_writes_grid_with_config_header() {
+    write_servers 5300 alpha beta gamma > /dev/null
+    run_mx gen --servers servers.txt --pps 5000 --tx-size 128 --rx-size 512
+    assert_status 0 "$RUN_RC" "gen should succeed" || return 1
+    assert_file_exists matrix.csv || return 1
+    local m; m="$(cat matrix.csv)"
+    assert_contains "$m" "tx_size=128 rx_size=512" "config header carries sizes" || return 1
+    assert_contains "$m" "alpha=127.0.0.1:5300" "host tokens survive" || return 1
+    assert_contains "$m" "alpha=127.0.0.1:5300,,5000,5000" "diagonal is empty" || return 1
+    # The summary tells the operator what they just asked for.
+    assert_contains "$RUN_OUT" "128 bytes out -> 512 bytes back" || return 1
+    assert_contains "$RUN_OUT" "per pair" || return 1
+}
+
+test_gen_max_writes_unpaced_cells() {
+    write_servers 5300 a b > /dev/null
+    run_mx gen --servers servers.txt --pps max
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$(cat matrix.csv)" ",max" "unpaced cells say max" || return 1
+    assert_contains "$RUN_OUT" "unpaced" || return 1
+}
+
+test_gen_gbps_sizes_the_rate() {
+    write_servers 5300 a b c > /dev/null
+    # 1 Gbps of 1400-byte requests per host, over 2 peers:
+    #   1e9 / ((1400+66)*8) = 85266 pps per host = 42633 per pair.
+    run_mx gen --servers servers.txt --gbps 1 --tx-size 1400
+    assert_status 0 "$RUN_RC" || return 1
+    local cell; cell=$(grep -v '^#' matrix.csv | sed -n '2p' | cut -d, -f3)
+    assert_between 42000 43300 "$cell" "per-pair rate from --gbps" || return 1
+}
+
+test_gen_rejects_impossible_sizes() {
+    write_servers 5300 a b > /dev/null
+    run_mx gen --servers servers.txt --pps 100 --tx-size 8
+    assert_status 2 "$RUN_RC" "a packet smaller than the header is refused" || return 1
+    assert_contains "$RUN_OUT" "must be between" || return 1
+    run_mx gen --servers servers.txt --pps 100 --rx-size 999999
+    assert_status 2 "$RUN_RC" "a packet bigger than a datagram is refused" || return 1
+    run_mx gen --servers servers.txt --pps 0
+    assert_status 2 "$RUN_RC" "--pps 0 would mean no flows at all" || return 1
+}
+
+test_gen_needs_two_servers() {
+    printf 'lonely\n' > servers.txt
+    run_mx gen --servers servers.txt --pps 100
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "at least 2 servers" || return 1
+}
+
+test_gen_rejects_duplicate_servers() {
+    printf 'a\nb\na\n' > servers.txt
+    run_mx gen --servers servers.txt --pps 100
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "duplicate" || return 1
+}
+
+test_hand_edited_matrix_round_trips() {
+    # A blanked cell removes that flow; the rest survive. This is the
+    # documented way to shape a run, so it has to keep working.
+    cat > matrix.csv <<'EOF'
+# tx_size=64 rx_size=64 port=5300
+src\dst,a,b,c
+a,,100,200
+b,,,300
+c,400,,
+EOF
+    run_mx check
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "3 hosts, 4 flows" "blank cells drop flows" || return 1
+}
+
+test_check_flags_over_capacity() {
+    write_servers 5300 a b c > /dev/null
+    run_mx gen --servers servers.txt --pps 100000 --tx-size 1400
+    run_mx check --nic-gbps 100
+    assert_status 0 "$RUN_RC" "generous cap is admissible" || return 1
+    assert_contains "$RUN_OUT" "admissible against the caps" || return 1
+    run_mx check --nic-gbps 1
+    assert_status 1 "$RUN_RC" "tight cap must fail" || return 1
+    assert_contains "$RUN_OUT" "OVER CAPACITY" || return 1
+    assert_contains "$RUN_OUT" "fix it" "a failure says what to do about it" || return 1
+    run_mx check --nic-mpps 0.05
+    assert_status 1 "$RUN_RC" "packet-rate cap is checked too" || return 1
+    assert_contains "$RUN_OUT" "NIC packet rate" || return 1
+}
+
+test_check_counts_both_directions() {
+    # Every request out is a reply back, so a host's ingress load is not
+    # just what the matrix column says.
+    write_servers 5300 a b > /dev/null
+    run_mx gen --servers servers.txt --pps 1000 --tx-size 100 --rx-size 100
+    run_mx check
+    assert_status 0 "$RUN_RC" || return 1
+    # 1000 pps out + 1000 pps in = 2000 packets/s touching the NIC.
+    assert_contains "$RUN_OUT" "2.0 kpps" || return 1
+}
+
+test_missing_matrix_says_how_to_make_one() {
+    run_mx check
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "matrix not found" || return 1
+    assert_contains "$RUN_OUT" "mx gen" "the error names the fix" || return 1
+}
+
+test_bad_cell_is_reported_with_its_location() {
+    cat > matrix.csv <<'EOF'
+src\dst,a,b
+a,,banana
+b,10,
+EOF
+    run_mx check
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "a -> b" "the error points at the cell" || return 1
+}
+
+run_test test_gen_writes_grid_with_config_header
+run_test test_gen_max_writes_unpaced_cells
+run_test test_gen_gbps_sizes_the_rate
+run_test test_gen_rejects_impossible_sizes
+run_test test_gen_needs_two_servers
+run_test test_gen_rejects_duplicate_servers
+run_test test_hand_edited_matrix_round_trips
+run_test test_check_flags_over_capacity
+run_test test_check_counts_both_directions
+run_test test_missing_matrix_says_how_to_make_one
+run_test test_bad_cell_is_reported_with_its_location
+report_tests
