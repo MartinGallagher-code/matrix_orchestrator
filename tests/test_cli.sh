@@ -127,6 +127,21 @@ test_full_help_lists_every_switch_of_every_command() {
     assert_contains "$RUN_OUT" "MX_MATRIX" "env vars are listed" || return 1
 }
 
+test_version_is_bumped_and_consistent_everywhere() {
+    # The check-in rule: every release-worthy change bumps the version,
+    # and the three places it lives must agree -- the tool itself, the
+    # package metadata, and the changelog.
+    run_mx --version
+    assert_status 0 "$RUN_RC" || return 1
+    local v; v=$(printf '%s' "$RUN_OUT" | sed -n 's/^mx \([0-9][0-9.]*\)$/\1/p')
+    [ -n "$v" ] || { echo "cannot parse version from: $RUN_OUT" >&2; return 1; }
+    assert_contains "$(grep '^version' "$REPO_ROOT/pyproject.toml")" "\"$v\"" \
+        "pyproject.toml must carry $v" || return 1
+    assert_contains "$(cat "$REPO_ROOT/CHANGELOG.md")" "[$v]" \
+        "CHANGELOG.md must have an entry for $v" || return 1
+}
+
+run_test test_version_is_bumped_and_consistent_everywhere
 run_test test_full_help_lists_every_switch_of_every_command
 run_test test_bare_invocation_points_somewhere
 run_test test_every_command_is_dispatchable_and_documented

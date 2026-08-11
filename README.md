@@ -190,6 +190,35 @@ block a congested pair of leaves.
 
 ---
 
+## Equal load without the full mesh (`--peers`)
+
+"All-to-all" usually means two separable things: every host carries the
+same sustained load, and every layer of the fabric is exercised. Neither
+requires every host to talk to every other host.
+
+`mx gen --peers K` builds a **k-regular shuffle**: each host sends to
+and receives from exactly K randomly-chosen others. The balance is by
+construction, not statistical — the graph is K superimposed
+permutations, so every host has exactly K flows out and K in at the same
+rate, all held continuously and simultaneously, just like the full mesh.
+With equal-size racks a random shuffle sends the vast majority of flows
+across spine and superspine, so the fabric aggregate is the same too.
+
+What changes is the machinery: K sockets per host instead of N−1, per
+flow rates fat enough to pace cleanly, reports K rows per interval
+instead of a thousand. At high per-host packet rates on a big fleet,
+sparse is not a compromise — it is the only shape that sustains cleanly.
+
+The shuffle is seeded and replayable (`--seed`, also stored in the
+matrix header). Path coverage through ECMP is the one statistical part:
+raise `--streams` to multiply the 4-tuples per flow, and run successive
+soaks with different seeds to re-roll every path.
+
+```bash
+mx gen --servers servers.txt --peers 8 --pps 250000 --seed 42
+mx start --streams 4 --workers auto
+```
+
 ## Finding the limit
 
 Raise the rate until delivery stops keeping up:
@@ -305,6 +334,11 @@ mx start --workers auto
 
 # RPC-shaped: small ask, large answer
 mx gen --servers servers.txt --pps 5000 --tx-size 128 --rx-size 8192
+
+# Sustained equal load on every host without the full mesh: each host
+# talks to exactly 8 shuffled peers -- identical per-host load, held
+# continuously, with 8 sockets instead of N-1 (seed printed, replayable)
+mx gen --servers servers.txt --peers 8 --pps 100000
 
 # Size the rate from a bandwidth budget instead of a packet rate
 mx gen --servers servers.txt --gbps 10 --tx-size 1400

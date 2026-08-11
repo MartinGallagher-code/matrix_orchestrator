@@ -40,6 +40,7 @@ import argparse
 import csv
 import multiprocessing
 import os
+import random
 import shlex
 import shutil
 import signal
@@ -53,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -261,7 +262,8 @@ def load_matrix(path):
     return Matrix(path, hosts, addrs, ports, rates, tx_size, rx_size, port)
 
 
-def write_matrix(path, tokens, cell_for, tx_size, rx_size, port):
+def write_matrix(path, tokens, cell_for, tx_size, rx_size, port,
+                 extra_comment=""):
     """Write a matrix CSV with the run config in its header comment."""
     names = [parse_token(t)[0] for t in tokens]
     out = sys.stdout if path == "-" else open(path, "w", newline="")
@@ -271,6 +273,8 @@ def write_matrix(path, tokens, cell_for, tx_size, rx_size, port):
         out.write("# tx_size=%d rx_size=%d port=%d\n" % (tx_size, rx_size, port))
         out.write("# every request of %d bytes is answered with a reply of %d bytes\n"
                   % (tx_size, rx_size))
+        if extra_comment:
+            out.write(extra_comment)
         w = csv.writer(out)
         w.writerow(["src\\dst"] + tokens)
         for si, stok in enumerate(tokens):
@@ -1426,11 +1430,48 @@ def read_server_list(path):
     return hosts
 
 
+def sparse_edges(n, k, seed):
+    """The flow set for --peers: a k-regular random digraph as k rounds of
+    a shifted permutation.
+
+    Relabel the hosts by one random permutation p, then round r sends
+    p[i] -> p[(i + shift_r) % n] with k distinct nonzero shifts. Every
+    round is a permutation, so after k rounds every host has EXACTLY k
+    flows out and k in -- the equal-load property is by construction, not
+    statistical. Distinct shifts on one relabeling can never produce a
+    duplicate edge or a self-loop, and the whole thing replays from the
+    seed.
+
+    Returns a set of (src_index, dst_index).
+    """
+    rng = random.Random(seed)
+    relabel = list(range(n))
+    rng.shuffle(relabel)
+    shifts = rng.sample(range(1, n), k)
+    edges = set()
+    for shift in shifts:
+        for i in range(n):
+            edges.add((relabel[i], relabel[(i + shift) % n]))
+    return edges
+
+
 def cmd_gen(args):
     tokens = read_server_list(args.servers)
     n = len(tokens)
     tx_size = check_size("--tx-size", args.tx_size)
     rx_size = check_size("--rx-size", args.rx_size)
+
+    peers = n - 1
+    edges = None
+    seed = None
+    if args.peers is not None:
+        if not 1 <= args.peers <= n - 1:
+            die("--peers must be between 1 and %d for %d hosts (got %d)"
+                % (n - 1, n, args.peers))
+        peers = args.peers
+        seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2 ** 32)
+        if peers < n - 1:
+            edges = sparse_edges(n, peers, seed)
 
     if args.pps is not None:
         cell = args.pps
@@ -1439,9 +1480,10 @@ def cmd_gen(args):
     elif args.gbps is not None:
         if args.gbps <= 0:
             die("--gbps must be greater than 0")
-        # Per-host egress budget in wire bits, split evenly across peers.
+        # Per-host egress budget in wire bits, split across its peers --
+        # fewer peers means fatter flows, same per-host total.
         per_host_pps = args.gbps * 1e9 / ((tx_size + WIRE_OVERHEAD) * 8.0)
-        cell = per_host_pps / (n - 1)
+        cell = per_host_pps / peers
     else:
         cell = 10000.0
 
@@ -1455,26 +1497,40 @@ def cmd_gen(args):
         text = "%.3f" % cell
 
     def cell_for(si, di):
-        return "" if si == di else text
+        if si == di:
+            return ""
+        if edges is not None and (si, di) not in edges:
+            return ""
+        return text
 
-    write_matrix(args.output, tokens, cell_for, tx_size, rx_size, args.port)
+    extra = ""
+    if args.peers is not None:
+        extra = ("# peers=%d seed=%d -- k-regular shuffle: every host sends to "
+                 "and receives from exactly %d others\n" % (peers, seed, peers))
+    write_matrix(args.output, tokens, cell_for, tx_size, rx_size, args.port,
+                 extra_comment=extra)
     if args.output == "-":
         return 0
 
+    nflows = n * peers
     log("wrote %s" % args.output)
     log("  %d hosts, %d flows, %d bytes out -> %d bytes back"
-        % (n, n * (n - 1), tx_size, rx_size))
+        % (n, nflows, tx_size, rx_size))
+    if edges is not None:
+        log("  shape    : k-regular shuffle, %d peers per host (seed %d -- "
+            "reuse --seed %d to replay)" % (peers, seed, seed))
     if cell == float("inf"):
         log("  rate: unpaced (send as fast as each host can)")
     else:
-        eg = cell * (n - 1)
+        eg = cell * peers
         log("  per pair : %s" % fmt_pps(cell))
-        log("  per host : %s out, %s back in" % (fmt_pps(eg), fmt_pps(eg)))
+        log("  per host : %s out, %s back in -- every host identical"
+            % (fmt_pps(eg), fmt_pps(eg)))
         log("             %s out on the wire (%s payload)"
             % (fmt_gbps(wire_bps(eg, tx_size)), fmt_gbps(payload_bps(eg, tx_size))))
         log("             %s back on the wire (%s payload)"
             % (fmt_gbps(wire_bps(eg, rx_size)), fmt_gbps(payload_bps(eg, rx_size))))
-        log("  fleet    : %s offered" % fmt_pps(cell * n * (n - 1)))
+        log("  fleet    : %s offered" % fmt_pps(cell * nflows))
     log("")
     log("next: mx check --nic-gbps 25     # will the NICs take it?")
     log("      mx start                   # deploy and run it")
@@ -2238,6 +2294,17 @@ mx hints -- what you want, and the command that gets it
       --grid g` writes the per-pair grids so you can see which pairs gave
       out first.
 
+  SUSTAINED EQUAL LOAD ON EVERY SERVER, WITHOUT THE FULL MESH
+    mx gen --servers servers.txt --peers 8 --pps 100000
+      Every host sends to and receives from exactly 8 randomly-shuffled
+      others -- all hosts loaded identically and simultaneously, held
+      until you stop it, exactly like the full mesh, but with 8 sockets
+      per host instead of N-1. At random nearly all flows cross the
+      spine, so the fabric still carries the same aggregate. The seed is
+      printed and stored in matrix.csv; re-run with --seed to replay the
+      same shuffle, or without it to re-roll every path. Combine with
+      --streams to multiply the ECMP tuples per flow.
+
   ONLY SOME PAIRS, OR DIFFERENT RATES PER PAIR
     mx gen ... then edit matrix.csv by hand.
       It is a plain grid: rows send, columns receive, cells are
@@ -2426,6 +2493,14 @@ def build_parser():
     rate.add_argument("--gbps", type=float,
                       help="per-host request bandwidth on the wire, split "
                            "evenly across peers")
+    g.add_argument("--peers", type=int, metavar="K",
+                   help="flows per host: each host sends to and receives from "
+                        "exactly K randomly-shuffled others instead of all "
+                        "N-1. Same per-host load, exactly, with K sockets "
+                        "instead of N-1 (default: full mesh)")
+    g.add_argument("--seed", type=int, metavar="N",
+                   help="replay a --peers shuffle (default: random, printed "
+                        "and stored in the matrix header)")
     g.add_argument("--tx-size", type=int, default=64, metavar="BYTES",
                    help="request size, %d-%d (default: %%(default)s)" % (HDR_SIZE, MAX_SIZE))
     g.add_argument("--rx-size", type=int, default=64, metavar="BYTES",

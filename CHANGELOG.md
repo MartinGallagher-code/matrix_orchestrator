@@ -9,6 +9,44 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.1.0] - 2026-08-11
+
+### Added
+
+- **`mx gen --peers K --seed N`**: sustained equal load without the full
+  mesh. Each host sends to and receives from exactly K randomly-shuffled
+  others — a k-regular digraph built from K shifted permutations, so the
+  equal-load property is by construction, not statistical. Same per-host
+  throughput and packet rate, held continuously by every host at once,
+  with K sockets instead of N−1. The seed is printed and stored in the
+  matrix header, so a shuffle replays exactly; a new seed re-rolls every
+  path through the fabric.
+- **`--streams N`** on `start`/`run`/`agent`: split each pair's rate
+  across N sockets. Each socket is its own 4-tuple, which is what lets
+  worker processes, NIC RSS queues and ECMP paths share a small mesh's
+  load — the fix for one core pegged while the rest of the box idles.
+  The offered rate is unchanged; reports still carry one row per peer.
+- **`mx help`**: every switch of every command on one page, generated
+  from the real parsers so it cannot drift. Bare flags gained help text.
+- `mx doctor` checks `ulimit -n` on every host against the mesh size —
+  a 1000-peer agent holds ~1000 sockets, exactly where the common 1024
+  default dies on startup.
+
+### Fixed
+
+- **`--bind` on two-NIC fleets reported 100% loss.** Binding pinned the
+  local sockets (including every listener) to the named NIC while
+  requests still targeted the server-list addresses on the other NIC.
+  `mx start --bind` now resolves the pattern on every host over ssh and
+  deploys a matrix retargeted at those data-plane addresses, the same
+  scheme `iperf-orchestrator` uses; it aborts up front, naming the
+  hosts, if any lacks a matching interface. A hand-run agent whose bound
+  address does not match the matrix refuses to start, with the
+  explanation, instead of running a guaranteed-100%-loss test.
+- Multi-worker agents no longer pickle the whole rates dict (~N² cells)
+  into every worker, and a partial final interval no longer prints a
+  summed status line that read as a host going quiet.
+
 ## [1.0.0] - 2026-08-11
 
 First release. A matrix-only companion to `iperf_orchestrator`: it holds
@@ -76,4 +114,5 @@ second as the headline number.
   [`iperf_orchestrator`](https://github.com/MartinGallagher-code/iperf_orchestrator).
 - Python 3.6+ on the orchestrator and on every server; nothing else.
 
+[1.1.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.0.0
