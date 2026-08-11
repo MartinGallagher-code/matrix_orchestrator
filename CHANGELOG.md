@@ -49,10 +49,20 @@ second as the headline number.
   report CSVs without analysis.
 - Per-pair grid CSVs (`--grid DIR`): achieved pps, delivered pps, loss
   and p99 latency, in the matrix's own N×N shape.
+- **A multi-process agent.** Packet rate is CPU work, and one Python
+  process is one GIL, so each host runs `--workers` worker *processes*
+  (default `auto`: one per core, capped at 8). Each drives all its
+  sockets from a single event loop; they split the send flows between
+  them and share the listening port via `SO_REUSEPORT`. Measured on a
+  4-core box, the same send loop runs at 300k pps in one thread, 199k
+  across two and 57k across four — threads convoy on the GIL — against
+  1.09M pps across four processes. On a five-host loopback matrix the
+  change took achieved rate from 93% to 100% of target, loss from 32% to
+  0.01%, and p50 latency from 393ms to 256us.
 - Per-host CPU sampling: the whole box, the busiest single core, and the
-  agent process's own share of one core. The last one is what separates
-  "the fabric is the limit" from "the agent is" — a Python process is
-  GIL-bound near 100% of a core, and the summary says so when it happens.
+  busiest agent worker's share of one core. The last one is what
+  separates "the fabric is the limit" from "the agent is", and the
+  summary says so in words when it happens.
 - `--workers N` to scale the responder across cores, `--bind` to pin
   traffic to one NIC (`iperf_orchestrator` semantics), and `--dry-run`
   on every fleet command.

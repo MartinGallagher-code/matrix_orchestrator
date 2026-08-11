@@ -12,15 +12,29 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test_helper.bash
 source "$DIR/test_helper.bash"
 
-# run_agents DURATION HOST... -- start one agent per host, wait for all.
+# run_agents DURATION HOST... [-- EXTRA-FLAGS...]
+# Start one agent per host and wait for all of them. Anything after the
+# host names that starts with '--' is passed through to every agent.
+#
+# Default --workers 1 keeps these tests deterministic: the runner has few
+# cores and several agents share them, so letting each fork one worker per
+# core would measure the contention, not the tool.
 run_agents() {
     local duration="$1"; shift
-    local h pids=()
-    mkdir -p rep
+    local h pids=() hosts=() extra=()
     for h in "$@"; do
+        if [ "${#extra[@]}" -gt 0 ] || [ "${h#--}" != "$h" ]; then
+            extra+=("$h")
+        else
+            hosts+=("$h")
+        fi
+    done
+    [ "${#extra[@]}" -gt 0 ] || extra=(--workers 1)
+    mkdir -p rep
+    for h in "${hosts[@]}"; do
         python3 "$MX" agent --matrix matrix.csv --host "$h" \
             --report "rep/$h.csv" --interval 2 --duration "$duration" \
-            > "rep/$h.log" 2>&1 &
+            "${extra[@]}" > "rep/$h.log" 2>&1 &
         pids+=($!)
     done
     wait "${pids[@]}"
@@ -183,7 +197,84 @@ test_unpaced_flows_send_as_fast_as_they_can() {
     assert_contains "$(cat rep/a.log)" "tx=" || return 1
 }
 
+test_multiple_workers_share_the_port_and_the_flows() {
+    # Four hosts so every agent has 3 flows to shard across its workers,
+    # and every worker's responder shares one port via SO_REUSEPORT.
+    local p; p=$(pick_port)
+    write_servers "$p" a b c d > /dev/null
+    run_mx gen --servers servers.txt --pps 2000
+    run_agents 7 a b c d --workers 3
+    assert_contains "$(cat rep/a.log)" "workers=3" "workers are reported" || return 1
+    assert_not_contains "$(cat rep/a.log)" "not listening" \
+        "every worker should get the port via SO_REUSEPORT" || return 1
+    # All 3 flows must be present regardless of which worker owns each.
+    local peers
+    peers=$(python3 - <<'EOF'
+import csv
+seen = set()
+with open("rep/a.csv", newline="") as f:
+    for r in csv.DictReader(f):
+        if r["dir"] == "tx":
+            seen.add(r["peer"])
+print(",".join(sorted(seen)))
+EOF
+)
+    assert_eq "b,c,d" "$peers" "every flow reports, whichever worker owns it" || return 1
+    local sent; sent=$(csv_col rep/a.csv tx pps)
+    assert_between 1600 2400 "$sent" "sharded flows still hit their target" || return 1
+}
+
+test_one_row_per_peer_per_interval_however_many_workers() {
+    # Worker rows are merged before they are written: two workers each
+    # reporting half a peer's traffic must not become two half-rate rows.
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 2000
+    run_agents 7 a b --workers 4
+    local dupes
+    dupes=$(python3 - <<'EOF'
+import collections, csv
+n = collections.Counter()
+with open("rep/a.csv", newline="") as f:
+    for r in csv.DictReader(f):
+        n[(r["ts"], r["dir"], r["peer"])] += 1
+print(sum(1 for v in n.values() if v > 1))
+EOF
+)
+    assert_eq "0" "$dupes" "no duplicate (ts, dir, peer) rows" || return 1
+    # And the rate is the whole rate, not one worker's share of it.
+    local arrived; arrived=$(csv_col rep/b.csv rx pps)
+    assert_between 1600 2400 "$arrived" "merged rows carry the full rate" || return 1
+}
+
+test_workers_auto_picks_a_sane_number() {
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 1000
+    run_agents 5 a b --workers auto
+    local line; line=$(grep -m1 "^mx agent" rep/a.log)
+    assert_contains "$line" "workers=" || return 1
+    local n; n=$(printf '%s' "$line" | sed -n 's/.*workers=\([0-9]*\).*/\1/p')
+    # One flow, so sharding caps it at 2; never zero, never unbounded.
+    assert_between 1 8 "$n" "auto should pick between 1 and the cap" || return 1
+}
+
+test_workers_flag_is_validated() {
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 1000
+    run_mx agent --matrix matrix.csv --host a --duration 1 --workers banana
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "number or 'auto'" || return 1
+    run_mx agent --matrix matrix.csv --host a --duration 1 --workers 0
+    assert_status 2 "$RUN_RC" || return 1
+}
+
 run_test test_two_agents_hit_the_target_rate
+run_test test_multiple_workers_share_the_port_and_the_flows
+run_test test_one_row_per_peer_per_interval_however_many_workers
+run_test test_workers_auto_picks_a_sane_number
+run_test test_workers_flag_is_validated
 run_test test_reply_size_differs_from_request_size
 run_test test_report_has_every_column_summarize_needs
 run_test test_rtt_is_measured

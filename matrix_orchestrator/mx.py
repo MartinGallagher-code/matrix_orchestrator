@@ -38,6 +38,7 @@ Python 3.6+, standard library only, on the orchestrator and on every host.
 
 import argparse
 import csv
+import multiprocessing
 import os
 import shlex
 import shutil
@@ -48,9 +49,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from queue import Empty
 
 VERSION = "1.0.0"
 
@@ -79,6 +80,16 @@ DEFAULT_MATRIX = "matrix.csv"
 DEFAULT_SERVERS = "servers.txt"
 DEFAULT_REMOTE_DIR = "/var/tmp/mx"
 DEFAULT_INTERVAL = 5.0
+
+# `--workers auto` fans out one process per core, but stops here:
+# a 64-core box forking 64 agents for a trickle of traffic helps
+# nobody, and `--workers N` is there when it does.
+MAX_AUTO_WORKERS = 8
+
+# What one worker process sustains, in packets/sec of request+reply,
+# measured on an ordinary x86 core. Used only to size advice, never to
+# limit anything -- the real number is in every summary's `agent` column.
+WORKER_PPS = 200000
 
 REPORT_NAME = "report.csv"
 LOG_NAME = "agent.log"
@@ -437,407 +448,548 @@ def read_self_cpu():
 
 
 # ---------------------------------------------------------------------------
-# Agent: client flows
+# Agent: worker processes
+#
+# Packet rate here is CPU work, and CPU work in Python means one process
+# is one GIL. Threads do not merely fail to help -- measured on a 4-core
+# box, the same send loop runs at 300k pps in one thread, 199k across two
+# threads, and 57k across four, because the threads convoy on the GIL.
+# The same work in separate processes scales nearly linearly: 1.09M pps
+# across four.
+#
+# So the agent is P worker *processes*, and each worker is a single
+# thread driving one event loop over all of its sockets. No locks, no
+# thread hand-offs, nothing shared in the packet path. Workers split the
+# send flows between them and each opens its own SO_REUSEPORT responder
+# socket, so the kernel spreads inbound requests across them too; a peer's
+# packets always hash to one worker, which keeps the per-peer counters
+# consistent. Every interval each worker ships its finished numbers to
+# the parent, which is the only process that writes the report.
 # ---------------------------------------------------------------------------
 
-class Flow(object):
-    """One client flow: this host -> one peer, request in / reply back.
+MAX_DRAIN = 1024        # packets read from one socket per poll
+MAX_SEND_BATCH = 512    # packets sent for one flow per poll
 
-    Counters are plain ints with a single writer each (the send thread
-    owns tx_*, the receive thread owns rx_* and the rtt fields), so the
-    reporter can read them without locking or perturbing the hot loop.
+
+class Flow(object):
+    """One client flow: this host -> one peer, request out, reply back.
+
+    Owned start to finish by a single worker process, so the counters are
+    plain integers with no synchronization anywhere.
     """
 
-    def __init__(self, agent, peer, addr, port, target_pps):
-        self.agent = agent
+    def __init__(self, peer, addr, port, target_pps):
         self.peer = peer
         self.addr = addr
         self.port = port
         self.target_pps = target_pps
+        self.paced = target_pps != float("inf")
+        # The bucket holds 5ms of traffic: enough to amortize the poll
+        # cadence, too little for a stall to earn a catch-up burst.
+        self.burst_cap = max(2.0, target_pps * 0.005) if self.paced else 0.0
+        self.tokens = 0.0
+        self.last = 0.0
+        self.seq = 0
+        self.sock = None
+        self.dest = None
         self.tx_pkts = 0
         self.tx_bytes = 0
         self.rx_pkts = 0
         self.rx_bytes = 0
         self.errors = 0
         self.rtt_sum = 0
-        self.rtt_max = 0
         self.rtt_n = 0
+        self.rtt_max = 0
         self.rtt_hist = [0] * RTT_NBUCKETS
-        self.sock = None
-        self.dest = None
-        self.ready = threading.Event()
-        self.threads = []
 
-    def start(self):
-        for target, name in ((self._send_loop, "tx"), (self._recv_loop, "rx")):
-            t = threading.Thread(target=target, daemon=True,
-                                 name="%s-%s" % (name, self.peer))
-            t.start()
-            self.threads.append(t)
-
-    def _open(self):
-        a = self.agent
+    def open(self, sndbuf, bind_ip):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if a.sndbuf:
+        if sndbuf:
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, a.sndbuf)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
             except OSError:
                 pass
-        if a.bind_ip:
-            sock.bind((a.bind_ip, 0))
-        # Resolve once, then sendto() a literal address forever -- a
-        # hostname in sendto() would mean a resolver call per packet.
-        #
-        # Deliberately NOT connected: a multi-homed peer whose responder
-        # is bound to the wildcard address answers from whichever local
-        # address the route picks, which a connected socket would discard
-        # as coming from the wrong peer. This socket only ever carries
-        # one flow's replies, so accepting them all is right.
+        if bind_ip:
+            sock.bind((bind_ip, 0))
+        # Resolve once: a hostname in sendto() would mean a resolver call
+        # per packet. Deliberately not connected -- a multi-homed peer
+        # answers from whichever local address its route picks, and a
+        # connected socket would discard those replies as coming from the
+        # wrong peer. This socket carries one flow, so accepting whatever
+        # arrives on it is right.
         self.dest = socket.getaddrinfo(self.addr, self.port, socket.AF_INET,
                                        socket.SOCK_DGRAM)[0][4]
+        sock.setblocking(False)
+        self.sock = sock
         return sock
 
-    def _send_loop(self):
-        a = self.agent
-        try:
-            self.sock = self._open()
-        except OSError as exc:
-            a.fail("cannot open flow to %s (%s:%d): %s"
-                   % (self.peer, self.addr, self.port, exc))
-            self.ready.set()
-            return
-        self.ready.set()
 
-        stop = a.stop
-        pack, sendto, dest = HDR.pack, self.sock.sendto, self.dest
-        monotonic = time.monotonic
-        idx, tx_size, rx_size = a.index, a.tx_size, a.rx_size
-        pad = pad_for(tx_size)
-        pps = self.target_pps
-        paced = pps != float("inf")
-        # Bucket holds 5ms of traffic: enough to amortize the syscall
-        # cadence, too little for a stall to earn a catch-up burst.
-        burst_cap = max(2.0, pps * 0.005) if paced else 0.0
-        tokens, last = 0.0, monotonic()
-        seq = 0
-        while not stop.is_set():
-            if paced:
-                now = monotonic()
-                tokens = min(tokens + (now - last) * pps, burst_cap)
-                last = now
-                if tokens < 1.0:
-                    stop.wait(min(0.25, (1.0 - tokens) / pps))
+class WorkerStats(object):
+    """What one worker hands the parent at the end of an interval."""
+
+    def __init__(self, wid, ts, flows, srv, cpu_pct):
+        self.wid = wid
+        self.ts = ts
+        self.flows = flows      # list of per-flow dicts
+        self.srv = srv          # list of per-peer server dicts
+        self.cpu_pct = cpu_pct  # this worker's CPU, as a share of one core
+
+
+def _worker(wid, matrix, me, cfg, flow_specs, stop, queue):
+    """One worker process: send its share of the flows, answer requests
+    on its own listening socket, and report every interval."""
+    try:
+        _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:                      # noqa: BLE001
+        sys.stderr.write("mx agent: worker %d died: %s\n" % (wid, exc))
+        sys.stderr.flush()
+
+
+def _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue):
+    import selectors
+
+    my_index = matrix.index[me]
+    tx_size, rx_size = matrix.tx_size, matrix.rx_size
+    pad = pad_for(tx_size)
+    pack, unpack = HDR.pack, HDR.unpack_from
+    monotonic = time.monotonic
+
+    sel = selectors.DefaultSelector()
+    flows = []
+    for peer, addr, port, pps in flow_specs:
+        fl = Flow(peer, addr, port, pps)
+        try:
+            sel.register(fl.open(cfg["sndbuf"], cfg["bind_ip"]),
+                         selectors.EVENT_READ, fl)
+        except OSError as exc:
+            sys.stderr.write("mx agent: worker %d cannot reach %s (%s:%d): %s\n"
+                             % (wid, peer, addr, port, exc))
+            sys.stderr.flush()
+            continue
+        fl.last = monotonic()
+        flows.append(fl)
+
+    # Responder. Every worker binds the same port with SO_REUSEPORT so the
+    # kernel fans inbound requests across them.
+    srv_counts = [[0, 0, 0, 0] for _ in range(len(matrix.hosts) + 1)]
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    reuseport = getattr(socket, "SO_REUSEPORT", None)
+    if reuseport is not None:
+        try:
+            srv.setsockopt(socket.SOL_SOCKET, reuseport, 1)
+        except OSError:
+            pass
+    try:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                       cfg["rcvbuf"] or 8 * 1024 * 1024)
+    except OSError:
+        pass
+    try:
+        srv.bind((cfg["bind_ip"], matrix.ports[me]))
+        srv.setblocking(False)
+        sel.register(srv, selectors.EVENT_READ, None)
+    except OSError as exc:
+        # Without SO_REUSEPORT only the first worker gets the port; the
+        # rest stay senders, which still works, just with one responder.
+        sys.stderr.write("mx agent: worker %d not listening on %s:%d (%s)\n"
+                         % (wid, cfg["bind_ip"] or "0.0.0.0", matrix.ports[me], exc))
+        sys.stderr.flush()
+        srv.close()
+        srv = None
+
+    pads = {}
+    prev = {}
+    prev_cpu = read_self_cpu()
+    interval = cfg["interval"]
+    last_report = monotonic()
+    next_report = last_report + interval
+    deadline = last_report + cfg["duration"] if cfg["duration"] > 0 else None
+    parent = os.getppid()
+
+    while not stop.is_set():
+        now = monotonic()
+
+        # ---- send whatever the token buckets allow ----
+        next_due = now + 0.05
+        for fl in flows:
+            if fl.paced:
+                fl.tokens = min(fl.tokens + (now - fl.last) * fl.target_pps,
+                                fl.burst_cap)
+                fl.last = now
+                if fl.tokens < 1.0:
+                    due = now + (1.0 - fl.tokens) / fl.target_pps
+                    if due < next_due:
+                        next_due = due
                     continue
-                batch = int(tokens)
-                tokens -= batch
+                batch = int(fl.tokens)
+                if batch > MAX_SEND_BATCH:
+                    batch = MAX_SEND_BATCH
+                fl.tokens -= batch
+                next_due = now
             else:
-                batch = 256
+                batch = MAX_SEND_BATCH
+                next_due = now
+            sendto, dest = fl.sock.sendto, fl.dest
+            seq, sent, sent_b = fl.seq, 0, 0
             for _ in range(batch):
                 seq += 1
                 try:
-                    sendto(pack(MAGIC, KIND_REQ, 0, idx, tx_size, rx_size,
+                    sendto(pack(MAGIC, KIND_REQ, 0, my_index, tx_size, rx_size,
                                 seq, int(monotonic() * 1e6)) + pad, dest)
                 except OSError:
-                    self.errors += 1
-                    stop.wait(0.05)
+                    fl.errors += 1
                     break
-                self.tx_pkts += 1
-                self.tx_bytes += tx_size
+                sent += 1
+                sent_b += tx_size
+            fl.seq = seq
+            fl.tx_pkts += sent
+            fl.tx_bytes += sent_b
 
-    def _recv_loop(self):
-        self.ready.wait()
-        sock = self.sock
-        if sock is None:
-            return
-        stop = self.agent.stop
-        sock.settimeout(0.5)
-        unpack, monotonic = HDR.unpack_from, time.monotonic
-        hist = self.rtt_hist
-        while not stop.is_set():
-            try:
-                data = sock.recv(MAX_SIZE)
-            except socket.timeout:
-                continue
-            except OSError:
-                stop.wait(0.05)
-                continue
-            if len(data) < HDR_SIZE:
-                continue
-            magic, kind, _flags, _idx, _plen, _rsize, _seq, tsend = unpack(data)
-            if magic != MAGIC or kind != KIND_REP:
-                continue
-            self.rx_pkts += 1
-            self.rx_bytes += len(data)
-            rtt = int(monotonic() * 1e6) - tsend
-            if rtt >= 0:
-                self.rtt_sum += rtt
-                self.rtt_n += 1
-                if rtt > self.rtt_max:
-                    self.rtt_max = rtt
-                hist[rtt_bucket(rtt)] += 1
-
-
-# ---------------------------------------------------------------------------
-# Agent: responder
-# ---------------------------------------------------------------------------
-
-class Responder(object):
-    """A server thread: answer every request with a reply of the size the
-    request asked for.
-
-    One of these per `--workers`, each with its own SO_REUSEPORT socket
-    and its own preallocated counter row per peer -- so several workers
-    share the port with no locking anywhere in the packet path, and the
-    reporter just sums the rows. The rows are allocated up front, so the
-    reporter can read them while a worker writes without ever seeing a
-    resized list.
-    """
-
-    def __init__(self, agent, nhosts):
-        self.agent = agent
-        # per peer index: [requests, request bytes, replies, reply bytes];
-        # the extra last row absorbs packets from unknown senders.
-        self.counts = [[0, 0, 0, 0] for _ in range(nhosts + 1)]
-        self.unknown = self.counts[nhosts]
-        self.thread = None
-
-    def start(self):
-        self.thread = threading.Thread(target=self._loop, daemon=True,
-                                       name="server")
-        self.thread.start()
-
-    def _loop(self):
-        a = self.agent
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        reuseport = getattr(socket, "SO_REUSEPORT", None)
-        if reuseport is not None:
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, reuseport, 1)
-            except OSError:
-                pass
+        # ---- wait for replies and requests ----
+        # select returns the moment anything is readable, so a reply is
+        # timed the instant it lands; the timeout only bounds an idle wait.
+        timeout = next_due - monotonic()
+        if timeout < 0:
+            timeout = 0
+        elif timeout > 0.05:
+            timeout = 0.05
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
-                            a.rcvbuf or 8 * 1024 * 1024)
+            events = sel.select(timeout)
+        except OSError:
+            events = []
+
+        for key, _mask in events:
+            fl = key.data
+            if fl is None:
+                # Responder socket: answer every request with a reply of
+                # the size the request asked for.
+                recvfrom, sendto = key.fileobj.recvfrom, key.fileobj.sendto
+                for _ in range(MAX_DRAIN):
+                    try:
+                        data, peer = recvfrom(MAX_SIZE)
+                    except OSError:
+                        break
+                    if len(data) < HDR_SIZE:
+                        continue
+                    magic, kind, _f, src, _pl, rsize, sq, ts = unpack(data)
+                    if magic != MAGIC or kind != KIND_REQ:
+                        continue
+                    row = srv_counts[src] if src < len(srv_counts) - 1 \
+                        else srv_counts[-1]
+                    row[0] += 1
+                    row[1] += len(data)
+                    if rsize < HDR_SIZE:
+                        rsize = HDR_SIZE
+                    elif rsize > MAX_SIZE:
+                        rsize = MAX_SIZE
+                    rpad = pads.get(rsize)
+                    if rpad is None:
+                        rpad = pads[rsize] = pad_for(rsize)
+                    # t_send is echoed untouched, so the client measures
+                    # its own round trip with no clock sync between us.
+                    try:
+                        sendto(pack(MAGIC, KIND_REP, 0, my_index, rsize, 0,
+                                    sq, ts) + rpad, peer)
+                    except OSError:
+                        continue
+                    row[2] += 1
+                    row[3] += rsize
+            else:
+                recv = fl.sock.recv
+                hist = fl.rtt_hist
+                for _ in range(MAX_DRAIN):
+                    try:
+                        data = recv(MAX_SIZE)
+                    except OSError:
+                        break
+                    if len(data) < HDR_SIZE:
+                        continue
+                    magic, kind, _f, _i, _pl, _rs, _sq, ts = unpack(data)
+                    if magic != MAGIC or kind != KIND_REP:
+                        continue
+                    fl.rx_pkts += 1
+                    fl.rx_bytes += len(data)
+                    rtt = int(monotonic() * 1e6) - ts
+                    if rtt >= 0:
+                        fl.rtt_sum += rtt
+                        fl.rtt_n += 1
+                        if rtt > fl.rtt_max:
+                            fl.rtt_max = rtt
+                        hist[rtt_bucket(rtt)] += 1
+
+        # ---- report ----
+        now = monotonic()
+        if now >= next_report:
+            cur_cpu = read_self_cpu()
+            elapsed = max(now - last_report, 1e-3)
+            cpu_pct = None
+            if cur_cpu is not None and prev_cpu is not None:
+                cpu_pct = (cur_cpu - prev_cpu) / elapsed * 100.0
+            prev_cpu = cur_cpu
+            stats = _collect(wid, flows, srv_counts, matrix, me, prev,
+                             elapsed, cpu_pct)
+            try:
+                queue.put(stats, block=False)
+            except Exception:                     # noqa: BLE001 - full queue
+                pass
+            last_report = now
+            next_report = now + interval
+
+        if deadline is not None and now >= deadline:
+            break
+        # If the parent is gone, so is the reason to keep sending. This is
+        # what keeps a SIGKILLed run from leaving traffic on the network.
+        if os.getppid() != parent:
+            break
+
+    for fl in flows:
+        try:
+            fl.sock.close()
         except OSError:
             pass
+    if srv is not None:
         try:
-            sock.bind((a.bind_ip, a.port))
-        except OSError as exc:
-            a.fail("cannot listen on %s:%d: %s" % (a.bind_ip or "0.0.0.0", a.port, exc))
-            return
-        sock.settimeout(0.5)
+            srv.close()
+        except OSError:
+            pass
+    sel.close()
 
-        stop = a.stop
-        counts, unknown = self.counts, self.unknown
-        nhosts = len(counts) - 1
-        pack, unpack = HDR.pack, HDR.unpack_from
-        idx = a.index
-        pads = {}
-        while not stop.is_set():
-            try:
-                data, peer = sock.recvfrom(MAX_SIZE)
-            except socket.timeout:
-                continue
-            except OSError:
-                stop.wait(0.05)
-                continue
-            if len(data) < HDR_SIZE:
-                continue
-            magic, kind, _flags, src, _plen, rsize, seq, tsend = unpack(data)
-            if magic != MAGIC or kind != KIND_REQ:
-                continue
-            row = counts[src] if src < nhosts else unknown
-            row[0] += 1
-            row[1] += len(data)
-            if rsize < HDR_SIZE:
-                rsize = HDR_SIZE
-            elif rsize > MAX_SIZE:
-                rsize = MAX_SIZE
-            pad = pads.get(rsize)
-            if pad is None:
-                pad = pads[rsize] = pad_for(rsize)
-            # t_send is echoed untouched: the client measures its own
-            # round trip without either side knowing the other's clock.
-            try:
-                sock.sendto(pack(MAGIC, KIND_REP, 0, idx, rsize, 0, seq, tsend) + pad,
-                            peer)
-            except OSError:
-                continue
-            row[2] += 1
-            row[3] += rsize
-        sock.close()
+
+def _collect(wid, flows, srv_counts, matrix, me, prev, elapsed, cpu_pct):
+    """Turn this worker's raw counters into one interval's finished rates."""
+    def delta(key, value):
+        was = prev.get(key, 0)
+        prev[key] = value
+        return value - was
+
+    frows = []
+    for fl in flows:
+        d_tx = delta(("tx", fl.peer), fl.tx_pkts)
+        d_txb = delta(("txb", fl.peer), fl.tx_bytes)
+        d_rx = delta(("rx", fl.peer), fl.rx_pkts)
+        d_rxb = delta(("rxb", fl.peer), fl.rx_bytes)
+        d_sum = delta(("rs", fl.peer), fl.rtt_sum)
+        d_n = delta(("rn", fl.peer), fl.rtt_n)
+        hist = []
+        for i, n in enumerate(fl.rtt_hist):
+            hist.append(n - prev.get(("h", fl.peer, i), 0))
+            prev[("h", fl.peer, i)] = n
+        frows.append({
+            "peer": fl.peer,
+            "target": None if not fl.paced else fl.target_pps,
+            "pps": d_tx / elapsed,
+            "mbps": d_txb * 8.0 / elapsed / 1e6,
+            "rep_pps": d_rx / elapsed,
+            "rep_mbps": d_rxb * 8.0 / elapsed / 1e6,
+            "loss": (100.0 - pct(d_rx, d_tx)) if d_tx else None,
+            "rtt_avg": (d_sum / d_n) if d_n else None,
+            "rtt_p50": rtt_percentile(hist, 0.50) if d_n else None,
+            "rtt_p99": rtt_percentile(hist, 0.99) if d_n else None,
+            "rtt_max": fl.rtt_max,
+            "hist": hist,
+        })
+
+    srows = []
+    for i, peer in enumerate(matrix.hosts):
+        if peer == me:
+            continue
+        row = srv_counts[i]
+        d_req = delta(("sq", peer), row[0])
+        d_reqb = delta(("sqb", peer), row[1])
+        d_rep = delta(("sp", peer), row[2])
+        d_repb = delta(("spb", peer), row[3])
+        if not (d_req or d_rep):
+            continue
+        srows.append({
+            "peer": peer,
+            "pps": d_req / elapsed,
+            "mbps": d_reqb * 8.0 / elapsed / 1e6,
+            "rep_pps": d_rep / elapsed,
+            "rep_mbps": d_repb * 8.0 / elapsed / 1e6,
+        })
+    return WorkerStats(wid, int(time.time()), frows, srows, cpu_pct)
 
 
 # ---------------------------------------------------------------------------
-# Agent: reporting
+# Agent: reporting (the parent process)
 # ---------------------------------------------------------------------------
 
 REPORT_FIELDS = ["ts", "host", "dir", "peer", "size", "rep_size", "target_pps",
                  "pps", "mbps", "rep_pps", "rep_mbps", "loss_pct",
                  "rtt_avg_us", "rtt_p50_us", "rtt_p99_us", "rtt_max_us",
-                 "cpu_pct", "cpu_max_pct", "agent_cpu_pct"]
+                 "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"]
+
+
+def _num(v, fmt="%.1f"):
+    return "" if v is None else fmt % v
+
+
+def _merge_flow(a, b):
+    """Two workers' halves of one flow's interval. Rates add; the latency
+    percentiles are recomputed from the combined histogram rather than
+    averaged, which would be a percentile of percentiles."""
+    hist = [x + y for x, y in zip(a["hist"], b["hist"])]
+    n = sum(hist)
+    pps = a["pps"] + b["pps"]
+    rep_pps = a["rep_pps"] + b["rep_pps"]
+    avgs = [(x["rtt_avg"], sum(x["hist"])) for x in (a, b)
+            if x["rtt_avg"] is not None]
+    weight = sum(w for _v, w in avgs)
+    return {
+        "peer": a["peer"],
+        "target": None if a["target"] is None or b["target"] is None
+                  else a["target"] + b["target"],
+        "pps": pps,
+        "mbps": a["mbps"] + b["mbps"],
+        "rep_pps": rep_pps,
+        "rep_mbps": a["rep_mbps"] + b["rep_mbps"],
+        "loss": (100.0 - pct(rep_pps, pps)) if pps else None,
+        "rtt_avg": (sum(v * w for v, w in avgs) / weight) if weight else None,
+        "rtt_p50": rtt_percentile(hist, 0.50) if n else None,
+        "rtt_p99": rtt_percentile(hist, 0.99) if n else None,
+        "rtt_max": max(a["rtt_max"], b["rtt_max"]),
+        "hist": hist,
+    }
+
+
+def _merge_srv(a, b):
+    return {"peer": a["peer"],
+            "pps": a["pps"] + b["pps"],
+            "mbps": a["mbps"] + b["mbps"],
+            "rep_pps": a["rep_pps"] + b["rep_pps"],
+            "rep_mbps": a["rep_mbps"] + b["rep_mbps"]}
 
 
 class Reporter(object):
-    """Every interval: append per-flow rows to report.csv and print one
-    line to stdout (which is what `mx status` shows)."""
+    """The parent's side: drain what the workers report, write the CSV,
+    and print the one line `mx status` shows."""
 
-    def __init__(self, agent, path):
-        self.agent = agent
+    def __init__(self, host, path, tx_size, rx_size, nworkers):
+        self.host = host
+        self.tx_size = tx_size
+        self.rx_size = rx_size
+        self.nworkers = nworkers
         fresh = not os.path.exists(path)
         self.fh = open(path, "a", newline="")
         self.csv = csv.writer(self.fh)
         if fresh:
             self.csv.writerow(REPORT_FIELDS)
             self.fh.flush()
-        self.prev = {}
         self.prev_cpu = read_cpu()
-        self.prev_self = read_self_cpu()
         self.last = time.monotonic()
 
-    def _delta(self, key, value):
-        prev = self.prev.get(key, 0)
-        self.prev[key] = value
-        return value - prev
+    def tick(self, batches, complete=True):
+        """Write one interval. `batches` is every WorkerStats collected
+        since the last tick; `complete` says whether every live worker is
+        represented.
 
-    def tick(self):
-        a = self.agent
+        Rows are merged across workers before they are written, so the
+        report keeps one row per peer per interval however many workers
+        produced it. That merge is not cosmetic: SO_REUSEPORT rehashes
+        when a worker's socket closes, so one peer's traffic can briefly
+        land on two workers, and those two rows are two halves of one
+        rate -- summed they are right, listed separately they read as a
+        host that halved its throughput.
+        """
         now = int(time.time())
-        mono = time.monotonic()
-        # Rate over the elapsed time we actually measured, not the
-        # nominal interval, so drift and the final partial tick stay true.
-        elapsed = max(mono - self.last, 1e-3)
-        self.last = mono
+        self.last = time.monotonic()
         cur_cpu = read_cpu()
         cpu, cpu_max = cpu_delta(self.prev_cpu, cur_cpu)
         self.prev_cpu = cur_cpu
-        cur_self = read_self_cpu()
-        self_pct = None
-        if cur_self is not None and self.prev_self is not None:
-            self_pct = (cur_self - self.prev_self) / elapsed * 100.0
-        self.prev_self = cur_self
 
-        tx_pps = tx_bps = rx_pps = rx_bps = 0.0
-        target_total = 0.0
+        # Two batches from one worker are two overlapping measurements of
+        # the same counters; only the newest can be counted.
+        latest = {}
+        for b in batches:
+            if b.wid not in latest or b.ts >= latest[b.wid].ts:
+                latest[b.wid] = b
+        if not latest:
+            return
+
+        flows, srv, cpus = {}, {}, []
+        for b in latest.values():
+            if b.cpu_pct is not None:
+                cpus.append(b.cpu_pct)
+            for f in b.flows:
+                cur = flows.get(f["peer"])
+                flows[f["peer"]] = f if cur is None else _merge_flow(cur, f)
+            for s in b.srv:
+                cur = srv.get(s["peer"])
+                srv[s["peer"]] = s if cur is None else _merge_srv(cur, s)
+
+        tx_pps = rx_pps = tx_bps = rx_bps = target = 0.0
         unpaced = 0
-        rtt_hist_total = [0] * RTT_NBUCKETS
-        rtt_sum_total = rtt_n_total = 0
-        rows = []
-        for fl in a.flows:
-            d_tx = self._delta(("tx", fl.peer), fl.tx_pkts)
-            d_txb = self._delta(("txb", fl.peer), fl.tx_bytes)
-            d_rx = self._delta(("rx", fl.peer), fl.rx_pkts)
-            d_rxb = self._delta(("rxb", fl.peer), fl.rx_bytes)
-            d_rtt_sum = self._delta(("rtts", fl.peer), fl.rtt_sum)
-            d_rtt_n = self._delta(("rttn", fl.peer), fl.rtt_n)
-            hist = [n - self.prev.get(("h", fl.peer, i), 0)
-                    for i, n in enumerate(fl.rtt_hist)]
-            for i, n in enumerate(fl.rtt_hist):
-                self.prev[("h", fl.peer, i)] = n
-            for i, n in enumerate(hist):
-                rtt_hist_total[i] += n
-            rtt_sum_total += d_rtt_sum
-            rtt_n_total += d_rtt_n
-
-            f_tx_pps = d_tx / elapsed
-            f_rx_pps = d_rx / elapsed
-            tx_pps += f_tx_pps
-            rx_pps += f_rx_pps
-            tx_bps += d_txb * 8.0 / elapsed
-            rx_bps += d_rxb * 8.0 / elapsed
-            if fl.target_pps == float("inf"):
+        hist = [0] * RTT_NBUCKETS
+        for peer in sorted(flows):
+            f = flows[peer]
+            tx_pps += f["pps"]
+            rx_pps += f["rep_pps"]
+            tx_bps += f["mbps"] * 1e6
+            rx_bps += f["rep_mbps"] * 1e6
+            if f["target"] is None:
                 unpaced += 1
             else:
-                target_total += fl.target_pps
-            rows.append([now, a.host, "tx", fl.peer, a.tx_size, a.rx_size,
-                         "" if fl.target_pps == float("inf") else "%.1f" % fl.target_pps,
-                         "%.1f" % f_tx_pps, "%.3f" % (d_txb * 8.0 / elapsed / 1e6),
-                         "%.1f" % f_rx_pps, "%.3f" % (d_rxb * 8.0 / elapsed / 1e6),
-                         "%.3f" % (100.0 - pct(d_rx, d_tx)) if d_tx else "",
-                         "%.0f" % (d_rtt_sum / d_rtt_n) if d_rtt_n else "",
-                         "%.0f" % (rtt_percentile(hist, 0.50) or 0) if d_rtt_n else "",
-                         "%.0f" % (rtt_percentile(hist, 0.99) or 0) if d_rtt_n else "",
-                         "%.0f" % fl.rtt_max, "", "", ""])
+                target += f["target"]
+            for i, n in enumerate(f["hist"]):
+                hist[i] += n
+            self.csv.writerow([
+                now, self.host, "tx", peer, self.tx_size, self.rx_size,
+                _num(f["target"]), _num(f["pps"]), _num(f["mbps"], "%.3f"),
+                _num(f["rep_pps"]), _num(f["rep_mbps"], "%.3f"),
+                _num(f["loss"], "%.3f"), _num(f["rtt_avg"], "%.0f"),
+                _num(f["rtt_p50"], "%.0f"), _num(f["rtt_p99"], "%.0f"),
+                _num(f["rtt_max"], "%.0f"), "", "", "", ""])
 
-        srv_pps = srv_bps = 0.0
-        for i, peer in enumerate(a.hosts):
-            row = [sum(r.counts[i][j] for r in a.responders) for j in range(4)]
-            if peer == a.host:
-                continue
-            d_req = self._delta(("sq", peer), row[0])
-            d_reqb = self._delta(("sqb", peer), row[1])
-            d_rep = self._delta(("sp", peer), row[2])
-            d_repb = self._delta(("spb", peer), row[3])
-            if not (d_req or d_rep):
-                continue
-            srv_pps += d_req / elapsed
-            srv_bps += d_reqb * 8.0 / elapsed
-            rows.append([now, a.host, "rx", peer, a.tx_size, a.rx_size, "",
-                         "%.1f" % (d_req / elapsed),
-                         "%.3f" % (d_reqb * 8.0 / elapsed / 1e6),
-                         "%.1f" % (d_rep / elapsed),
-                         "%.3f" % (d_repb * 8.0 / elapsed / 1e6),
-                         "", "", "", "", "", "", "", ""])
+        srv_pps = 0.0
+        for peer in sorted(srv):
+            s = srv[peer]
+            srv_pps += s["pps"]
+            self.csv.writerow([
+                now, self.host, "rx", peer, self.tx_size, self.rx_size,
+                "", _num(s["pps"]), _num(s["mbps"], "%.3f"),
+                _num(s["rep_pps"]), _num(s["rep_mbps"], "%.3f"),
+                "", "", "", "", "", "", "", "", ""])
 
-        # An all-unpaced host has no target to report; a mixed one reports
-        # what the paced flows asked for.
-        rows.append([now, a.host, "host", "*", a.tx_size, a.rx_size,
-                     "" if unpaced and not target_total else "%.1f" % target_total,
-                     "%.1f" % tx_pps,
-                     "%.3f" % (tx_bps / 1e6), "%.1f" % rx_pps,
-                     "%.3f" % (rx_bps / 1e6),
-                     "%.3f" % (100.0 - pct(rx_pps, tx_pps)) if tx_pps else "",
-                     "%.0f" % (rtt_sum_total / rtt_n_total) if rtt_n_total else "",
-                     "%.0f" % (rtt_percentile(rtt_hist_total, 0.50) or 0),
-                     "%.0f" % (rtt_percentile(rtt_hist_total, 0.99) or 0), "",
-                     "%.1f" % cpu if cpu is not None else "",
-                     "%.1f" % cpu_max if cpu_max is not None else "",
-                     "%.1f" % self_pct if self_pct is not None else ""])
+        # The busiest worker, not the average: one pegged worker is the
+        # ceiling even when its siblings are idle, and averaging hides it.
+        agent_cpu = max(cpus) if cpus else None
 
-        for row in rows:
-            self.csv.writerow(row)
+        # The host row sums across workers, so it only means anything when
+        # every worker is in. A partial one would read as a host that went
+        # quiet -- the per-peer rows above are self-contained and stay.
+        if complete:
+            self.csv.writerow([
+                now, self.host, "host", "*", self.tx_size, self.rx_size,
+                "" if unpaced and not target else _num(target),
+                _num(tx_pps), _num(tx_bps / 1e6, "%.3f"),
+                _num(rx_pps), _num(rx_bps / 1e6, "%.3f"),
+                _num(100.0 - pct(rx_pps, tx_pps), "%.3f") if tx_pps else "",
+                "", _num(rtt_percentile(hist, 0.50), "%.0f"),
+                _num(rtt_percentile(hist, 0.99), "%.0f"), "",
+                _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers])
         self.fh.flush()
+        nflows = len(flows)
 
         log("ts=%d tx=%s/%s rx=%s serving=%s loss=%.2f%% rtt_p50=%s rtt_p99=%s "
-            "cpu=%s flows=%d"
+            "cpu=%s workers=%d flows=%d"
             % (now, fmt_pps(tx_pps),
-               "max" if unpaced and not target_total else fmt_pps(target_total),
-               fmt_pps(rx_pps),
-               fmt_pps(srv_pps), max(0.0, 100.0 - pct(rx_pps, tx_pps)),
-               fmt_us(rtt_percentile(rtt_hist_total, 0.50)),
-               fmt_us(rtt_percentile(rtt_hist_total, 0.99)),
+               "max" if unpaced and not target else fmt_pps(target),
+               fmt_pps(rx_pps), fmt_pps(srv_pps),
+               max(0.0, 100.0 - pct(rx_pps, tx_pps)) if tx_pps else 0.0,
+               fmt_us(rtt_percentile(hist, 0.50)),
+               fmt_us(rtt_percentile(hist, 0.99)),
                "%.0f%%(max %.0f%%)" % (cpu, cpu_max) if cpu is not None else "n/a",
-               len(a.flows))
-        + (" agent_cpu=%.0f%%" % self_pct if self_pct is not None else ""))
+               self.nworkers, nflows)
+            + (" busiest_worker=%.0f%% of a core" % agent_cpu
+               if agent_cpu is not None else ""))
 
 
 # ---------------------------------------------------------------------------
 # Agent: the process that runs on every host
 # ---------------------------------------------------------------------------
-
-class Agent(object):
-    def __init__(self, matrix, host, args):
-        self.matrix = matrix
-        self.host = host
-        self.hosts = matrix.hosts
-        self.index = matrix.index[host]
-        self.port = matrix.ports[host]
-        self.tx_size = matrix.tx_size
-        self.rx_size = matrix.rx_size
-        self.sndbuf = args.sndbuf
-        self.rcvbuf = args.rcvbuf
-        self.bind_ip = ""
-        self.stop = threading.Event()
-        self.flows = []
-        self.responders = []
-        self.errors = []
-
-    def fail(self, msg):
-        self.errors.append(msg)
-        sys.stderr.write("mx agent: %s\n" % msg)
-        sys.stderr.flush()
-
 
 def resolve_self(matrix, override):
     """Which row of the matrix is this host? `mx start` always passes
@@ -876,63 +1028,133 @@ def _is_local_ipv4(addr):
         s.close()
 
 
-def cmd_agent(args):
-    try:
-        threading.stack_size(256 * 1024)     # many flows, small stacks
-    except (ValueError, RuntimeError):
-        pass
+def resolve_workers(spec, nflows):
+    """--workers N | auto. 'auto' is one per core, capped at MAX_AUTO_WORKERS
+    so a big box does not fork 64 processes for a trickle of traffic."""
+    if spec in (None, "", "auto"):
+        cores = 1
+        try:
+            cores = multiprocessing.cpu_count()
+        except NotImplementedError:
+            pass
+        n = min(max(1, cores), MAX_AUTO_WORKERS)
+    else:
+        try:
+            n = int(spec)
+        except ValueError:
+            die("--workers wants a number or 'auto' (got %r)" % spec)
+        if n < 1:
+            die("--workers must be at least 1")
+    # More workers than flows only adds responders; past one per flow plus
+    # a little headroom it is just processes sitting in select().
+    return max(1, min(n, max(1, nflows) + 1)) if nflows else n
 
+
+def cmd_agent(args):
     matrix = load_matrix(args.matrix)
-    host = resolve_self(matrix, args.host)
-    agent = Agent(matrix, host, args)
+    me = resolve_self(matrix, args.host)
+
+    bind_ip = ""
     if args.bind:
-        iface, agent.bind_ip = resolve_bind(args.bind)
-        log("bind: %r -> %s (%s)" % (args.bind, agent.bind_ip, iface))
+        iface, bind_ip = resolve_bind(args.bind)
+        log("bind: %r -> %s (%s)" % (args.bind, bind_ip, iface))
+
+    peers = matrix.peers_of(me)
+    nworkers = resolve_workers(args.workers, len(peers))
+
+    cfg = {"sndbuf": args.sndbuf, "rcvbuf": args.rcvbuf, "bind_ip": bind_ip,
+           "interval": args.interval, "duration": args.duration}
+
+    # Round-robin so that when the flow count does not divide evenly the
+    # remainder is spread, not piled on worker 0.
+    shards = [[] for _ in range(nworkers)]
+    for i, (peer, pps) in enumerate(peers):
+        addr, port = matrix.endpoint(peer)
+        shards[i % nworkers].append((peer, addr, port, pps))
+
+    stop = multiprocessing.Event()
+    queue = multiprocessing.Queue()
+    procs = []
+    for wid in range(nworkers):
+        p = multiprocessing.Process(target=_worker, name="mx-worker-%d" % wid,
+                                    args=(wid, matrix, me, cfg, shards[wid],
+                                          stop, queue))
+        p.daemon = True
+        p.start()
+        procs.append(p)
 
     def on_stop(_sig, _frame):
-        agent.stop.set()
+        stop.set()
 
     signal.signal(signal.SIGTERM, on_stop)
     signal.signal(signal.SIGINT, on_stop)
 
-    for _ in range(max(1, args.workers)):
-        r = Responder(agent, len(matrix.hosts))
-        agent.responders.append(r)
-        r.start()
-
-    peers = matrix.peers_of(host)
-    for peer, pps in peers:
-        addr, port = matrix.endpoint(peer)
-        fl = Flow(agent, peer, addr, port, pps)
-        agent.flows.append(fl)
-    # Give every responder a moment to bind before the first request.
-    time.sleep(0.1)
-    for fl in agent.flows:
-        fl.start()
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
-    reporter = Reporter(agent, args.report)
+    os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".",
+                exist_ok=True)
+    reporter = Reporter(me, args.report, matrix.tx_size, matrix.rx_size,
+                        nworkers)
 
     log("mx agent %s: host=%s port=%d flows=%d tx_size=%d rx_size=%d "
         "workers=%d report=%s"
-        % (VERSION, host, agent.port, len(agent.flows), agent.tx_size,
-           agent.rx_size, max(1, args.workers), args.report))
+        % (VERSION, me, matrix.ports[me], len(peers), matrix.tx_size,
+           matrix.rx_size, nworkers, args.report))
 
     deadline = time.monotonic() + args.duration if args.duration > 0 else None
-    next_tick = time.monotonic() + args.interval
-    while not agent.stop.is_set():
-        agent.stop.wait(max(0.0, min(next_tick - time.monotonic(), 0.25)))
-        if time.monotonic() >= next_tick:
-            reporter.tick()
-            next_tick += args.interval
-        if deadline is not None and time.monotonic() >= deadline:
-            agent.stop.set()
-    # A final partial interval, but only if it covers enough time to
-    # carry an honest rate.
-    if time.monotonic() - reporter.last >= args.interval * 0.5:
-        reporter.tick()
+    interval = args.interval
+    next_tick = time.monotonic() + interval
+    # Wait a little past the tick for stragglers, rather than reporting a
+    # window with one worker's numbers missing -- which would read as a
+    # host that stopped serving.
+    grace = min(1.0, interval * 0.5)
+    pending, seen = [], set()
+
+    while not stop.is_set():
+        try:
+            pending.append(queue.get(timeout=0.2))
+            seen.add(pending[-1].wid)
+        except Empty:
+            pass
+        now = time.monotonic()
+        live = sum(1 for p in procs if p.is_alive()) or len(procs)
+        if now >= next_tick and (len(seen) >= live or now >= next_tick + grace):
+            if pending:
+                reporter.tick(pending, complete=len(seen) >= live)
+                pending, seen = [], set()
+            next_tick = now + interval if now > next_tick + interval \
+                else next_tick + interval
+        if deadline is not None and now >= deadline:
+            break
+        if not any(p.is_alive() for p in procs):
+            break
+
+    stop.set()
+    for p in procs:
+        p.join(timeout=5)
+    for p in procs:
+        if p.is_alive():
+            p.terminate()
+    # Whatever the workers managed to report on their way out. This one is
+    # never treated as complete: the run is ending, workers stop at
+    # slightly different moments, and a partial sum here would look like a
+    # cliff in the last interval of every run.
+    pending.extend(_drain(queue))
+    if pending:
+        reporter.tick(pending, complete=False)
+    queue.close()
     log("mx agent: stopped")
     return 0
+
+
+def _drain(q):
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except Empty:
+            break
+        except (OSError, ValueError):             # queue closed under us
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1029,7 +1251,7 @@ def _agent_flags(args):
     flags = ["--interval", "%g" % args.interval]
     if args.duration:
         flags += ["--duration", "%g" % args.duration]
-    if args.workers:
+    if args.workers and args.workers != "auto":
         flags += ["--workers", str(args.workers)]
     if args.bind:
         flags += ["--bind", args.bind]
@@ -1231,8 +1453,9 @@ def cmd_check(args):
     else:
         log("  no caps given -- pass --nic-gbps and/or --nic-mpps to check them")
     log("")
-    log("  note: a per-host python agent tops out around a few hundred kpps;")
-    log("        `mx start --workers N` scales the responder across cores.")
+    log("  note: one agent worker process sustains roughly 200k packets/sec of")
+    log("        request+reply. `--workers auto` (the default) runs one per")
+    log("        core, so a host's own ceiling is about 200k x cores.")
     return 0
 
 
@@ -1659,9 +1882,9 @@ def _summary_hints(rx_size, hostagg, target, tx_pps, rep_pps, fwd_pps,
     hints = []
     hot = [(h, a.mean("cpu_max_pct")) for h, a in hostagg.items()
            if a.mean("cpu_max_pct") >= 85.0]
-    # The agent is one Python process, so the GIL caps it near 100% of a
-    # single core. That, not the box-wide figure, is the number that says
-    # "you are measuring the tool, not the network".
+    # Each worker is one Python process, so the GIL caps it near 100% of a
+    # single core. The busiest worker, not the box-wide figure, is what
+    # says "you are measuring the tool, not the network".
     busy_agents = [(h, a.mean("agent_cpu_pct")) for h, a in hostagg.items()
                    if a.mean("agent_cpu_pct") >= 75.0]
     short = target and tx_pps < target * 0.95
@@ -1670,13 +1893,13 @@ def _summary_hints(rx_size, hostagg, target, tx_pps, rep_pps, fwd_pps,
 
     if short and busy_agents:
         worst = max(busy_agents, key=lambda kv: kv[1])
-        hints.append("sending %.0f%% of target, and the agent process on %s is "
-                     "at %.0f%% of one core: you are measuring the agent, not "
-                     "the fabric. One python process cannot go much past 100%% "
-                     "of a core. Split the load across more hosts, lower --pps, "
-                     "or raise `mx start --workers N` (responder threads spend "
-                     "most of their time in send/recv, where the GIL is "
-                     "released, so it helps -- but not linearly)."
+        hints.append("sending %.0f%% of target, and the busiest agent worker on "
+                     "%s is at %.0f%% of a core: you are measuring the agent, "
+                     "not the fabric. One worker is one python process and one "
+                     "GIL, so it stops at ~100%% of a single core (~200k "
+                     "packets/sec of request+reply). Raise `mx start --workers "
+                     "N` if that host has spare cores, otherwise spread the "
+                     "load across more hosts or lower --pps."
                      % (pct(tx_pps, target), worst[0], worst[1]))
     elif short and hot:
         hints.append("sending %.0f%% of target and %d host(s) have a core at "
@@ -1807,9 +2030,10 @@ mx hints -- what you want, and the command that gets it
 
   SMALL PACKETS, HIGH PACKET RATE (the usual fabric torture test)
     mx gen --servers servers.txt --pps max --tx-size 64 --rx-size 64
-    mx start --workers 4
+    mx start --workers auto
       64-byte requests answered by 64-byte replies, unpaced. Packet rate
       is the metric; bandwidth will be tiny and that is the point.
+      `--workers auto` is the default and runs one process per core.
 
   ASYMMETRIC REQUEST/RESPONSE (small ask, big answer)
     mx gen --servers servers.txt --pps 5000 --tx-size 128 --rx-size 8192
@@ -1853,10 +2077,13 @@ mx hints -- what you want, and the command that gets it
     mx clean --yes     # agents down, /var/tmp/mx gone, nothing left
 
   WHEN THE NUMBERS DISAPPOINT
-    packet rate is CPU work: one python agent sends a few hundred kpps
-    per core. `mx start --workers N` scales the responder; more hosts
-    scale the senders. `mx check --nic-gbps 25 --nic-mpps 15` tells you
-    whether you asked for something the NICs cannot do in the first place.
+    Packet rate is CPU work, and one python process is one GIL: a worker
+    sustains ~200k packets/sec of request+reply and stops at 100% of one
+    core. `--workers auto` runs one per core, so a host's own ceiling is
+    roughly 200k x cores -- watch the `agent` column in `mx summarize`,
+    and once it sits near 100% add workers, or add hosts. Meanwhile
+    `mx check --nic-gbps 25 --nic-mpps 15` tells you whether you asked
+    for something the NICs could never have done anyway.
 
   SIZE A RUN BEFORE RUNNING IT
     mx hints --servers servers.txt --pps-per-host 2000000 --tx-size 64
@@ -1899,12 +2126,24 @@ def cmd_hints(args):
     log("  mx check --nic-gbps 25 --nic-mpps 15    # your NIC's real numbers")
     log("  mx run --for 60")
     log("")
-    if per_host > 400000:
-        log("  heads up: %s per host is beyond what one python agent thread"
+    # One worker process sustains ~200k packets/sec of request+reply, and
+    # a host does both, so size the workers off the combined rate.
+    need = int((per_host * 2) / WORKER_PPS) + 1
+    if need > 1:
+        log("  that needs about %d worker processes per host (one worker "
+            "sustains" % need)
+        log("  ~%s of request+reply, and each host does both directions):"
+            % fmt_pps(WORKER_PPS))
+        log("      mx start --workers %d        # needs >= %d cores per host"
+            % (need, need))
+        if need > MAX_AUTO_WORKERS:
+            log("  `--workers auto` would only use %d, so set it explicitly."
+                % MAX_AUTO_WORKERS)
+    if need > 32:
+        log("  heads up: %s per host is a lot to ask of a socket-based agent."
             % fmt_pps(per_host))
-        log("  sustains (~200-400 kpps). Use `mx start --workers %d`, and expect"
-            % max(2, int(per_host / 250000) + 1))
-        log("  the senders to be the limit before the fabric is.")
+        log("  Past a few Mpps per host the kernel's own UDP path is the limit")
+        log("  too -- widen the fleet instead, or reach for AF_XDP/DPDK.")
     if out_bps > 25e9:
         log("  heads up: %s per host needs a 40/100G NIC." % fmt_gbps(out_bps))
     log("  a smaller --tx-size raises packets/sec for the same bandwidth;")
@@ -1938,9 +2177,11 @@ def _add_run_flags(p):
                    help="agent report interval, seconds (default: %(default)s)")
     p.add_argument("--duration", type=float, default=0.0,
                    help="agents exit after N seconds (default: run until stopped)")
-    p.add_argument("--workers", type=int, default=0,
-                   help="responder threads per host; raise when a core pegs "
-                        "(default: 1)")
+    p.add_argument("--workers", default="auto", metavar="N",
+                   help="worker processes per host, or 'auto' for one per "
+                        "core capped at %d. Packet rate scales with these, "
+                        "because one python process is one GIL "
+                        "(default: %%(default)s)" % MAX_AUTO_WORKERS)
     p.add_argument("--bind", default=_env("IPERF_BIND", ""), metavar="SPEC",
                    help="pin traffic to a NIC: substring matched against "
                         "`ip -o -4 addr show`, so 'eth1' or '10.0.' both work")
@@ -2052,7 +2293,7 @@ def build_parser():
     a.add_argument("--report", default=REPORT_NAME, help="report CSV path")
     a.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
     a.add_argument("--duration", type=float, default=0.0)
-    a.add_argument("--workers", type=int, default=1)
+    a.add_argument("--workers", default="auto")
     a.add_argument("--bind", default="")
     a.add_argument("--sndbuf", type=int, default=0)
     a.add_argument("--rcvbuf", type=int, default=0)

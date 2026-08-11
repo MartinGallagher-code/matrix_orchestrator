@@ -176,12 +176,12 @@ that matters most:
 |---|---|
 | `cpu` | the whole box, averaged over its cores |
 | `1 core` | the busiest single core |
-| `agent` | the **agent process itself**, as a share of *one* core |
+| `agent` | the **busiest agent worker**, as a share of *one* core |
 
-The agent is a single Python process, so the GIL holds it near 100% of
-one core no matter how many cores the box has. When `agent` approaches
-100% you are measuring the tool, not the network — and `mx summarize`
-says so in as many words.
+Each worker is one Python process, so the GIL holds it near 100% of one
+core. When `agent` approaches 100%, that worker is the ceiling and you
+are measuring the tool rather than the network — add workers if the host
+has spare cores, or add hosts. `mx summarize` says so in as many words.
 
 `mx summarize --grid g` also writes `pps_grid.csv`, `delivered_grid.csv`,
 `loss_grid.csv` and `rtt_p99_grid.csv` — N×N grids in the matrix's own
@@ -215,18 +215,37 @@ Before you blame the network, check what you asked for was possible:
 mx check --nic-gbps 25 --nic-mpps 15
 ```
 
-**One honest limit:** the agent is Python. One agent is one process, and
-the GIL holds a process near 100% of a single core, which works out at a
-few hundred thousand packets/sec. Past that you are measuring the agent,
-not the fabric.
+## How fast can it go
 
-Watch the `agent` column in the per-host table: as it approaches 100%,
-that host has stopped telling you anything about the network.
-`mx start --workers N` adds responder threads (they spend most of their
-time inside `sendto`/`recvfrom`, where the GIL is released, so it helps —
-but not linearly); spreading the load over more hosts is what actually
-scales the senders. `mx summarize` says all of this in plain words when
-the numbers show it happening.
+Packet rate is CPU work, and in Python one process is one GIL. So the
+agent runs **P worker processes** per host — `--workers auto` (the
+default) starts one per core, capped at 8. Each worker drives all of its
+sockets from a single event loop, and workers share the listening port
+through `SO_REUSEPORT`, so the kernel spreads inbound requests across
+them too.
+
+Measured on one ordinary core:
+
+| | Rate |
+|---|---|
+| One worker, request + reply | **~200k pps** |
+| Per host | ~200k × workers |
+| Fleet | ~200k × workers × hosts |
+
+So 9 Mpps across the fleet is 45 hosts at one worker each, or 12 hosts
+with 4 workers apiece — `mx hints --pps-per-host N` does that arithmetic
+and tells you how many workers to ask for.
+
+Per *host*, expect 1–4 Mpps on a typical server. Beyond a few Mpps on a
+single box the kernel's own UDP socket path becomes the limit as much as
+Python does, and the answer is a wider fleet — or a different kind of
+tool entirely (AF_XDP, DPDK).
+
+Why processes and not threads: on a 4-core box, the same send loop runs
+at 300k pps in one thread, 199k across two, and 57k across four — threads
+convoy on the GIL and make it *worse*. The same work in four processes
+runs at 1.09M pps. Watch the `agent` column in `mx summarize`; as it
+approaches 100% that worker is saturated.
 
 ---
 
@@ -251,9 +270,9 @@ gone and no agent is still running.
 ## Common runs
 
 ```bash
-# Small-packet torture test, unpaced, 4 responder threads per host
+# Small-packet torture test, unpaced, one worker process per core
 mx gen --servers servers.txt --pps max --tx-size 64 --rx-size 64
-mx start --workers 4
+mx start --workers auto
 
 # RPC-shaped: small ask, large answer
 mx gen --servers servers.txt --pps 5000 --tx-size 128 --rx-size 8192
@@ -302,14 +321,18 @@ Each agent appends one row per flow per interval to `report.csv`, which
 ```
 ts,host,dir,peer,size,rep_size,target_pps,pps,mbps,rep_pps,rep_mbps,
 loss_pct,rtt_avg_us,rtt_p50_us,rtt_p99_us,rtt_max_us,cpu_pct,cpu_max_pct,
-agent_cpu_pct
+agent_cpu_pct,workers
 ```
 
 `dir=tx` rows are this host as a client (requests it sent, replies it got
 back, and the latency between them). `dir=rx` rows are this host as a
 server (requests that *arrived* from that peer, replies it sent). One
-`dir=host` row per interval carries the CPU samples. It is a plain CSV —
-take it to whatever you normally plot with.
+`dir=host` row per interval carries the CPU samples and the worker count.
+
+One row per peer per interval, whatever the worker count — the parent
+merges its workers' numbers before writing, so nothing downstream has to
+know how the host was sharded. It is a plain CSV; take it to whatever you
+normally plot with.
 
 ---
 
