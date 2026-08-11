@@ -125,6 +125,62 @@ EOF
     assert_contains "$RUN_OUT" "a -> b" "the error points at the cell" || return 1
 }
 
+test_peers_builds_an_exactly_k_regular_graph() {
+    printf 'h%02d\n' $(seq 1 12) > servers.txt
+    run_mx gen --servers servers.txt --peers 4 --pps 1000 --seed 11
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "12 hosts, 48 flows" "N x K flows" || return 1
+    assert_contains "$RUN_OUT" "every host identical" || return 1
+    # Every host: exactly 4 out, exactly 4 in, no self-loops. This is the
+    # whole promise of --peers, so it is asserted, not assumed.
+    python3 - <<'EOF'
+import csv, sys
+rows = [r for r in csv.reader(open("matrix.csv")) if r and not r[0].startswith("#")]
+hosts = rows[0][1:]
+in_deg = dict((h, 0) for h in hosts)
+for r in rows[1:]:
+    nz = [hosts[i] for i, c in enumerate(r[1:]) if c.strip()]
+    assert len(nz) == 4, "%s has %d out-flows" % (r[0], len(nz))
+    assert r[0] not in nz, "%s sends to itself" % r[0]
+    for d in nz:
+        in_deg[d] += 1
+assert set(in_deg.values()) == {4}, "in-degrees: %r" % in_deg
+EOF
+    assert_status 0 $? "graph must be exactly 4-regular" || return 1
+}
+
+test_peers_seed_replays_and_is_recorded() {
+    printf 'h%02d\n' $(seq 1 30) > servers.txt
+    run_mx gen --servers servers.txt --peers 3 --pps 100 --seed 42 -o a.csv
+    run_mx gen --servers servers.txt --peers 3 --pps 100 --seed 42 -o b.csv
+    cmp -s a.csv b.csv || { echo "same seed differed" >&2; return 1; }
+    run_mx gen --servers servers.txt --peers 3 --pps 100 --seed 43 -o c.csv
+    cmp -s a.csv c.csv && { echo "different seed matched" >&2; return 1; }
+    assert_contains "$(cat a.csv)" "peers=3 seed=42" "seed recorded in the header" || return 1
+}
+
+test_peers_splits_a_gbps_budget_over_k_not_n() {
+    # --gbps is a per-host budget: with 3 peers instead of 9 each flow
+    # must carry 3x the rate, keeping the host total constant.
+    printf 'h%02d\n' $(seq 1 10) > servers.txt
+    run_mx gen --servers servers.txt --gbps 1 --tx-size 1400 --peers 3 --seed 1
+    assert_status 0 "$RUN_RC" || return 1
+    local cell
+    cell=$(grep -v '^#' matrix.csv | sed -n 2p | tr ',' '\n' | grep -v '^$' | sed -n 3p)
+    assert_between 27000 30000 "$cell" "per-flow rate is budget/K" || return 1
+}
+
+test_peers_bounds_are_enforced() {
+    printf 'a\nb\nc\n' > servers.txt
+    run_mx gen --servers servers.txt --peers 0
+    assert_status 2 "$RUN_RC" "--peers 0 refused" || return 1
+    run_mx gen --servers servers.txt --peers 3
+    assert_status 2 "$RUN_RC" "--peers >= N refused" || return 1
+    assert_contains "$RUN_OUT" "between 1 and 2" || return 1
+    run_mx gen --servers servers.txt --peers 2
+    assert_status 0 "$RUN_RC" "--peers N-1 is just the full mesh" || return 1
+}
+
 run_test test_gen_writes_grid_with_config_header
 run_test test_gen_max_writes_unpaced_cells
 run_test test_gen_gbps_sizes_the_rate
@@ -136,4 +192,8 @@ run_test test_check_flags_over_capacity
 run_test test_check_counts_both_directions
 run_test test_missing_matrix_says_how_to_make_one
 run_test test_bad_cell_is_reported_with_its_location
+run_test test_peers_builds_an_exactly_k_regular_graph
+run_test test_peers_seed_replays_and_is_recorded
+run_test test_peers_splits_a_gbps_budget_over_k_not_n
+run_test test_peers_bounds_are_enforced
 report_tests
