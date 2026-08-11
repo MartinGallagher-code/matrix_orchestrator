@@ -318,6 +318,31 @@ test_streams_flag_is_validated() {
     assert_status 2 "$RUN_RC" "an absurd stream count is refused" || return 1
 }
 
+test_bind_refuses_an_address_the_matrix_does_not_target() {
+    # The 100%-loss trap: bind the listeners to one NIC while the matrix
+    # tells peers to send to another. The agent must refuse to start.
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 1000
+    mkdir -p bin
+    cat > bin/ip <<'EOF'
+#!/usr/bin/env bash
+echo '2: eth0    inet 127.0.0.1/8 scope global eth0'
+echo '3: eth1    inet 127.0.0.2/8 scope global eth1'
+EOF
+    chmod +x bin/ip
+    PATH="$PWD/bin:$PATH" run_mx agent --matrix matrix.csv --host a \
+        --duration 1 --workers 1 --bind eth1
+    assert_status 2 "$RUN_RC" "mismatched bind must refuse to start" || return 1
+    assert_contains "$RUN_OUT" "100% loss" "the error explains the outcome" || return 1
+    assert_contains "$RUN_OUT" "127.0.0.2" "...naming the bound address" || return 1
+    assert_contains "$RUN_OUT" "127.0.0.1" "...and the matrix address" || return 1
+    # The matching interface is accepted and actually runs.
+    PATH="$PWD/bin:$PATH" run_mx agent --matrix matrix.csv --host a \
+        --duration 1 --workers 1 --bind eth0
+    assert_status 0 "$RUN_RC" "matching bind should run" || return 1
+}
+
 test_workers_flag_is_validated() {
     local p; p=$(pick_port)
     write_servers "$p" a b > /dev/null
@@ -337,6 +362,7 @@ run_test test_streams_split_the_rate_rather_than_multiplying_it
 run_test test_streams_report_as_one_row_per_peer
 run_test test_streams_raise_the_worker_ceiling
 run_test test_streams_flag_is_validated
+run_test test_bind_refuses_an_address_the_matrix_does_not_target
 run_test test_workers_flag_is_validated
 run_test test_reply_size_differs_from_request_size
 run_test test_report_has_every_column_summarize_needs

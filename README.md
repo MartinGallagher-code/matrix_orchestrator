@@ -312,6 +312,9 @@ mx gen --servers servers.txt --gbps 10 --tx-size 1400
 # Pin everything to one NIC (interface name or address, both work)
 mx start --bind eth1
 
+# The complete flag reference, generated from the real parsers
+mx help
+
 # Watch it live
 mx status --watch 5
 
@@ -323,7 +326,29 @@ Every fleet command takes `--user`, `--jobs`, `--remote-dir`, `--python`
 and `--dry-run`; each has an `MX_*` environment variable
 (`MX_USER`, `MX_JOBS`, `MX_REMOTE_DIR`, `MX_PYTHON`, `MX_MATRIX`,
 `MX_SERVERS`, `MX_REPORTS`). `--dry-run` prints the ssh and scp commands
-instead of running them.
+instead of running them. `mx help` prints every switch of every command
+on one page.
+
+### How `--bind` really works (the two-NIC case)
+
+Fleets usually have a management NIC (the addresses in `servers.txt`,
+where ssh goes) and a data NIC (the one you want to load). Binding the
+local sockets to the data NIC is only half the job: the *destinations*
+have to be the peers' data-NIC addresses too, or every request goes to
+an address nobody is listening on and the run reports 100% loss that has
+nothing to do with the network.
+
+So `mx start --bind eth1` does both halves, the same way
+`iperf-orchestrator` does: it resolves the pattern **on every host over
+ssh** (substring match against that host's `ip -o -4 addr show`), then
+deploys a matrix retargeted at those data-plane addresses — ssh keeps
+using the login addresses, the traffic rides the bound NIC end to end.
+If any host has no matching interface, `start` aborts up front and names
+the hosts, before launching a mesh that cannot work.
+
+A hand-run `mx agent --bind ...` whose bound address does not match what
+the matrix tells peers refuses to start, with the explanation, instead
+of running a guaranteed-100%-loss test.
 
 ---
 

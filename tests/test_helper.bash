@@ -83,8 +83,10 @@ root="$FAKE_ROOT/$host"
 mkdir -p "$root"
 cmd="$*"
 printf 'ssh\t%s\t%s\n' "$host" "$cmd" >> "$FAKE_ROOT/calls.log"
-# Rewrite the remote working dir into this host's sandbox.
+# Rewrite the remote working dir into this host's sandbox, and tell any
+# per-host shims (e.g. a fake `ip`) which host they are running "on".
 cmd="${cmd//$MX_REMOTE_DIR/$root$MX_REMOTE_DIR}"
+export FAKE_HOST_ADDR="$host"
 cd "$root" && bash -c "$cmd"
 SHIM
     cat > "$FAKE_BIN/scp" <<'SHIM'

@@ -338,6 +338,34 @@ def payload_bps(pps, size):
     return pps * size * 8.0
 
 
+def check_bind_matches_matrix(matrix, me, bind_ip, iface):
+    """--bind pins this agent's listeners to one address; the matrix says
+    where the peers will send. If those disagree, every request arrives
+    at an address nobody is listening on, and the run reports 100% loss
+    that has nothing to do with the network -- so refuse to start.
+
+    `mx start --bind` avoids this by resolving the bind pattern on every
+    host and retargeting the deployed matrix at those addresses (the same
+    scheme iperf-orchestrator uses for its conn_ip); this check is the
+    safety net for hand-run agents.
+    """
+    addr = matrix.addrs[me]
+    try:
+        resolved = socket.getaddrinfo(addr, None, socket.AF_INET,
+                                      socket.SOCK_DGRAM)[0][4][0]
+    except OSError:
+        return       # can't resolve here; let the run speak for itself
+    if resolved != bind_ip:
+        die("--bind resolves to %s (%s), but the matrix tells peers to "
+            "reach %r at %s. Requests would arrive at an address this "
+            "agent is not listening on: 100%% loss, guaranteed, before "
+            "the network is even involved. Either start via `mx start "
+            "--bind ...` (which rewrites the deployed matrix to each "
+            "host's %s address), rebuild servers.txt from the %s-side "
+            "addresses, or drop --bind." % (bind_ip, iface, me, resolved,
+                                            iface, iface))
+
+
 def resolve_bind(spec):
     """--bind SPEC, iperf-orchestrator semantics: substring-match the spec
     against `ip -o -4 addr show`, so an interface name or an address both
@@ -1106,6 +1134,7 @@ def cmd_agent(args):
     if args.bind:
         iface, bind_ip = resolve_bind(args.bind)
         log("bind: %r -> %s (%s)" % (args.bind, bind_ip, iface))
+        check_bind_matches_matrix(matrix, me, bind_ip, iface)
 
     peers = matrix.peers_of(me)
     streams = resolve_streams(args.streams)
@@ -1523,6 +1552,53 @@ def cmd_check(args):
     return 0
 
 
+def _probe_bind_ips(fleet, spec):
+    """Resolve the --bind pattern ON EVERY HOST: same substring match
+    against that host's own `ip -o -4 addr show`. Returns name -> IPv4.
+
+    This is the load-bearing half of --bind, and the same scheme
+    iperf-orchestrator uses (its PEER_BIND_IPS / conn_ip): the server
+    list carries the login addresses, but pinning traffic to a NIC means
+    *targeting* each peer's address on that NIC, not just binding the
+    local sockets. Dies listing every host with no match, before a full
+    mesh of doomed agents is launched.
+    """
+    script = ("ip -o -4 addr show 2>/dev/null | grep -F -m1 -- %s | "
+              "awk '{print $4}' | cut -d/ -f1" % shlex.quote(spec))
+    hosts = fleet.matrix.hosts
+    with ThreadPoolExecutor(max_workers=fleet.jobs) as pool:
+        results = list(pool.map(lambda h: fleet.sh(h, script, timeout=30),
+                                hosts))
+    ips, missing = {}, []
+    for host, (rc, out) in zip(hosts, results):
+        ip = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if rc != 0 or not ip:
+            missing.append(host)
+        else:
+            ips[host] = ip
+    if missing:
+        die("--bind %r matches no interface on %d host(s): %s -- fix the "
+            "pattern (it is substring-matched against `ip -o -4 addr show` "
+            "on each host) before starting a mesh that cannot work."
+            % (spec, len(missing), " ".join(missing[:10])))
+    return ips
+
+
+def _write_retargeted_matrix(m, addr_of, path):
+    """The deployed matrix, with every address replaced by that host's
+    data-plane IP. Names, ports, rates and sizes are untouched, so the
+    local matrix keeps the login addresses ssh needs."""
+    tokens = ["%s=%s:%d" % (h, addr_of[h], m.ports[h]) for h in m.hosts]
+
+    def cell(si, di):
+        pps = m.rates.get((m.hosts[si], m.hosts[di]), 0)
+        if not pps:
+            return ""
+        return "max" if pps == float("inf") else "%.3f" % pps
+
+    write_matrix(path, tokens, cell, m.tx_size, m.rx_size, m.port)
+
+
 def cmd_start(args):
     m = load_matrix(args.matrix)
     fleet = Fleet(m, args)
@@ -1532,10 +1608,20 @@ def cmd_start(args):
     if not args.no_deploy:
         # scp lands a file under its own basename, and the agent always
         # looks for matrix.csv -- so stage a copy under that name when the
-        # local file is called something else.
+        # local file is called something else. With --bind the staged copy
+        # is retargeted at each host's data-plane IP, so the traffic rides
+        # the bound NIC end to end while ssh keeps the login addresses.
         tmpdir = None
         matrix_src = args.matrix
-        if os.path.basename(matrix_src) != MATRIX_NAME:
+        if args.bind and not fleet.dry_run:
+            bind_ips = _probe_bind_ips(fleet, args.bind)
+            tmpdir = tempfile.mkdtemp(prefix="mx-")
+            matrix_src = os.path.join(tmpdir, MATRIX_NAME)
+            _write_retargeted_matrix(m, bind_ips, matrix_src)
+            changed = sum(1 for h in m.hosts if m.addrs[h] != bind_ips[h])
+            log("[mx] --bind %r: matrix retargeted at each host's matching "
+                "address (%d of %d changed)" % (args.bind, changed, len(m.hosts)))
+        elif os.path.basename(matrix_src) != MATRIX_NAME:
             tmpdir = tempfile.mkdtemp(prefix="mx-")
             matrix_src = os.path.join(tmpdir, MATRIX_NAME)
             shutil.copyfile(args.matrix, matrix_src)
@@ -2350,18 +2436,22 @@ def build_parser():
                    help="output file, '-' for stdout (default: %(default)s)")
 
     c = sub.add_parser("check", help="will the fleet carry this matrix?")
-    c.add_argument("--matrix", default=_env("MX_MATRIX", DEFAULT_MATRIX))
+    c.add_argument("--matrix", default=_env("MX_MATRIX", DEFAULT_MATRIX),
+                   help="matrix CSV to check (default: %(default)s)")
     c.add_argument("--nic-gbps", type=float, help="per-host NIC bandwidth cap")
     c.add_argument("--nic-mpps", type=float, help="per-host NIC packet-rate cap, Mpps")
     c.add_argument("--top", type=int, default=15, help="hosts to list")
 
     h = sub.add_parser("hints", help="what you want -> the command for it")
-    h.add_argument("--servers", default=_env("MX_SERVERS", DEFAULT_SERVERS))
+    h.add_argument("--servers", default=_env("MX_SERVERS", DEFAULT_SERVERS),
+                   help="server list the sizing math is for (default: %(default)s)")
     h.add_argument("--pps-per-host", type=float, help="size a run for this per-host rate")
     h.add_argument("--pps-per-pair", type=float, help="size a run for this per-pair rate")
     h.add_argument("--gbps-per-host", type=float, help="size a run for this per-host Gbps")
-    h.add_argument("--tx-size", type=int, default=64)
-    h.add_argument("--rx-size", type=int, default=64)
+    h.add_argument("--tx-size", type=int, default=64,
+                   help="request size the sizing assumes (default: %(default)s)")
+    h.add_argument("--rx-size", type=int, default=64,
+                   help="reply size the sizing assumes (default: %(default)s)")
 
     s = sub.add_parser("start", help="deploy the agent and start it everywhere")
     _add_fleet_flags(s)
@@ -2378,7 +2468,8 @@ def build_parser():
 
     co = sub.add_parser("collect", help="pull report CSVs, no analysis")
     _add_fleet_flags(co)
-    co.add_argument("--reports", default=_env("MX_REPORTS", "reports"))
+    co.add_argument("--reports", default=_env("MX_REPORTS", "reports"),
+                    help="local directory to pull into (default: %(default)s)")
 
     sp = sub.add_parser("stop", help="stop the agents (files stay)")
     _add_fleet_flags(sp)
@@ -2405,17 +2496,56 @@ def build_parser():
     _add_fleet_flags(d)
 
     a = sub.add_parser("agent", help="the per-host worker (started by `mx start`)")
-    a.add_argument("--matrix", default=DEFAULT_MATRIX)
-    a.add_argument("--host", help="this host's name in the matrix")
-    a.add_argument("--report", default=REPORT_NAME, help="report CSV path")
-    a.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
-    a.add_argument("--duration", type=float, default=0.0)
-    a.add_argument("--workers", default="auto")
-    a.add_argument("--streams", type=int, default=1)
-    a.add_argument("--bind", default="")
-    a.add_argument("--sndbuf", type=int, default=0)
-    a.add_argument("--rcvbuf", type=int, default=0)
+    a.add_argument("--matrix", default=DEFAULT_MATRIX,
+                   help="matrix CSV (default: %(default)s)")
+    a.add_argument("--host", help="this host's name in the matrix "
+                                  "(default: gethostname, then address match)")
+    a.add_argument("--report", default=REPORT_NAME,
+                   help="report CSV path (default: %(default)s)")
+    a.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
+                   help="report interval, seconds (default: %(default)s)")
+    a.add_argument("--duration", type=float, default=0.0,
+                   help="exit after N seconds (default: run until signalled)")
+    a.add_argument("--workers", default="auto",
+                   help="worker processes, or 'auto' (default: %(default)s)")
+    a.add_argument("--streams", type=int, default=1,
+                   help="sockets per peer (default: %(default)s)")
+    a.add_argument("--bind", default="",
+                   help="pin to a NIC; must match the matrix addresses")
+    a.add_argument("--sndbuf", type=int, default=0,
+                   help="SO_SNDBUF per flow (default: kernel default)")
+    a.add_argument("--rcvbuf", type=int, default=0,
+                   help="SO_RCVBUF per responder (default: 8 MB)")
+
+    sub.add_parser("help", help="every switch of every command, one page")
     return ap
+
+
+def cmd_full_help(ap):
+    """`mx help`: the complete flag reference, generated from the real
+    parsers so it cannot drift from what the code accepts."""
+    sub_action = next(a for a in ap._actions
+                      if isinstance(a, argparse._SubParsersAction))
+    log("mx %s -- every command, every switch. `mx CMD --help` shows one" % VERSION)
+    log("command with its defaults; `mx hints` maps goals to commands.")
+    for name, parser in sub_action.choices.items():
+        if name == "help":
+            continue
+        log("")
+        log("=" * 74)
+        text = parser.format_help().rstrip()
+        # The per-command usage line already says everything the header
+        # would; strip the "options:" boilerplate line for density.
+        for line in text.splitlines():
+            if line.strip() == "options:":
+                continue
+            log(line)
+    log("")
+    log("=" * 74)
+    log("environment variables (each is the default for the matching flag):")
+    log("  MX_MATRIX MX_SERVERS MX_REPORTS MX_REMOTE_DIR MX_USER (or SSH_USER)")
+    log("  MX_JOBS MX_PYTHON IPERF_BIND (same variable iperf-orchestrator uses)")
+    return 0
 
 
 COMMANDS = {
@@ -2433,8 +2563,10 @@ def main(argv=None):
         ap.print_help()
         log("")
         log("start here:  mx gen --servers servers.txt --pps 20000 && mx run --for 60")
-        log("stuck?       mx hints")
+        log("stuck?       mx hints        every switch:  mx help")
         return 2
+    if args.cmd == "help":
+        return cmd_full_help(ap)
     try:
         return COMMANDS[args.cmd](args) or 0
     except KeyboardInterrupt:
