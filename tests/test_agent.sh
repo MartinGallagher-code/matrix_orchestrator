@@ -259,6 +259,65 @@ test_workers_auto_picks_a_sane_number() {
     assert_between 1 8 "$n" "auto should pick between 1 and the cap" || return 1
 }
 
+test_streams_split_the_rate_rather_than_multiplying_it() {
+    # The whole premise: N sockets per pair carry the same offered load,
+    # so a run with --streams 8 must not send 8x the packets.
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 4000
+    run_agents 7 a b --workers 2 --streams 8
+    assert_contains "$(cat rep/a.log)" "streams=8 flows=8" \
+        "8 sockets for the one peer" || return 1
+    local sent; sent=$(csv_col rep/a.csv tx pps)
+    assert_between 3200 4800 "$sent" "8 streams still offer 4000 pps total" || return 1
+    local arrived; arrived=$(csv_col rep/b.csv rx pps)
+    assert_between 3200 4800 "$arrived" "and the peer receives 4000 pps" || return 1
+}
+
+test_streams_report_as_one_row_per_peer() {
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 4000
+    run_agents 7 a b --workers 2 --streams 8
+    local dupes
+    dupes=$(python3 - <<'EOF'
+import collections, csv
+n = collections.Counter()
+with open("rep/a.csv", newline="") as f:
+    for r in csv.DictReader(f):
+        n[(r["ts"], r["dir"], r["peer"])] += 1
+print(sum(1 for v in n.values() if v > 1))
+EOF
+)
+    assert_eq "0" "$dupes" "streams merge into one row per peer" || return 1
+}
+
+test_streams_raise_the_worker_ceiling() {
+    # Workers are capped at flows+1, and streams are what create flows --
+    # this is the fix for one pegged core on a small mesh.
+    python3 - <<'EOF'
+import sys
+sys.path.insert(0, __import__("os").environ["REPO_ROOT"] + "/matrix_orchestrator")
+import mx
+one = mx.resolve_workers("32", 1 * 1)      # 1 peer, 1 stream
+many = mx.resolve_workers("32", 1 * 8)     # 1 peer, 8 streams
+assert one == 2, "1 flow should cap workers at 2, got %d" % one
+assert many == 9, "8 flows should cap workers at 9, got %d" % many
+EOF
+    assert_status 0 $? "streams should raise the worker cap" || return 1
+}
+
+test_streams_flag_is_validated() {
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 1000
+    run_mx agent --matrix matrix.csv --host a --duration 1 --streams 0
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "at least 1" || return 1
+    run_mx agent --matrix matrix.csv --host a --duration 1 --streams 99999
+    assert_status 2 "$RUN_RC" "an absurd stream count is refused" || return 1
+}
+
 test_workers_flag_is_validated() {
     local p; p=$(pick_port)
     write_servers "$p" a b > /dev/null
@@ -274,6 +333,10 @@ run_test test_two_agents_hit_the_target_rate
 run_test test_multiple_workers_share_the_port_and_the_flows
 run_test test_one_row_per_peer_per_interval_however_many_workers
 run_test test_workers_auto_picks_a_sane_number
+run_test test_streams_split_the_rate_rather_than_multiplying_it
+run_test test_streams_report_as_one_row_per_peer
+run_test test_streams_raise_the_worker_ceiling
+run_test test_streams_flag_is_validated
 run_test test_workers_flag_is_validated
 run_test test_reply_size_differs_from_request_size
 run_test test_report_has_every_column_summarize_needs

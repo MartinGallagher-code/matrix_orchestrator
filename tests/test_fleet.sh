@@ -185,6 +185,23 @@ test_a_matrix_by_another_name_is_still_deployed_as_matrix_csv() {
     run_mx stop --matrix custom.csv
 }
 
+test_streams_and_workers_reach_the_remote_agents() {
+    # Runtime knobs have to survive the trip through ssh into the agent
+    # command line, or they silently do nothing on the fleet.
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    run_mx start --interval 2 --duration 20 --workers 3 --streams 4
+    assert_status 0 "$RUN_RC" || return 1
+    local sent; sent=$(grep -c -- "--streams 4" "$FAKE_ROOT/calls.log")
+    [ "$sent" -ge 1 ] || { echo "--streams never reached the hosts" >&2; return 1; }
+    sleep 4
+    run_mx logs
+    assert_contains "$(cat logs/alpha.log)" "streams=4" \
+        "the agent should report the stream count it was given" || return 1
+    assert_contains "$(cat logs/alpha.log)" "workers=3" || return 1
+    run_mx stop
+}
+
+run_test test_streams_and_workers_reach_the_remote_agents
 run_test test_start_deploys_agent_and_matrix
 run_test test_start_returns_instead_of_hanging_on_the_agent
 run_test test_status_shows_running_then_not_running

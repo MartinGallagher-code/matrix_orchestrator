@@ -91,6 +91,11 @@ MAX_AUTO_WORKERS = 8
 # limit anything -- the real number is in every summary's `agent` column.
 WORKER_PPS = 200000
 
+# Sockets per peer. The ceiling is a sanity check, not a tuned limit:
+# every stream is a socket on both ends, so N hosts x N peers x streams
+# is what the kernel has to hold.
+MAX_STREAMS = 256
+
 REPORT_NAME = "report.csv"
 LOG_NAME = "agent.log"
 PID_NAME = "agent.pid"
@@ -478,8 +483,12 @@ class Flow(object):
     plain integers with no synchronization anywhere.
     """
 
-    def __init__(self, peer, addr, port, target_pps):
+    def __init__(self, peer, addr, port, target_pps, stream=0):
         self.peer = peer
+        self.stream = stream
+        # Counters are kept per stream but reported per peer, so the key
+        # has to carry the stream and the label must not.
+        self.key = "%s#%d" % (peer, stream)
         self.addr = addr
         self.port = port
         self.target_pps = target_pps
@@ -535,11 +544,25 @@ class WorkerStats(object):
         self.cpu_pct = cpu_pct  # this worker's CPU, as a share of one core
 
 
-def _worker(wid, matrix, me, cfg, flow_specs, stop, queue):
+class WorkerView(object):
+    """The slice of the matrix a worker needs. The full Matrix carries the
+    whole rates dict -- ~N^2 cells, tens of MB at 1000 hosts -- and every
+    worker would inherit a pickled copy of it. This is the part they read.
+    """
+
+    def __init__(self, matrix, me):
+        self.hosts = matrix.hosts
+        self.my_index = matrix.index[me]
+        self.my_port = matrix.ports[me]
+        self.tx_size = matrix.tx_size
+        self.rx_size = matrix.rx_size
+
+
+def _worker(wid, view, me, cfg, flow_specs, stop, queue):
     """One worker process: send its share of the flows, answer requests
     on its own listening socket, and report every interval."""
     try:
-        _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue)
+        _worker_loop(wid, view, me, cfg, flow_specs, stop, queue)
     except KeyboardInterrupt:
         pass
     except Exception as exc:                      # noqa: BLE001
@@ -547,19 +570,19 @@ def _worker(wid, matrix, me, cfg, flow_specs, stop, queue):
         sys.stderr.flush()
 
 
-def _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue):
+def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
     import selectors
 
-    my_index = matrix.index[me]
-    tx_size, rx_size = matrix.tx_size, matrix.rx_size
+    my_index = view.my_index
+    tx_size, rx_size = view.tx_size, view.rx_size
     pad = pad_for(tx_size)
     pack, unpack = HDR.pack, HDR.unpack_from
     monotonic = time.monotonic
 
     sel = selectors.DefaultSelector()
     flows = []
-    for peer, addr, port, pps in flow_specs:
-        fl = Flow(peer, addr, port, pps)
+    for peer, addr, port, pps, stream in flow_specs:
+        fl = Flow(peer, addr, port, pps, stream)
         try:
             sel.register(fl.open(cfg["sndbuf"], cfg["bind_ip"]),
                          selectors.EVENT_READ, fl)
@@ -573,7 +596,7 @@ def _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue):
 
     # Responder. Every worker binds the same port with SO_REUSEPORT so the
     # kernel fans inbound requests across them.
-    srv_counts = [[0, 0, 0, 0] for _ in range(len(matrix.hosts) + 1)]
+    srv_counts = [[0, 0, 0, 0] for _ in range(len(view.hosts) + 1)]
     srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     reuseport = getattr(socket, "SO_REUSEPORT", None)
@@ -588,14 +611,14 @@ def _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue):
     except OSError:
         pass
     try:
-        srv.bind((cfg["bind_ip"], matrix.ports[me]))
+        srv.bind((cfg["bind_ip"], view.my_port))
         srv.setblocking(False)
         sel.register(srv, selectors.EVENT_READ, None)
     except OSError as exc:
         # Without SO_REUSEPORT only the first worker gets the port; the
         # rest stay senders, which still works, just with one responder.
         sys.stderr.write("mx agent: worker %d not listening on %s:%d (%s)\n"
-                         % (wid, cfg["bind_ip"] or "0.0.0.0", matrix.ports[me], exc))
+                         % (wid, cfg["bind_ip"] or "0.0.0.0", view.my_port, exc))
         sys.stderr.flush()
         srv.close()
         srv = None
@@ -729,7 +752,7 @@ def _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue):
             if cur_cpu is not None and prev_cpu is not None:
                 cpu_pct = (cur_cpu - prev_cpu) / elapsed * 100.0
             prev_cpu = cur_cpu
-            stats = _collect(wid, flows, srv_counts, matrix, me, prev,
+            stats = _collect(wid, flows, srv_counts, view, me, prev,
                              elapsed, cpu_pct)
             try:
                 queue.put(stats, block=False)
@@ -758,7 +781,7 @@ def _worker_loop(wid, matrix, me, cfg, flow_specs, stop, queue):
     sel.close()
 
 
-def _collect(wid, flows, srv_counts, matrix, me, prev, elapsed, cpu_pct):
+def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct):
     """Turn this worker's raw counters into one interval's finished rates."""
     def delta(key, value):
         was = prev.get(key, 0)
@@ -767,16 +790,19 @@ def _collect(wid, flows, srv_counts, matrix, me, prev, elapsed, cpu_pct):
 
     frows = []
     for fl in flows:
-        d_tx = delta(("tx", fl.peer), fl.tx_pkts)
-        d_txb = delta(("txb", fl.peer), fl.tx_bytes)
-        d_rx = delta(("rx", fl.peer), fl.rx_pkts)
-        d_rxb = delta(("rxb", fl.peer), fl.rx_bytes)
-        d_sum = delta(("rs", fl.peer), fl.rtt_sum)
-        d_n = delta(("rn", fl.peer), fl.rtt_n)
+        # Keyed per stream: two streams to the same peer are two sets of
+        # counters, and sharing a key would make each delta the difference
+        # between the other's total.
+        d_tx = delta(("tx", fl.key), fl.tx_pkts)
+        d_txb = delta(("txb", fl.key), fl.tx_bytes)
+        d_rx = delta(("rx", fl.key), fl.rx_pkts)
+        d_rxb = delta(("rxb", fl.key), fl.rx_bytes)
+        d_sum = delta(("rs", fl.key), fl.rtt_sum)
+        d_n = delta(("rn", fl.key), fl.rtt_n)
         hist = []
         for i, n in enumerate(fl.rtt_hist):
-            hist.append(n - prev.get(("h", fl.peer, i), 0))
-            prev[("h", fl.peer, i)] = n
+            hist.append(n - prev.get(("h", fl.key, i), 0))
+            prev[("h", fl.key, i)] = n
         frows.append({
             "peer": fl.peer,
             "target": None if not fl.paced else fl.target_pps,
@@ -793,7 +819,7 @@ def _collect(wid, flows, srv_counts, matrix, me, prev, elapsed, cpu_pct):
         })
 
     srows = []
-    for i, peer in enumerate(matrix.hosts):
+    for i, peer in enumerate(view.hosts):
         if peer == me:
             continue
         row = srv_counts[i]
@@ -957,24 +983,28 @@ class Reporter(object):
         # ceiling even when its siblings are idle, and averaging hides it.
         agent_cpu = max(cpus) if cpus else None
 
-        # The host row sums across workers, so it only means anything when
-        # every worker is in. A partial one would read as a host that went
-        # quiet -- the per-peer rows above are self-contained and stay.
-        if complete:
-            self.csv.writerow([
-                now, self.host, "host", "*", self.tx_size, self.rx_size,
-                "" if unpaced and not target else _num(target),
-                _num(tx_pps), _num(tx_bps / 1e6, "%.3f"),
-                _num(rx_pps), _num(rx_bps / 1e6, "%.3f"),
-                _num(100.0 - pct(rx_pps, tx_pps), "%.3f") if tx_pps else "",
-                "", _num(rtt_percentile(hist, 0.50), "%.0f"),
-                _num(rtt_percentile(hist, 0.99), "%.0f"), "",
-                _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers])
+        # The host row and the status line both sum across workers, so
+        # they only mean anything when every worker is in. A partial one
+        # reads as a host that went quiet -- the per-peer rows above are
+        # self-contained and stay either way.
+        if not complete:
+            self.fh.flush()
+            return
+
+        self.csv.writerow([
+            now, self.host, "host", "*", self.tx_size, self.rx_size,
+            "" if unpaced and not target else _num(target),
+            _num(tx_pps), _num(tx_bps / 1e6, "%.3f"),
+            _num(rx_pps), _num(rx_bps / 1e6, "%.3f"),
+            _num(100.0 - pct(rx_pps, tx_pps), "%.3f") if tx_pps else "",
+            "", _num(rtt_percentile(hist, 0.50), "%.0f"),
+            _num(rtt_percentile(hist, 0.99), "%.0f"), "",
+            _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers])
         self.fh.flush()
-        nflows = len(flows)
+        npeers = len(flows)
 
         log("ts=%d tx=%s/%s rx=%s serving=%s loss=%.2f%% rtt_p50=%s rtt_p99=%s "
-            "cpu=%s workers=%d flows=%d"
+            "cpu=%s workers=%d peers=%d"
             % (now, fmt_pps(tx_pps),
                "max" if unpaced and not target else fmt_pps(target),
                fmt_pps(rx_pps), fmt_pps(srv_pps),
@@ -982,7 +1012,7 @@ class Reporter(object):
                fmt_us(rtt_percentile(hist, 0.50)),
                fmt_us(rtt_percentile(hist, 0.99)),
                "%.0f%%(max %.0f%%)" % (cpu, cpu_max) if cpu is not None else "n/a",
-               self.nworkers, nflows)
+               self.nworkers, npeers)
             + (" busiest_worker=%.0f%% of a core" % agent_cpu
                if agent_cpu is not None else ""))
 
@@ -1045,9 +1075,27 @@ def resolve_workers(spec, nflows):
             die("--workers wants a number or 'auto' (got %r)" % spec)
         if n < 1:
             die("--workers must be at least 1")
-    # More workers than flows only adds responders; past one per flow plus
-    # a little headroom it is just processes sitting in select().
+    # More workers than flows only adds responders, and even those cannot
+    # help: inbound requests are spread by hashing the 4-tuple, so with F
+    # flows arriving there are only F tuples to spread. Raise --streams to
+    # raise this ceiling.
     return max(1, min(n, max(1, nflows) + 1)) if nflows else n
+
+
+def resolve_streams(spec):
+    """--streams N: sockets per peer. More sockets means more 4-tuples,
+    which is what lets workers, RSS queues and ECMP paths share the load
+    for a mesh with few peers."""
+    try:
+        n = int(spec)
+    except (TypeError, ValueError):
+        die("--streams wants a number (got %r)" % spec)
+    if n < 1:
+        die("--streams must be at least 1")
+    if n > MAX_STREAMS:
+        die("--streams above %d is almost certainly a mistake (got %d)"
+            % (MAX_STREAMS, n))
+    return n
 
 
 def cmd_agent(args):
@@ -1060,24 +1108,38 @@ def cmd_agent(args):
         log("bind: %r -> %s (%s)" % (args.bind, bind_ip, iface))
 
     peers = matrix.peers_of(me)
-    nworkers = resolve_workers(args.workers, len(peers))
+    streams = resolve_streams(args.streams)
+
+    # Each stream is its own socket, so it is its own 4-tuple: that is what
+    # gives the kernel, the fabric's ECMP hash and our own workers more
+    # than one thing to spread. The pair's rate is split across them, so
+    # the offered load is identical however many streams carry it.
+    specs = []
+    for peer, pps in peers:
+        addr, port = matrix.endpoint(peer)
+        per_stream = pps if pps == float("inf") else pps / streams
+        for s in range(streams):
+            specs.append((peer, addr, port, per_stream, s))
+
+    nworkers = resolve_workers(args.workers, len(specs))
 
     cfg = {"sndbuf": args.sndbuf, "rcvbuf": args.rcvbuf, "bind_ip": bind_ip,
            "interval": args.interval, "duration": args.duration}
 
     # Round-robin so that when the flow count does not divide evenly the
-    # remainder is spread, not piled on worker 0.
+    # remainder is spread, not piled on worker 0. Striding by stream means
+    # one peer's streams land on different workers, which is the point.
     shards = [[] for _ in range(nworkers)]
-    for i, (peer, pps) in enumerate(peers):
-        addr, port = matrix.endpoint(peer)
-        shards[i % nworkers].append((peer, addr, port, pps))
+    for i, spec in enumerate(specs):
+        shards[i % nworkers].append(spec)
 
+    view = WorkerView(matrix, me)
     stop = multiprocessing.Event()
     queue = multiprocessing.Queue()
     procs = []
     for wid in range(nworkers):
         p = multiprocessing.Process(target=_worker, name="mx-worker-%d" % wid,
-                                    args=(wid, matrix, me, cfg, shards[wid],
+                                    args=(wid, view, me, cfg, shards[wid],
                                           stop, queue))
         p.daemon = True
         p.start()
@@ -1094,10 +1156,10 @@ def cmd_agent(args):
     reporter = Reporter(me, args.report, matrix.tx_size, matrix.rx_size,
                         nworkers)
 
-    log("mx agent %s: host=%s port=%d flows=%d tx_size=%d rx_size=%d "
-        "workers=%d report=%s"
-        % (VERSION, me, matrix.ports[me], len(peers), matrix.tx_size,
-           matrix.rx_size, nworkers, args.report))
+    log("mx agent %s: host=%s port=%d peers=%d streams=%d flows=%d "
+        "tx_size=%d rx_size=%d workers=%d report=%s"
+        % (VERSION, me, matrix.ports[me], len(peers), streams, len(specs),
+           matrix.tx_size, matrix.rx_size, nworkers, args.report))
 
     deadline = time.monotonic() + args.duration if args.duration > 0 else None
     interval = args.interval
@@ -1253,6 +1315,8 @@ def _agent_flags(args):
         flags += ["--duration", "%g" % args.duration]
     if args.workers and args.workers != "auto":
         flags += ["--workers", str(args.workers)]
+    if getattr(args, "streams", 1) and args.streams != 1:
+        flags += ["--streams", str(args.streams)]
     if args.bind:
         flags += ["--bind", args.bind]
     if args.sndbuf:
@@ -1739,7 +1803,7 @@ def cmd_summarize(args):
             srv.setdefault((r["host"], r["peer"]), Agg()).add(r, ["pps", "rep_pps"])
         elif d == "host":
             hostagg.setdefault(r["host"], Agg()).add(
-                r, ["cpu_pct", "cpu_max_pct", "agent_cpu_pct"])
+                r, ["cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"])
     if not tx:
         die("no client rows in the last %ds -- are the agents still running?"
             % args.window)
@@ -1845,7 +1909,13 @@ def cmd_summarize(args):
     if args.grid:
         _write_grids(args.grid, m, tx, srv)
 
-    _summary_hints(rx_size, hostagg, target, tx_pps, rep_pps, fwd_pps, rtt_p50, rtt_p99)
+    # How many peers each host is a client for -- the cap on how many
+    # workers it can ever put to work.
+    flowcount = {}
+    for (host, _peer) in tx:
+        flowcount[host] = flowcount.get(host, 0) + 1
+    _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
+                   fwd_pps, rtt_p50, rtt_p99)
     return 0
 
 
@@ -1876,8 +1946,8 @@ def _write_grids(gdir, m, tx, srv):
     log("  wrote %s/{%s}" % (gdir, ",".join(sorted(grids))))
 
 
-def _summary_hints(rx_size, hostagg, target, tx_pps, rep_pps, fwd_pps,
-                   rtt_p50, rtt_p99):
+def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
+                   fwd_pps, rtt_p50, rtt_p99):
     """Turn what the numbers say into what to do next."""
     hints = []
     hot = [(h, a.mean("cpu_max_pct")) for h, a in hostagg.items()
@@ -1891,16 +1961,33 @@ def _summary_hints(rx_size, hostagg, target, tx_pps, rep_pps, fwd_pps,
     fwd_loss = max(0.0, 100.0 - pct(fwd_pps, tx_pps)) if tx_pps else 0.0
     ret_loss = max(0.0, pct(fwd_pps, tx_pps) - pct(rep_pps, tx_pps)) if tx_pps else 0.0
 
-    if short and busy_agents:
+    if busy_agents:
         worst = max(busy_agents, key=lambda kv: kv[1])
-        hints.append("sending %.0f%% of target, and the busiest agent worker on "
-                     "%s is at %.0f%% of a core: you are measuring the agent, "
-                     "not the fabric. One worker is one python process and one "
-                     "GIL, so it stops at ~100%% of a single core (~200k "
-                     "packets/sec of request+reply). Raise `mx start --workers "
-                     "N` if that host has spare cores, otherwise spread the "
-                     "load across more hosts or lower --pps."
-                     % (pct(tx_pps, target), worst[0], worst[1]))
+        agg = hostagg[worst[0]]
+        workers = int(agg.mean("workers") or 1)
+        peers = flowcount.get(worst[0], 0)
+        lead = ("sending %.0f%% of target, and " % pct(tx_pps, target)
+                if short else "")
+        hints.append("%sthe busiest agent worker on %s is at %.0f%% of a core: "
+                     "that worker, not the fabric, is the ceiling. One worker "
+                     "is one python process and one GIL, so it stops near 100%% "
+                     "of a single core (~%s of request+reply)."
+                     % (lead, worst[0], worst[1], fmt_pps(WORKER_PPS)))
+        # Workers cannot outnumber flows: inbound requests are spread by
+        # hashing the 4-tuple, so a mesh with few peers has few tuples to
+        # spread however many cores the box has. --streams is the lever.
+        if workers <= peers + 1:
+            hints.append("%s is running %d worker(s) for %d peer(s), which is "
+                         "the most it can use: workers are capped by the number "
+                         "of flows, because each pair is one socket and one "
+                         "4-tuple. Add `mx start --streams 8` -- it splits each "
+                         "pair's rate across 8 sockets, so the load spreads over "
+                         "8x the workers, NIC receive queues and ECMP paths. The "
+                         "offered rate does not change."
+                         % (worst[0], workers, peers))
+        else:
+            hints.append("raise `mx start --workers N` while %s has spare cores; "
+                         "past that, add hosts or lower --pps." % worst[0])
     elif short and hot:
         hints.append("sending %.0f%% of target and %d host(s) have a core at "
                      ">=85%% (%s): something on those boxes is CPU bound, and "
@@ -1997,19 +2084,31 @@ def cmd_doctor(args):
     log("  matrix      %s: %d hosts, %d flows, %d -> %d bytes, port %d"
         % (m.path, len(m.hosts), len(m.rates), m.tx_size, m.rx_size, m.port))
 
+    # Every flow is a socket, so a big mesh runs straight into the default
+    # nofile limit of 1024: at ~1000 peers the agent dies opening sockets.
+    # Checked on the hosts, because that is where the sockets open.
+    need_fds = len(m.hosts) - 1 + 64      # flows + listeners/report/headroom
     script = """
 py=$({py} -V 2>&1 || echo 'MISSING python')
 running=no
 {pgrep} >/dev/null 2>&1 && running=yes
-echo "$py; cores=$(nproc 2>/dev/null || echo ?); agent_running=$running"
-""".format(py=shlex.quote(fleet.python), pgrep=PGREP)
+fds=$(ulimit -n 2>/dev/null || echo ?)
+low=""
+[ "$fds" != unlimited ] && [ "$fds" -lt {need} ] 2>/dev/null \
+    && low=" FDS-TOO-LOW(need>{need})"
+echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile=$fds$low; agent_running=$running"
+""".format(py=shlex.quote(fleet.python), pgrep=PGREP, need=need_fds)
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
-                        "checking hosts (ssh + python)")
+                        "checking hosts (ssh + python + fd limit)")
     if failed:
         log("[mx] fix ssh/python on those hosts first: key-based ssh must work "
             "non-interactively (ssh-copy-id) and `%s` must exist." % fleet.python)
         return 1
+    if need_fds > 512:
+        log("[mx] every peer is one socket (~%d per agent here, more with "
+            "--streams); a host marked FDS-TOO-LOW needs `ulimit -n` raised "
+            "above %d before start." % (len(m.hosts) - 1, need_fds))
     log("[mx] fleet looks ready: mx start")
     return 0
 
@@ -2076,14 +2175,26 @@ mx hints -- what you want, and the command that gets it
     mx stop            # agents down, files still there
     mx clean --yes     # agents down, /var/tmp/mx gone, nothing left
 
+  ONE CORE PEGGED WHILE THE REST OF THE BOX IDLES
+    mx start --streams 8
+      The classic small-mesh problem. Each pair is one socket and one
+      4-tuple, and everything downstream -- our worker processes, the
+      NIC's receive queues, the fabric's ECMP hash -- spreads load by
+      hashing that tuple. With 3 peers there are 3 tuples, so 3 cores do
+      the work however many the box has. `--streams N` gives each pair N
+      sockets instead of one, splitting its rate across them (the offered
+      load is unchanged) and so spreading it over N times as many
+      workers, queues and paths. Raise --workers to match.
+
   WHEN THE NUMBERS DISAPPOINT
     Packet rate is CPU work, and one python process is one GIL: a worker
     sustains ~200k packets/sec of request+reply and stops at 100% of one
-    core. `--workers auto` runs one per core, so a host's own ceiling is
-    roughly 200k x cores -- watch the `agent` column in `mx summarize`,
-    and once it sits near 100% add workers, or add hosts. Meanwhile
-    `mx check --nic-gbps 25 --nic-mpps 15` tells you whether you asked
-    for something the NICs could never have done anyway.
+    core. `--workers auto` runs one per core, capped at 8 -- on a big box
+    say `--workers 32` explicitly. Workers can never outnumber flows, so
+    on a small mesh raise --streams first. Watch the `agent` column in
+    `mx summarize`: near 100% means that worker is the limit, not the
+    network. Meanwhile `mx check --nic-gbps 25 --nic-mpps 15` tells you
+    whether you asked for something the NICs could never have done.
 
   SIZE A RUN BEFORE RUNNING IT
     mx hints --servers servers.txt --pps-per-host 2000000 --tx-size 64
@@ -2182,6 +2293,12 @@ def _add_run_flags(p):
                         "core capped at %d. Packet rate scales with these, "
                         "because one python process is one GIL "
                         "(default: %%(default)s)" % MAX_AUTO_WORKERS)
+    p.add_argument("--streams", type=int, default=1, metavar="N",
+                   help="sockets per peer (default: 1). Each is its own "
+                        "4-tuple, so raising this is what lets workers, NIC "
+                        "RSS queues and ECMP paths share a small mesh's "
+                        "load; the pair's packet rate is split across them, "
+                        "not multiplied")
     p.add_argument("--bind", default=_env("IPERF_BIND", ""), metavar="SPEC",
                    help="pin traffic to a NIC: substring matched against "
                         "`ip -o -4 addr show`, so 'eth1' or '10.0.' both work")
@@ -2294,6 +2411,7 @@ def build_parser():
     a.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
     a.add_argument("--duration", type=float, default=0.0)
     a.add_argument("--workers", default="auto")
+    a.add_argument("--streams", type=int, default=1)
     a.add_argument("--bind", default="")
     a.add_argument("--sndbuf", type=int, default=0)
     a.add_argument("--rcvbuf", type=int, default=0)

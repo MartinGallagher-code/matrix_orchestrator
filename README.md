@@ -247,6 +247,35 @@ convoy on the GIL and make it *worse*. The same work in four processes
 runs at 1.09M pps. Watch the `agent` column in `mx summarize`; as it
 approaches 100% that worker is saturated.
 
+### One core pegged while the rest of the box idles
+
+Workers can never outnumber flows, and by default a pair is **one socket,
+one 4-tuple**. Everything that spreads load downstream — our workers, the
+NIC's receive queues, the fabric's ECMP hash — does it by hashing that
+tuple. So a mesh with 3 peers puts 3 cores to work no matter how many the
+box has, and those cores sit at 100% while the rest idle.
+
+`--streams N` gives each pair N sockets instead of one. The pair's packet
+rate is **split** across them, so the offered load is identical; what
+changes is that there are now N times as many tuples to spread. Measured
+on 4 workers with one peer, unpaced:
+
+| `--streams` | workers used | achieved | busiest worker |
+|---|---|---|---|
+| 1 | 2 | 203.8 kpps | **100% of a core** |
+| 4 | 4 | 323.2 kpps | 51% |
+| 8 | 4 | 359.5 kpps | 56% |
+
+So the recipe for a big box against a small mesh is to raise both:
+
+```bash
+mx start --streams 8 --workers 32
+```
+
+`mx summarize` detects this case by itself — when a worker is pegged and
+the worker count is already at the flow-count cap, it says so and names
+the flag.
+
 ---
 
 ## Leaving no trace
