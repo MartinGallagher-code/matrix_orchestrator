@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every version the hosted runners still provide. The declared
+        # floor is 3.6, which setup-python can no longer install, so the
+        # bottom of the range runs in a container in the python-floor job
+        # below; vermin covers 3.7/3.8 statically.
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    name: test (python ${{ matrix.python-version }})
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python-version }}"
+
+      # The suite starts real agents on loopback and asserts on achieved
+      # packet rates, so it needs nothing installed -- only a network
+      # stack and a couple of free UDP ports.
+      - name: Run the test suite
+        run: ./tests/run_tests.sh
+
+  python-floor:
+    name: Python 3.6 compatibility
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Catches stdlib APIs newer than the floor, which a syntax-only
+      # compile check cannot see. The agent runs on whatever python3 the
+      # fleet has, so this floor is load-bearing.
+      - name: Scan for post-3.6 syntax and stdlib APIs
+        run: |
+          python -m pip install --upgrade vermin
+          ./tests/check_python_compat.sh
+          # The '-' suffix means "3.6 or later"; a bare --target=3.6 asks
+          # for code that needs *exactly* 3.6 and fails on anything older.
+          vermin --eval-annotations --violations --target=3.6- \
+            matrix_orchestrator/*.py
+
+      # Hosted runners no longer offer a 3.6 toolchain, so use the
+      # container. Checkout runs on the host, so there is no node20 issue.
+      - name: Run the suite under real Python 3.6
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w python:3.6-slim \
+            bash -euxc './tests/check_python_compat.sh && ./tests/run_tests.sh'
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # SC1091 only says shellcheck cannot open the sourced helper from
+      # its own working directory; following it instead (-x) makes every
+      # test function look unreachable, because run_test calls them by
+      # name. Excluding the one info-level check is the honest trade.
+      - name: Run shellcheck over the test harness
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -e SC1091 tests/*.sh tests/test_helper.bash
+
+  build:
+    name: build the wheel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and check
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
+      # A pip install must put a working `mx` on PATH -- that is the
+      # documented install path.
+      - name: Install the wheel and smoke-test the entry point
+        run: |
+          python -m pip install dist/*.whl
+          mx --version
+          printf 'a\nb\nc\n' > servers.txt
+          mx gen --servers servers.txt --pps 1000
+          mx check --nic-gbps 25
+          mx hints > /dev/null

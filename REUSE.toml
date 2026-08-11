@@ -1,0 +1,12 @@
+version = 1
+
+# The whole project is authored by Martin J. Gallagher and licensed
+# GPL-3.0-or-later. Files that carry their own SPDX headers keep them; this
+# blanket annotation supplies the same information for everything else
+# (docs, config, and anything generated).
+
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Martin J. Gallagher"
+SPDX-License-Identifier = "GPL-3.0-or-later"

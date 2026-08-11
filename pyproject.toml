@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matrix-orchestrator"
+version = "1.0.0"
+description = "Request/response traffic matrix across a fleet, measured in packets per second"
+readme = "README.md"
+requires-python = ">=3.6"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Martin J. Gallagher" }]
+maintainers = [{ name = "Martin J. Gallagher" }]
+keywords = [
+    "network",
+    "packets-per-second",
+    "pps",
+    "traffic-matrix",
+    "request-response",
+    "udp",
+    "latency",
+    "fabric",
+    "load-testing",
+    "benchmark",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: System :: Benchmark",
+]
+
+# Standard library only, on the orchestrator and on every host. The agent
+# is copied to servers by scp and run there, so a dependency here would
+# become a dependency on every machine in the fleet.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MartinGallagher-code/matrix_orchestrator"
+Repository = "https://github.com/MartinGallagher-code/matrix_orchestrator"
+Issues = "https://github.com/MartinGallagher-code/matrix_orchestrator/issues"
+Changelog = "https://github.com/MartinGallagher-code/matrix_orchestrator/blob/main/CHANGELOG.md"
+
+[project.scripts]
+mx = "matrix_orchestrator.mx:main"
+matrix-orchestrator = "matrix_orchestrator.mx:main"
+
+[tool.setuptools]
+packages = ["matrix_orchestrator"]
