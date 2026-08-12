@@ -9,6 +9,41 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.2.0] - 2026-08-12
+
+### Added
+
+- **The agent raises its own fd limit.** Every flow is a socket, and the
+  default soft limit of 1024 is exactly where a big mesh used to die on
+  startup. Raising the soft limit up to the hard limit needs no
+  privilege and ends with the process, so the agent now does it itself
+  and says so. Only when the HARD limit is too low does it refuse to
+  start -- up front, naming the limit, what the run needs, and the ways
+  out (limits.conf / systemd LimitNOFILE, fewer --streams, `--peers K`,
+  or more hosts). Nothing on the box is ever changed behind the
+  operator's back.
+- `mx doctor` accordingly now checks the hosts' HARD limit (`ulimit
+  -Hn`), the only one that still needs an administrator.
+- **Read the Docs integration.** `.readthedocs.yaml` plus a Sphinx/MyST
+  setup under `docs/` that *includes* the repository's own README,
+  CHANGELOG and PUBLISHING pages rather than duplicating them, and
+  generates the CLI reference from the live argparse parsers at build
+  time — the same anti-drift trick as `mx help`, so a flag cannot exist
+  undocumented or linger documented after removal. CI builds the docs
+  with warnings-as-errors on every push, so a docs break fails the PR
+  instead of surfacing on RTD. Importing the repo on readthedocs.org is
+  the only remaining step.
+- **PyPI packaging.** The distribution name `matrix-orchestrator` was
+  verified available; `pip install matrix-orchestrator` will put `mx`
+  on PATH (the console script collides with nothing — the old eGenix
+  `mx` distribution is a library with a different import package). The
+  sdist ships the license texts, changelog, REUSE metadata and the full
+  test suite so packagers can test exactly what they unpacked; a
+  `publish.yml` workflow uploads via PyPI trusted publishing (OIDC, no
+  stored token) on every GitHub Release, after building, `twine
+  check`ing and smoke-testing the wheel it is about to upload. See
+  PUBLISHING.md for the release ritual and one-time PyPI setup.
+
 ## [1.1.0] - 2026-08-11
 
 ### Added
@@ -114,5 +149,6 @@ second as the headline number.
   [`iperf_orchestrator`](https://github.com/MartinGallagher-code/iperf_orchestrator).
 - Python 3.6+ on the orchestrator and on every server; nothing else.
 
+[1.2.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.2.0
 [1.1.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.0.0

@@ -5,6 +5,11 @@ SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 
 # matrix_orchestrator (`mx`)
 
+[![PyPI version](https://img.shields.io/pypi/v/matrix-orchestrator.svg)](https://pypi.org/project/matrix-orchestrator/)
+[![Python versions](https://img.shields.io/pypi/pyversions/matrix-orchestrator.svg)](https://pypi.org/project/matrix-orchestrator/)
+[![CI](https://github.com/MartinGallagher-code/matrix_orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/MartinGallagher-code/matrix_orchestrator/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 Run a **request/response traffic matrix** across a fleet of servers, and
 get **packets per second** back as the headline number.
 
@@ -52,18 +57,19 @@ the round-trip time fall out for free.
 
 ## Install
 
-Nothing to install. `mx` is one file of standard-library Python:
+```bash
+pip install matrix-orchestrator
+```
+
+That puts `mx` on your `PATH` (and `matrix-orchestrator` as an alias).
+No dependencies — the package is standard-library only.
+
+Or skip installing entirely: `mx` is one self-contained file.
 
 ```bash
 git clone https://github.com/MartinGallagher-code/matrix_orchestrator
 cd matrix_orchestrator
 ./mx hints
-```
-
-Or with pip, which puts `mx` on your `PATH`:
-
-```bash
-pip install .
 ```
 
 **Requirements.** Python 3.6+ and `ssh`/`scp` on the machine you drive
@@ -119,7 +125,7 @@ because that is the number a NIC actually has to carry.
 in it — the hosts, the per-pair rates, the packet sizes, the port. No
 other command needs those flags again:
 
-```csv
+```text
 # mx matrix v1 -- rows send, columns receive, cells are packets/sec
 # tx_size=64 rx_size=512 port=5300
 src\dst,10.0.0.10,10.0.0.11,10.0.0.12
@@ -304,6 +310,17 @@ mx start --streams 8 --workers 32
 `mx summarize` detects this case by itself — when a worker is pegged and
 the worker count is already at the flow-count cap, it says so and names
 the flag.
+
+### File descriptors take care of themselves
+
+Every flow is a socket, and the common soft `ulimit -n` default of 1024
+is exactly where a big mesh or a high `--streams` count used to die on
+startup. The agent now raises its own *soft* limit to what the run needs
+— that requires no privilege, and the raise lives and dies with the
+process, so nothing on the box changes. Only a too-low *hard* limit
+still needs an administrator: the agent refuses to start with the fix
+named (`limits.conf` / systemd `LimitNOFILE`), and `mx doctor` flags
+such hosts (`FDS-TOO-LOW`, from `ulimit -Hn`) before you deploy.
 
 ---
 

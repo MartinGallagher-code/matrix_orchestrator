@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -1114,6 +1114,54 @@ def resolve_workers(spec, nflows):
     return max(1, min(n, max(1, nflows) + 1)) if nflows else n
 
 
+def raise_fd_limit(nflows):
+    """Every flow is a socket, so make sure this process may open enough.
+
+    Raising the SOFT limit up to the hard limit needs no privilege and
+    leaves no trace -- it lives and dies with this process, and workers
+    inherit it across fork. The default soft limit of 1024 is exactly
+    where a big mesh dies, so this removes the most common startup
+    failure without touching the box.
+
+    Only the HARD limit needs an administrator, and that case is a
+    refusal with the fix spelled out, never something changed behind the
+    operator's back.
+    """
+    # Flows + per-worker listener/report/queue plumbing + interpreter
+    # headroom. Workers inherit the parent's limit, and no worker holds
+    # more than the whole agent would.
+    need = nflows + 64
+    try:
+        import resource
+    except ImportError:
+        return                      # non-POSIX; let the run speak for itself
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return
+    if soft >= need:
+        return
+    if hard != resource.RLIM_INFINITY and hard < need:
+        die("this run needs ~%d file descriptors (%d flows; each is a "
+            "socket) but the hard limit is %d, which only an administrator "
+            "can raise. Either raise it (limits.conf / systemd "
+            "LimitNOFILE), lower --streams, use fewer peers (`mx gen "
+            "--peers K`), or split the load across more hosts."
+            % (need, nflows, hard))
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+        log("fd limit: soft %d -> %d (hard %s; raising the soft limit "
+            "needs no privilege and ends with this process)"
+            % (soft, need,
+               "unlimited" if hard == resource.RLIM_INFINITY else hard))
+    except (OSError, ValueError) as exc:
+        # Refused despite the headroom (containers can do this): better
+        # to start and let flow-open errors name the culprit than to
+        # guess wrongly here.
+        log("fd limit: could not raise soft limit %d -> %d (%s); "
+            "continuing, but flows may fail to open" % (soft, need, exc))
+
+
 def resolve_streams(spec):
     """--streams N: sockets per peer. More sockets means more 4-tuples,
     which is what lets workers, RSS queues and ECMP paths share the load
@@ -1155,6 +1203,8 @@ def cmd_agent(args):
             specs.append((peer, addr, port, per_stream, s))
 
     nworkers = resolve_workers(args.workers, len(specs))
+    # Before any worker forks, so they all inherit the raised limit.
+    raise_fd_limit(len(specs))
 
     cfg = {"sndbuf": args.sndbuf, "rcvbuf": args.rcvbuf, "bind_ip": bind_ip,
            "interval": args.interval, "duration": args.duration}
@@ -2226,19 +2276,19 @@ def cmd_doctor(args):
     log("  matrix      %s: %d hosts, %d flows, %d -> %d bytes, port %d"
         % (m.path, len(m.hosts), len(m.rates), m.tx_size, m.rx_size, m.port))
 
-    # Every flow is a socket, so a big mesh runs straight into the default
-    # nofile limit of 1024: at ~1000 peers the agent dies opening sockets.
-    # Checked on the hosts, because that is where the sockets open.
+    # Every flow is a socket. The agent raises its own SOFT fd limit at
+    # startup (no privilege needed), so the only real constraint is the
+    # HARD limit -- checked on the hosts, where the sockets open.
     need_fds = len(m.hosts) - 1 + 64      # flows + listeners/report/headroom
     script = """
 py=$({py} -V 2>&1 || echo 'MISSING python')
 running=no
 {pgrep} >/dev/null 2>&1 && running=yes
-fds=$(ulimit -n 2>/dev/null || echo ?)
+fds=$(ulimit -Hn 2>/dev/null || echo ?)
 low=""
 [ "$fds" != unlimited ] && [ "$fds" -lt {need} ] 2>/dev/null \
     && low=" FDS-TOO-LOW(need>{need})"
-echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile=$fds$low; agent_running=$running"
+echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile_hard=$fds$low; agent_running=$running"
 """.format(py=shlex.quote(fleet.python), pgrep=PGREP, need=need_fds)
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
@@ -2249,8 +2299,10 @@ echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile=$fds$low; agent_running=
         return 1
     if need_fds > 512:
         log("[mx] every peer is one socket (~%d per agent here, more with "
-            "--streams); a host marked FDS-TOO-LOW needs `ulimit -n` raised "
-            "above %d before start." % (len(m.hosts) - 1, need_fds))
+            "--streams). The agent raises its own soft fd limit, so only a "
+            "host marked FDS-TOO-LOW needs an admin: raise the HARD limit "
+            "above %d (limits.conf / systemd LimitNOFILE) before start."
+            % (len(m.hosts) - 1, need_fds))
     log("[mx] fleet looks ready: mx start")
     return 0
 
