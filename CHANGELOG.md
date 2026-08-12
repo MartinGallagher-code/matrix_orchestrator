@@ -24,6 +24,15 @@ project uses [semantic versioning](https://semver.org/).
   operator's back.
 - `mx doctor` accordingly now checks the hosts' HARD limit (`ulimit
   -Hn`), the only one that still needs an administrator.
+- **Read the Docs integration.** `.readthedocs.yaml` plus a Sphinx/MyST
+  setup under `docs/` that *includes* the repository's own README,
+  CHANGELOG and PUBLISHING pages rather than duplicating them, and
+  generates the CLI reference from the live argparse parsers at build
+  time — the same anti-drift trick as `mx help`, so a flag cannot exist
+  undocumented or linger documented after removal. CI builds the docs
+  with warnings-as-errors on every push, so a docs break fails the PR
+  instead of surfacing on RTD. Importing the repo on readthedocs.org is
+  the only remaining step.
 - **PyPI packaging.** The distribution name `matrix-orchestrator` was
   verified available; `pip install matrix-orchestrator` will put `mx`
   on PATH (the console script collides with nothing — the old eGenix

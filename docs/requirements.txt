@@ -1,0 +1,4 @@
+# Docs build only -- the tool itself has no dependencies.
+sphinx>=7,<9
+myst-parser>=2,<5
+sphinx-rtd-theme>=2,<4

@@ -125,7 +125,7 @@ because that is the number a NIC actually has to carry.
 in it — the hosts, the per-pair rates, the packet sizes, the port. No
 other command needs those flags again:
 
-```csv
+```text
 # mx matrix v1 -- rows send, columns receive, cells are packets/sec
 # tx_size=64 rx_size=512 port=5300
 src\dst,10.0.0.10,10.0.0.11,10.0.0.12
