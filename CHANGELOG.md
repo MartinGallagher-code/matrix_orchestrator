@@ -24,6 +24,16 @@ project uses [semantic versioning](https://semver.org/).
   operator's back.
 - `mx doctor` accordingly now checks the hosts' HARD limit (`ulimit
   -Hn`), the only one that still needs an administrator.
+- **PyPI packaging.** The distribution name `matrix-orchestrator` was
+  verified available; `pip install matrix-orchestrator` will put `mx`
+  on PATH (the console script collides with nothing — the old eGenix
+  `mx` distribution is a library with a different import package). The
+  sdist ships the license texts, changelog, REUSE metadata and the full
+  test suite so packagers can test exactly what they unpacked; a
+  `publish.yml` workflow uploads via PyPI trusted publishing (OIDC, no
+  stored token) on every GitHub Release, after building, `twine
+  check`ing and smoke-testing the wheel it is about to upload. See
+  PUBLISHING.md for the release ritual and one-time PyPI setup.
 
 ## [1.1.0] - 2026-08-11
 

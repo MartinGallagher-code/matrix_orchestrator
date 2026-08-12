@@ -5,6 +5,11 @@ SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 
 # matrix_orchestrator (`mx`)
 
+[![PyPI version](https://img.shields.io/pypi/v/matrix-orchestrator.svg)](https://pypi.org/project/matrix-orchestrator/)
+[![Python versions](https://img.shields.io/pypi/pyversions/matrix-orchestrator.svg)](https://pypi.org/project/matrix-orchestrator/)
+[![CI](https://github.com/MartinGallagher-code/matrix_orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/MartinGallagher-code/matrix_orchestrator/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 Run a **request/response traffic matrix** across a fleet of servers, and
 get **packets per second** back as the headline number.
 
@@ -52,18 +57,19 @@ the round-trip time fall out for free.
 
 ## Install
 
-Nothing to install. `mx` is one file of standard-library Python:
+```bash
+pip install matrix-orchestrator
+```
+
+That puts `mx` on your `PATH` (and `matrix-orchestrator` as an alias).
+No dependencies — the package is standard-library only.
+
+Or skip installing entirely: `mx` is one self-contained file.
 
 ```bash
 git clone https://github.com/MartinGallagher-code/matrix_orchestrator
 cd matrix_orchestrator
 ./mx hints
-```
-
-Or with pip, which puts `mx` on your `PATH`:
-
-```bash
-pip install .
 ```
 
 **Requirements.** Python 3.6+ and `ssh`/`scp` on the machine you drive
