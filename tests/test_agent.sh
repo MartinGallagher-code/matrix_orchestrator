@@ -343,6 +343,45 @@ EOF
     assert_status 0 "$RUN_RC" "matching bind should run" || return 1
 }
 
+test_low_soft_fd_limit_is_raised_automatically() {
+    # The classic 1024-soft-limit box: the agent must raise its own soft
+    # limit (needs no privilege) and open every flow, not die on socket().
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 2000
+    mkdir -p rep
+    ( ulimit -Sn 100
+      python3 "$MX" agent --matrix matrix.csv --host a --report rep/a.csv \
+          --interval 2 --duration 5 --workers 1 --streams 150 \
+          > rep/a.log 2>&1 ) &
+    python3 "$MX" agent --matrix matrix.csv --host b --report rep/b.csv \
+        --interval 2 --duration 5 --workers 1 --streams 150 \
+        > rep/b.log 2>&1 &
+    wait
+    assert_contains "$(cat rep/a.log)" "fd limit: soft 100 ->" \
+        "the raise is announced" || return 1
+    assert_not_contains "$(cat rep/a.log)" "cannot reach" \
+        "every flow must open" || return 1
+    local sent; sent=$(csv_col rep/a.csv tx pps)
+    assert_between 1600 2400 "$sent" "traffic flows at the target rate" || return 1
+}
+
+test_too_low_hard_fd_limit_is_refused_with_the_fix() {
+    # Past the hard limit only an admin can help; the agent must refuse
+    # up front with the fix named, not fail flow by flow.
+    local p; p=$(pick_port)
+    write_servers "$p" a b > /dev/null
+    run_mx gen --servers servers.txt --pps 100
+    local out rc
+    out=$( ( ulimit -Sn 100 -Hn 100 2>/dev/null || ulimit -n 100
+             python3 "$MX" agent --matrix matrix.csv --host a --duration 2 \
+                 --workers 1 --streams 150 2>&1 ) )
+    rc=$?
+    assert_status 2 "$rc" "hard-limited agent must refuse to start" || return 1
+    assert_contains "$out" "hard limit" || return 1
+    assert_contains "$out" "LimitNOFILE" "the fix is named" || return 1
+}
+
 test_workers_flag_is_validated() {
     local p; p=$(pick_port)
     write_servers "$p" a b > /dev/null
@@ -363,6 +402,8 @@ run_test test_streams_report_as_one_row_per_peer
 run_test test_streams_raise_the_worker_ceiling
 run_test test_streams_flag_is_validated
 run_test test_bind_refuses_an_address_the_matrix_does_not_target
+run_test test_low_soft_fd_limit_is_raised_automatically
+run_test test_too_low_hard_fd_limit_is_refused_with_the_fix
 run_test test_workers_flag_is_validated
 run_test test_reply_size_differs_from_request_size
 run_test test_report_has_every_column_summarize_needs

@@ -305,6 +305,17 @@ mx start --streams 8 --workers 32
 the worker count is already at the flow-count cap, it says so and names
 the flag.
 
+### File descriptors take care of themselves
+
+Every flow is a socket, and the common soft `ulimit -n` default of 1024
+is exactly where a big mesh or a high `--streams` count used to die on
+startup. The agent now raises its own *soft* limit to what the run needs
+— that requires no privilege, and the raise lives and dies with the
+process, so nothing on the box changes. Only a too-low *hard* limit
+still needs an administrator: the agent refuses to start with the fix
+named (`limits.conf` / systemd `LimitNOFILE`), and `mx doctor` flags
+such hosts (`FDS-TOO-LOW`, from `ulimit -Hn`) before you deploy.
+
 ---
 
 ## Leaving no trace

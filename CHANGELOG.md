@@ -9,6 +9,22 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.2.0] - 2026-08-12
+
+### Added
+
+- **The agent raises its own fd limit.** Every flow is a socket, and the
+  default soft limit of 1024 is exactly where a big mesh used to die on
+  startup. Raising the soft limit up to the hard limit needs no
+  privilege and ends with the process, so the agent now does it itself
+  and says so. Only when the HARD limit is too low does it refuse to
+  start -- up front, naming the limit, what the run needs, and the ways
+  out (limits.conf / systemd LimitNOFILE, fewer --streams, `--peers K`,
+  or more hosts). Nothing on the box is ever changed behind the
+  operator's back.
+- `mx doctor` accordingly now checks the hosts' HARD limit (`ulimit
+  -Hn`), the only one that still needs an administrator.
+
 ## [1.1.0] - 2026-08-11
 
 ### Added
@@ -114,5 +130,6 @@ second as the headline number.
   [`iperf_orchestrator`](https://github.com/MartinGallagher-code/iperf_orchestrator).
 - Python 3.6+ on the orchestrator and on every server; nothing else.
 
+[1.2.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.2.0
 [1.1.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MartinGallagher-code/matrix_orchestrator/releases/tag/v1.0.0
