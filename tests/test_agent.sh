@@ -435,6 +435,33 @@ EOF
     assert_between 700 1300 "$sent" "per-host load stays one layer's" || return 1
 }
 
+test_layered_matrix_with_hostnames_resolves_in_the_parent() {
+    # A matrix that carries names, not IP literals: every peer must be
+    # resolved once in the agent's parent, never per flow in a worker --
+    # a layered agent rebuilds flows at every switch, and a resolver
+    # (with its timeouts) inside the workers' schedule is how a fleet
+    # ends up with report.csv growing but not one stats line in the log.
+    local p; p=$(pick_port)
+    { echo "a=localhost:$p"; echo "b=localhost:$((p+1))"
+      echo "c=localhost:$((p+2))"; echo "d=localhost:$((p+3))"; } > servers.txt
+    run_mx gen --servers servers.txt --pps 1000 --peers 1 --dwell 4 --seed 7
+    assert_status 0 "$RUN_RC" || return 1
+    mkdir -p rep
+    local h pids=()
+    for h in a b c d; do
+        python3 "$MX" agent --matrix matrix.csv --host "$h" \
+            --report "rep/$h.csv" --interval 2 --duration 10 --workers 2 \
+            > "rep/$h.log" 2>&1 &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    assert_contains "$(cat rep/a.log)" "ts=" \
+        "stats lines must reach the log" || return 1
+    assert_not_contains "$(cat rep/a.log)" "cannot reach" || return 1
+    local sent; sent=$(csv_col rep/a.csv tx pps)
+    assert_between 700 1300 "$sent" "named peers carry traffic" || return 1
+}
+
 test_layered_summarize_reports_coverage() {
     local p; p=$(pick_port)
     write_servers "$p" a b c d > /dev/null
@@ -486,6 +513,7 @@ run_test test_report_has_every_column_summarize_needs
 run_test test_rtt_is_measured
 run_test test_three_hosts_form_a_full_mesh
 run_test test_layered_agents_rotate_and_cover_every_pair
+run_test test_layered_matrix_with_hostnames_resolves_in_the_parent
 run_test test_layered_summarize_reports_coverage
 run_test test_summarize_reports_pps_gbps_loss_and_hints
 run_test test_summarize_writes_grids
