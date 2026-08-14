@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -104,7 +104,8 @@ MATRIX_NAME = "matrix.csv"          # name the matrix always takes on a host
 
 ZEROS = b"\0" * MAX_SIZE
 
-CONFIG_KEYS = ("tx_size", "rx_size", "port", "peers", "seed", "layers", "dwell")
+CONFIG_KEYS = ("tx_size", "rx_size", "port", "peers", "seed", "layers",
+               "dwell", "fill")
 
 _PADS = {}
 
@@ -136,11 +137,15 @@ class Layering(object):
     it rotates through.
     """
 
-    def __init__(self, peers, layers, dwell, seed):
+    def __init__(self, peers, layers, dwell, seed, fill=False):
         self.peers = peers      # flows per host per layer (K)
         self.layers = layers    # ceil((N-1)/K), never chosen by hand
         self.dwell = dwell      # seconds each layer is held
         self.seed = seed
+        # --equal-layers: the remainder layer is padded with repeats so
+        # every layer carries exactly K -- "exactly once" per cycle
+        # softens to "at least once" for the padded shifts.
+        self.fill = fill
 
     def cycle(self):
         """Seconds for one full rotation -- every ordered pair once."""
@@ -303,7 +308,8 @@ def load_matrix(path):
             die("%s: layers=%d but %d hosts at %d peers per layer partition "
                 "into %d layers -- the header was edited; regenerate with "
                 "`mx gen`" % (path, layers, n, peers, want))
-        layering = Layering(peers, layers, dwell, seed)
+        layering = Layering(peers, layers, dwell, seed,
+                            fill=bool(_int("fill", 0)))
     return Matrix(path, hosts, addrs, ports, rates, tx_size, rx_size, port,
                   layering)
 
@@ -580,8 +586,13 @@ class Flow(object):
         # the layer that just ended.
         self.draining = False
         # Counters are kept per stream but reported per peer, so the key
-        # has to carry the stream and the label must not.
-        self.key = "%s#%d" % (peer, stream)
+        # has to carry the stream and the label must not. It carries the
+        # layer too: --equal-layers lets the padded layer share a pair
+        # with layer 0, so at the cycle wrap a draining flow and a new
+        # active flow to the SAME peer overlap for one interval -- with
+        # one key they would read each other's delta baselines.
+        self.key = "%s#%d@%s" % (peer, stream,
+                                 "-" if layer is None else layer)
         self.addr = addr
         self.port = port
         self.target_pps = target_pps
@@ -1119,8 +1130,15 @@ class Reporter(object):
             if b.cpu_pct is not None:
                 cpus.append(b.cpu_pct)
             for f in b.flows:
-                cur = flows.get(f["peer"])
-                flows[f["peer"]] = f if cur is None else _merge_flow(cur, f)
+                # Keyed by (peer, layer, drain), not peer alone: at an
+                # --equal-layers cycle wrap the old layer's drain and the
+                # new layer's active flow are the SAME peer in the same
+                # interval, and folding them into one row would blank the
+                # active flow's traffic under the drain's flag. Two rows,
+                # each under its own layer, is the correct accounting.
+                fkey = (f["peer"], f.get("layer"), bool(f.get("drain")))
+                cur = flows.get(fkey)
+                flows[fkey] = f if cur is None else _merge_flow(cur, f)
             for s in b.srv:
                 cur = srv.get(s["peer"])
                 srv[s["peer"]] = s if cur is None else _merge_srv(cur, s)
@@ -1129,8 +1147,9 @@ class Reporter(object):
         unpaced = 0
         cur_layer = None
         hist = [0] * RTT_NBUCKETS
-        for peer in sorted(flows):
-            f = flows[peer]
+        for fkey in sorted(flows, key=lambda t: (t[0], str(t[1]), t[2])):
+            f = flows[fkey]
+            peer = f["peer"]
             drain = f.get("drain")
             layer = f.get("layer")
             tx_pps += f["pps"]
@@ -1206,7 +1225,7 @@ class Reporter(object):
             _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers,
             _num(cur_layer, "%d")])
         self.fh.flush()
-        npeers = len(flows)
+        npeers = len(set(p for p, _l, drain in flows if not drain))
 
         log("ts=%d tx=%s/%s rx=%s serving=%s loss=%.2f%% rtt_p50=%s rtt_p99=%s "
             "cpu=%s workers=%d peers=%d"
@@ -1470,9 +1489,10 @@ def cmd_agent(args):
            maxflows if lay else len(specs),
            matrix.tx_size, matrix.rx_size, nworkers, args.report))
     if lay:
-        log("mx agent: layered -- %d layers of %d peers, dwell %gs, cycle "
+        log("mx agent: layered -- %d layers of %d peers%s, dwell %gs, cycle "
             "%s; starting in layer %d"
-            % (lay.layers, lay.peers, lay.dwell, fmt_secs(lay.cycle()),
+            % (lay.layers, lay.peers, ", equal layers" if lay.fill else "",
+               lay.dwell, fmt_secs(lay.cycle()),
                int((time.time() + 0.01) // lay.dwell) % lay.layers))
 
     deadline = time.monotonic() + args.duration if args.duration > 0 else None
@@ -1742,7 +1762,7 @@ def shift_edges(relabel, shifts):
     return edges
 
 
-def layer_partition(n, k, seed):
+def layer_partition(n, k, seed, fill=False):
     """The layers of `--peers K --dwell T`: ONE permutation shared by every
     layer, and the n-1 nonzero shifts dealt out k at a time.
 
@@ -1753,7 +1773,13 @@ def layer_partition(n, k, seed):
     instead collide by birthday and leave a tail of pairs never measured.
 
     The last layer keeps the remainder when k does not divide n-1: fewer
-    peers for one dwell, never a pair measured twice or missed.
+    peers for one dwell, never a pair measured twice or missed. With
+    `fill` (--equal-layers) that layer is instead padded back up to k
+    with shifts repeated from the front of the deal, so every layer
+    carries exactly k and per-host load never dips -- at the price of
+    the padded shifts being measured twice per cycle. The pad shifts
+    come from other layers, so within any one layer the shifts are still
+    distinct: every layer is exactly k-regular either way.
 
     Returns (relabel, [shift list per layer]).
     """
@@ -1762,7 +1788,10 @@ def layer_partition(n, k, seed):
     rng.shuffle(relabel)
     shifts = list(range(1, n))
     rng.shuffle(shifts)
-    return relabel, [shifts[i:i + k] for i in range(0, n - 1, k)]
+    layers = [shifts[i:i + k] for i in range(0, n - 1, k)]
+    if fill and len(layers) > 1 and len(layers[-1]) < k:
+        layers[-1] = layers[-1] + shifts[:k - len(layers[-1])]
+    return relabel, layers
 
 
 def layered_flow_specs(matrix, me, streams):
@@ -1775,7 +1804,7 @@ def layered_flow_specs(matrix, me, streams):
     """
     lay = matrix.layering
     n = len(matrix.hosts)
-    relabel, shift_layers = layer_partition(n, lay.peers, lay.seed)
+    relabel, shift_layers = layer_partition(n, lay.peers, lay.seed, lay.fill)
     pos = [0] * n
     for i, h in enumerate(relabel):
         pos[h] = i
@@ -1819,6 +1848,9 @@ def cmd_gen(args):
     if args.dwell is not None and args.peers is None:
         die("--dwell rotates a --peers matrix through its layers; it needs "
             "--peers K to say how many flows each layer carries")
+    if args.equal_layers and args.dwell is None:
+        die("--equal-layers pads the rotation's remainder layer; it only "
+            "means something with --peers K --dwell T")
     if args.peers is not None:
         if not 1 <= args.peers <= n - 1:
             die("--peers must be between 1 and %d for %d hosts (got %d)"
@@ -1841,7 +1873,8 @@ def cmd_gen(args):
                 die("--peers %d already reaches all %d peers in one layer; "
                     "--dwell has nothing to rotate. Lower --peers, or drop "
                     "--dwell for a fixed sparse matrix." % (peers, n - 1))
-            relabel, shift_layers = layer_partition(n, peers, seed)
+            relabel, shift_layers = layer_partition(n, peers, seed,
+                                                    args.equal_layers)
             edges = shift_edges(relabel, shift_layers[0])
         elif peers < n - 1:
             edges = sparse_edges(n, peers, seed)
@@ -1881,12 +1914,16 @@ def cmd_gen(args):
         extra = ("# peers=%d seed=%d -- k-regular shuffle: every host sends to "
                  "and receives from exactly %d others\n" % (peers, seed, peers))
     if nlayers > 1:
-        extra += ("# layers=%d dwell=%g -- disjoint-shift layers on that one "
-                  "shuffle: the grid below\n"
+        extra += ("# layers=%d dwell=%g%s -- disjoint-shift layers on that "
+                  "one shuffle: the grid below\n"
                   "#   is layer 0; every agent derives layer "
                   "(walltime // dwell) %% layers itself,\n"
-                  "#   and one full cycle measures every ordered pair "
-                  "exactly once\n" % (nlayers, args.dwell))
+                  "#   and one full cycle measures every ordered pair %s\n"
+                  % (nlayers, args.dwell,
+                     " fill=1" if args.equal_layers else "",
+                     "at least once (the remainder\n#   layer is padded "
+                     "with repeats, so every layer carries exactly the "
+                     "same load)" if args.equal_layers else "exactly once"))
     write_matrix(args.output, tokens, cell_for, tx_size, rx_size, args.port,
                  extra_comment=extra)
     if args.output == "-":
@@ -1903,11 +1940,26 @@ def cmd_gen(args):
         last = (n - 1) - peers * (nlayers - 1)
         cycle = nlayers * args.dwell
         log("  layers   : %d, held %gs each -- every ordered pair measured "
-            "exactly once per %s cycle" % (nlayers, args.dwell, fmt_secs(cycle)))
-        if last != peers:
+            "%s per %s cycle"
+            % (nlayers, args.dwell,
+               "at least once" if args.equal_layers and last != peers
+               else "exactly once", fmt_secs(cycle)))
+        if last != peers and args.equal_layers:
+            log("             every layer carries exactly %d peers per host "
+                "(--equal-layers): the last\n"
+                "             layer's %d leftover shifts are padded with %d "
+                "repeats, so those %d pairs\n"
+                "             per host are measured twice per cycle and the "
+                "load never dips" % (peers, last, peers - last, peers - last))
+        elif last != peers:
             log("             the last layer carries the remainder: %d "
-                "peer%s per host instead of %d"
+                "peer%s per host instead of %d (use\n"
+                "             --equal-layers to pad it with repeats and "
+                "hold the load flat)"
                 % (last, "" if last == 1 else "s", peers))
+        elif args.equal_layers:
+            log("             --equal-layers: %d divides %d evenly, so "
+                "there is nothing to pad" % (peers, n - 1))
         log("             dwell must be a whole multiple of the agents' "
             "--interval (default %gs); `mx start` checks" % DEFAULT_INTERVAL)
     if cell == float("inf"):
@@ -1951,8 +2003,10 @@ def cmd_check(args):
         # the rotation only changes WHO carries it.
         log("  layered: %d layers of %d peers, dwell %gs -- the loads below "
             "are one layer's, held constant while the pairs rotate; every "
-            "ordered pair is measured once per %s cycle"
-            % (lay.layers, lay.peers, lay.dwell, fmt_secs(lay.cycle())))
+            "ordered pair is measured %s per %s cycle"
+            % (lay.layers, lay.peers, lay.dwell,
+               "at least once (equal layers)" if lay.fill else "once",
+               fmt_secs(lay.cycle())))
     if unpaced:
         log("  %d flows are unpaced ('max'): offered load is whatever the "
             "senders manage, so the caps below cannot be checked" % unpaced)
@@ -2058,8 +2112,10 @@ def _write_retargeted_matrix(m, addr_of, path):
     extra = ""
     if m.layering:
         lay = m.layering
-        extra = ("# peers=%d seed=%d layers=%d dwell=%g -- layered; the grid "
-                 "is layer 0\n" % (lay.peers, lay.seed, lay.layers, lay.dwell))
+        extra = ("# peers=%d seed=%d layers=%d dwell=%g%s -- layered; the "
+                 "grid is layer 0\n"
+                 % (lay.peers, lay.seed, lay.layers, lay.dwell,
+                    " fill=1" if lay.fill else ""))
     write_matrix(path, tokens, cell, m.tx_size, m.rx_size, m.port,
                  extra_comment=extra)
 
@@ -3103,6 +3159,13 @@ def build_parser():
                         "clock; dwell must be a whole multiple of the "
                         "run's --interval, and 3x the interval is the "
                         "sensible floor")
+    g.add_argument("--equal-layers", action="store_true",
+                   help="pad the rotation's remainder layer with repeated "
+                        "pairs so every layer carries exactly K flows per "
+                        "host and the load never dips. The repeated pairs "
+                        "are measured twice per cycle, so 'exactly once' "
+                        "softens to 'at least once'; a no-op when K "
+                        "divides N-1")
     g.add_argument("--tx-size", type=int, default=64, metavar="BYTES",
                    help="request size, %d-%d (default: %%(default)s)" % (HDR_SIZE, MAX_SIZE))
     g.add_argument("--rx-size", type=int, default=64, metavar="BYTES",

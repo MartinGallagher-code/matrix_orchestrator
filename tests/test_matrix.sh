@@ -261,6 +261,50 @@ run_test test_peers_builds_an_exactly_k_regular_graph
 run_test test_peers_seed_replays_and_is_recorded
 run_test test_peers_splits_a_gbps_budget_over_k_not_n
 run_test test_peers_bounds_are_enforced
+test_equal_layers_pad_the_remainder_with_repeats() {
+    # --equal-layers: every layer carries exactly K, the union is still
+    # the complete digraph, and only the padded shifts repeat. 11 hosts
+    # at K=3 is the awkward case: 10 shifts = 3+3+3+1.
+    printf 'h%02d\n' $(seq 1 11) > servers.txt
+    run_mx gen --servers servers.txt --peers 3 --pps 1000 --seed 5 \
+        --dwell 30 --equal-layers
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "exactly 3 peers per host" || return 1
+    assert_contains "$RUN_OUT" "at least once" \
+        "the guarantee is stated honestly" || return 1
+    assert_contains "$(head -8 matrix.csv)" "fill=1" \
+        "the pad is part of the schedule header" || return 1
+    python3 - <<'EOF'
+import sys, os
+sys.path.insert(0, os.environ["REPO_ROOT"] + "/matrix_orchestrator")
+import mx
+n = 11
+relabel, layers = mx.layer_partition(n, 3, 5, fill=True)
+assert [len(s) for s in layers] == [3, 3, 3, 3], layers
+for s in layers:
+    assert len(set(s)) == len(s), "a layer repeats a shift within itself"
+flat = [s for layer in layers for s in layer]
+assert set(flat) == set(range(1, n)), "padding lost a shift"
+dupes = len(flat) - len(set(flat))
+assert dupes == 2, "expected exactly the 2 pad shifts twice, got %d" % dupes
+# The unpadded partition must be untouched by the flag's existence.
+_r, plain = mx.layer_partition(n, 3, 5, fill=False)
+assert [len(s) for s in plain] == [3, 3, 3, 1], plain
+assert plain[:3] == layers[:3], "padding must only touch the last layer"
+EOF
+    assert_status 0 $? "padded layers stay k-regular and complete" || return 1
+    # Divides-evenly case: nothing to pad, and gen says so.
+    printf 'h%02d\n' $(seq 1 10) > servers.txt
+    run_mx gen --servers servers.txt --peers 3 --pps 1000 --dwell 30 \
+        --equal-layers
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "nothing to pad" || return 1
+    # And the flag without a rotation is refused.
+    run_mx gen --servers servers.txt --peers 3 --pps 1000 --equal-layers
+    assert_status 2 "$RUN_RC" "--equal-layers needs --dwell" || return 1
+}
+
+run_test test_equal_layers_pad_the_remainder_with_repeats
 run_test test_dwell_layers_partition_every_ordered_pair
 run_test test_dwell_flag_is_validated
 run_test test_edited_layers_header_is_refused

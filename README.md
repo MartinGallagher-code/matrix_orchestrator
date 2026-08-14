@@ -277,6 +277,17 @@ Per-pair pps is held constant across layers, so **per-host load never
 changes** — the rotation only changes who carries it. `mx check` on a
 layered matrix is therefore checking every layer at once.
 
+One exception: when K does not divide N−1, the last layer carries only
+the remainder, so per-host load dips to R·rate for one dwell per cycle.
+If the point of your run is a soak whose offered load never dips, add
+**`--equal-layers`**: the short layer is padded back up to K with pairs
+repeated from the other layers, so every layer carries exactly K flows
+per host and every host is equally busy all the time. The repeated
+pairs are measured twice per cycle, so the guarantee softens from
+"exactly once" to "at least once" — stated in the matrix header, the
+gen output and the agent log. It is a no-op when K divides N−1 (pick
+such a K and you need neither the flag nor the trade).
+
 The file stays one ordinary matrix: the grid in it is layer 0, and the
 other layers exist only as four header keys (`peers seed layers dwell`).
 Each agent derives the whole schedule from the seed — every host already
@@ -539,6 +550,12 @@ still in flight when the layer ended, with the send-side cells left
 blank. Blank, not zero — a zero rate there is an artifact of the switch,
 and any tool averaging the column would be poisoned by it. Treat
 `pps == ""` as "not sending this interval", not as zero.
+
+With `--equal-layers` a boundary interval at the cycle wrap can hold
+*two* rows for the same peer — the old layer's drain tail and the new
+layer's live flow — told apart by the `layer` column. Group by
+`(peer, layer)` rather than peer alone if you post-process layered
+reports yourself.
 
 ---
 

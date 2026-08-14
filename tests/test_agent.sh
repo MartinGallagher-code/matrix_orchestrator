@@ -462,6 +462,50 @@ test_layered_matrix_with_hostnames_resolves_in_the_parent() {
     assert_between 700 1300 "$sent" "named peers carry traffic" || return 1
 }
 
+test_equal_layers_hold_the_load_flat_in_every_layer() {
+    # 4 hosts at --peers 2: 3 shifts deal into layers of 2 and 1, so the
+    # plain rotation dips to half load every other dwell. --equal-layers
+    # pads the short layer back to 2 -- every layer must show exactly 2
+    # peers per host, and the whole mesh must still be covered.
+    local p; p=$(pick_port)
+    write_servers "$p" a b c d > /dev/null
+    run_mx gen --servers servers.txt --pps 1000 --peers 2 --dwell 4 \
+        --seed 7 --equal-layers
+    assert_status 0 "$RUN_RC" || return 1
+    mkdir -p rep
+    local h pids=()
+    for h in a b c d; do
+        python3 "$MX" agent --matrix matrix.csv --host "$h" \
+            --report "rep/$h.csv" --interval 2 --duration 12 --workers 1 \
+            > "rep/$h.log" 2>&1 &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    assert_contains "$(cat rep/a.log)" "equal layers" \
+        "the agent announces the pad" || return 1
+    python3 - <<'EOF'
+import csv, collections
+for h in "abcd":
+    by_layer = collections.defaultdict(set)
+    peers = set()
+    with open("rep/%s.csv" % h, newline="") as f:
+        for r in csv.DictReader(f):
+            if r["dir"] == "tx" and r.get("pps") and r.get("layer") != "":
+                # A negative rate is a delta computed across two flows
+                # sharing one baseline -- the padded pair's failure mode
+                # at the cycle wrap, where old and new layer overlap on
+                # the same peer.
+                assert float(r["pps"]) >= 0, "negative pps: %r" % r
+                by_layer[r["layer"]].add(r["peer"])
+                peers.add(r["peer"])
+    assert peers == set("abcd") - {h}, "%s covered only %r" % (h, peers)
+    for lj, ps in by_layer.items():
+        assert len(ps) == 2, "%s layer %s has %d peers, want 2 -- the " \
+            "load dipped" % (h, lj, len(ps))
+EOF
+    assert_status 0 $? "every layer carries exactly K peers" || return 1
+}
+
 test_layered_summarize_reports_coverage() {
     local p; p=$(pick_port)
     write_servers "$p" a b c d > /dev/null
@@ -514,6 +558,7 @@ run_test test_rtt_is_measured
 run_test test_three_hosts_form_a_full_mesh
 run_test test_layered_agents_rotate_and_cover_every_pair
 run_test test_layered_matrix_with_hostnames_resolves_in_the_parent
+run_test test_equal_layers_hold_the_load_flat_in_every_layer
 run_test test_layered_summarize_reports_coverage
 run_test test_summarize_reports_pps_gbps_loss_and_hints
 run_test test_summarize_writes_grids
