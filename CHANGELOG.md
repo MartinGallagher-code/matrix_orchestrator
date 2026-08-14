@@ -9,6 +9,26 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.4.0] - 2026-08-14
+
+### Added
+
+- **`mx gen --equal-layers`: a rotation whose load never dips.** When K
+  does not divide N−1, the plain rotation's last layer carries only the
+  remainder, so per-host load drops for one dwell per cycle.
+  `--equal-layers` pads that layer back up to K with shifts repeated
+  from the front of the deal: every layer then carries exactly K flows
+  per host — equally busy, all the time, whatever N and K are. The
+  padded shifts come from other layers, so each layer is still exactly
+  k-regular with no duplicate edges inside it; the trade is that the
+  K−R repeated pairs per host are measured twice per cycle, so the
+  coverage guarantee softens from "exactly once" to "at least once" —
+  and `gen`, `check`, the agent log and the matrix header all say so.
+  Off by default: without the flag, nothing changes and "exactly once"
+  stands. The pad is one header key (`fill=1`), derived from the same
+  seed like everything else, so it deploys as the same single file. A
+  no-op (with a note) when K already divides N−1.
+
 ## [1.3.1] - 2026-08-14
 
 ### Fixed

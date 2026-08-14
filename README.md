@@ -277,6 +277,17 @@ Per-pair pps is held constant across layers, so **per-host load never
 changes** — the rotation only changes who carries it. `mx check` on a
 layered matrix is therefore checking every layer at once.
 
+One exception: when K does not divide N−1, the last layer carries only
+the remainder, so per-host load dips to R·rate for one dwell per cycle.
+If the point of your run is a soak whose offered load never dips, add
+**`--equal-layers`**: the short layer is padded back up to K with pairs
+repeated from the other layers, so every layer carries exactly K flows
+per host and every host is equally busy all the time. The repeated
+pairs are measured twice per cycle, so the guarantee softens from
+"exactly once" to "at least once" — stated in the matrix header, the
+gen output and the agent log. It is a no-op when K divides N−1 (pick
+such a K and you need neither the flag nor the trade).
+
 The file stays one ordinary matrix: the grid in it is layer 0, and the
 other layers exist only as four header keys (`peers seed layers dwell`).
 Each agent derives the whole schedule from the seed — every host already
