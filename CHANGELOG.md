@@ -9,6 +9,15 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.4.1] - 2026-08-14
+
+### Changed
+
+- `mx --version` now prints the full notice in the canonical GNU form:
+  the version line first (scripts parse it), then
+  `Copyright (C) 2026 Martin J. Gallagher`, the GPLv3+ license line,
+  and the two free-software/no-warranty lines.
+
 ## [1.4.0] - 2026-08-14
 
 ### Added

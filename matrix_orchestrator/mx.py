@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -3129,7 +3129,17 @@ def build_parser():
     ap = argparse.ArgumentParser(
         prog="mx", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version", action="version", version="mx %s" % VERSION)
+    # The canonical GNU form: version line first (scripts parse it), then
+    # holder, license and the two GPL notice lines.
+    ap.add_argument("--version", action="version",
+                    version="mx %s\n"
+                            "Copyright (C) 2026 Martin J. Gallagher\n"
+                            "License GPLv3+: GNU GPL version 3 or later "
+                            "<https://gnu.org/licenses/gpl.html>\n"
+                            "This is free software: you are free to change "
+                            "and redistribute it.\n"
+                            "There is NO WARRANTY, to the extent permitted "
+                            "by law." % VERSION)
     sub = ap.add_subparsers(dest="cmd")
 
     g = sub.add_parser("gen", help="build matrix.csv from a server list")
