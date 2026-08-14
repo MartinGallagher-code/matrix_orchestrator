@@ -9,6 +9,59 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.3.0] - 2026-08-14
+
+### Added
+
+- **`mx gen --peers K --dwell T`: measure every ordered pair with only K
+  flows per host.** The `--peers` shuffle already builds its k-regular
+  graph as K shifted permutations of one relabeling; the complete digraph
+  is exactly the union of all N−1 shifts. So the layered mode deals those
+  N−1 shifts out K at a time: `⌈(N−1)/K⌉` edge-disjoint layers on the one
+  shared shuffle, each held for `--dwell` seconds, and one full rotation
+  measures every ordered pair **exactly once** — a schedule, not a
+  probabilistic hope. The layer count is derived, never chosen, so the
+  guarantee cannot be configured away. Per-pair pps stays constant across
+  layers, which keeps per-host load flat — the rotation only changes *who*
+  carries it. The grid in the file is layer 0 and the file stays a valid
+  matrix; the other layers exist only as four header keys
+  (`peers seed layers dwell`), because every agent derives the whole
+  schedule itself from the seed and switches on its own wall clock —
+  one file to deploy, no control channel to fail, and an old agent
+  simply runs layer 0 forever.
+- At every layer switch the finished layer's sockets stay open one more
+  report interval, so replies still in flight are counted for their own
+  layer instead of booked as loss — the tails land in `drain` rows whose
+  send-side cells stay blank rather than zero, which is what keeps the
+  averages honest. Peak fd cost is 2·K·streams, independent of the layer
+  count, and the agent sizes its fd limit for exactly that.
+- The report CSV gained a `layer` column (last, so existing column
+  positions are unchanged), and `mx summarize` understands it: fleet and
+  per-host rates become time averages over the window (summing each
+  pair's active-only mean would count every layer as if it ran the whole
+  time), per-pair delivery is the ratio of totals so the drain tails
+  reconcile, and two new sections appear — **COVERAGE**, the cumulative
+  count of ordered pairs measured across the whole report history with
+  the still-unmeasured ones named, and a per-layer table for the window.
+  `--grid` additionally writes `coverage_grid.csv`: the N×N of how many
+  intervals each pair has been measured, empty cells meaning never yet.
+- `mx start` refuses a dwell that is not a whole multiple of
+  `--interval` (switches must land on report ticks, or every boundary
+  row blurs) and prints the cycle time; `mx check` and `mx run` say what
+  the rotation covers and how long full coverage takes.
+- The per-host table in `mx summarize` gained the missing **egress**
+  column: everything the host puts on the wire — its own requests plus
+  the replies it owes its callers — in wire bits/sec.
+
+### Notes
+
+- The floor for `--dwell` is one report interval (switches land on
+  ticks); 3× the interval is the sensible minimum so each layer gets a
+  couple of clean interior intervals. With `--interval 1` a dwell of 3 s
+  is sound: 1000 hosts at `--peers 8` is 125 layers, a full
+  every-pair-once sweep every ~6¼ minutes, with only 8 sockets live per
+  host at any moment.
+
 ## [1.2.0] - 2026-08-12
 
 ### Added

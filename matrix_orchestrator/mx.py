@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -104,7 +104,7 @@ MATRIX_NAME = "matrix.csv"          # name the matrix always takes on a host
 
 ZEROS = b"\0" * MAX_SIZE
 
-CONFIG_KEYS = ("tx_size", "rx_size", "port")
+CONFIG_KEYS = ("tx_size", "rx_size", "port", "peers", "seed", "layers", "dwell")
 
 _PADS = {}
 
@@ -127,10 +127,31 @@ def _env(name, default):
 # Matrix
 # ---------------------------------------------------------------------------
 
+class Layering(object):
+    """The rotation schedule of a layered matrix (`mx gen --peers K --dwell T`).
+
+    The grid in the file is layer 0; the other layers exist only as this
+    header, because every agent derives them from (hosts, peers, seed) --
+    which is why a layered matrix deploys as one file however many layers
+    it rotates through.
+    """
+
+    def __init__(self, peers, layers, dwell, seed):
+        self.peers = peers      # flows per host per layer (K)
+        self.layers = layers    # ceil((N-1)/K), never chosen by hand
+        self.dwell = dwell      # seconds each layer is held
+        self.seed = seed
+
+    def cycle(self):
+        """Seconds for one full rotation -- every ordered pair once."""
+        return self.layers * self.dwell
+
+
 class Matrix(object):
     """Host list, endpoints, per-pair target rates and the run config."""
 
-    def __init__(self, path, hosts, addrs, ports, rates, tx_size, rx_size, port):
+    def __init__(self, path, hosts, addrs, ports, rates, tx_size, rx_size, port,
+                 layering=None):
         self.path = path
         self.hosts = hosts                  # ordered names; index == matrix row
         self.addrs = addrs                  # name -> address
@@ -139,6 +160,7 @@ class Matrix(object):
         self.tx_size = tx_size
         self.rx_size = rx_size
         self.port = port
+        self.layering = layering            # None, or the rotation schedule
         self.index = {h: i for i, h in enumerate(hosts)}
 
     def peers_of(self, host):
@@ -259,7 +281,31 @@ def load_matrix(path):
                 rates[(src, dst)] = pps
     if not rates:
         die("%s: every cell is empty -- no flows to run" % path)
-    return Matrix(path, hosts, addrs, ports, rates, tx_size, rx_size, port)
+
+    layering = None
+    if _int("layers", 1) > 1:
+        n = len(hosts)
+        layers = _int("layers", 1)
+        peers = _int("peers", 0)
+        seed = _int("seed", -1)
+        try:
+            dwell = float(cfg.get("dwell", 0))
+        except ValueError:
+            die("%s: bad dwell=%r in the config header" % (path, cfg["dwell"]))
+        if not 1 <= peers <= n - 1 or seed < 0 or dwell <= 0:
+            die("%s: layers=%d needs peers, seed and dwell in the header -- "
+                "regenerate with `mx gen --peers K --dwell T`" % (path, layers))
+        # The hard guarantee lives here: the layer count is a function of
+        # (hosts, peers), never a choice, so a cycle always covers every
+        # ordered pair exactly once. A header that disagrees was edited.
+        want = -(-(n - 1) // peers)
+        if layers != want:
+            die("%s: layers=%d but %d hosts at %d peers per layer partition "
+                "into %d layers -- the header was edited; regenerate with "
+                "`mx gen`" % (path, layers, n, peers, want))
+        layering = Layering(peers, layers, dwell, seed)
+    return Matrix(path, hosts, addrs, ports, rates, tx_size, rx_size, port,
+                  layering)
 
 
 def write_matrix(path, tokens, cell_for, tx_size, rx_size, port,
@@ -317,6 +363,16 @@ def fmt_gbps(bps):
     if bps >= 1e6:
         return "%.1f Mbps" % (bps / 1e6)
     return "%.0f kbps" % (bps / 1e3)
+
+
+def fmt_secs(s):
+    """'90' -> '1m30s', '7500' -> '2h05m': durations for humans."""
+    s = int(round(s))
+    if s < 60:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm%02ds" % (s // 60, s % 60)
+    return "%dh%02dm" % (s // 3600, s % 3600 // 60)
 
 
 def fmt_us(us):
@@ -515,9 +571,14 @@ class Flow(object):
     plain integers with no synchronization anywhere.
     """
 
-    def __init__(self, peer, addr, port, target_pps, stream=0):
+    def __init__(self, peer, addr, port, target_pps, stream=0, layer=None):
         self.peer = peer
         self.stream = stream
+        self.layer = layer      # which layer this flow belongs to, if any
+        # A drained flow stops sending but stays open one more interval so
+        # replies still in flight are counted, not booked as loss against
+        # the layer that just ended.
+        self.draining = False
         # Counters are kept per stream but reported per peer, so the key
         # has to carry the stream and the label must not.
         self.key = "%s#%d" % (peer, stream)
@@ -612,19 +673,42 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
     monotonic = time.monotonic
 
     sel = selectors.DefaultSelector()
-    flows = []
-    for peer, addr, port, pps, stream in flow_specs:
-        fl = Flow(peer, addr, port, pps, stream)
-        try:
-            sel.register(fl.open(cfg["sndbuf"], cfg["bind_ip"]),
-                         selectors.EVENT_READ, fl)
-        except OSError as exc:
-            sys.stderr.write("mx agent: worker %d cannot reach %s (%s:%d): %s\n"
-                             % (wid, peer, addr, port, exc))
-            sys.stderr.flush()
-            continue
-        fl.last = monotonic()
-        flows.append(fl)
+
+    def build_flows(specs, layer):
+        built = []
+        for peer, addr, port, pps, stream in specs:
+            fl = Flow(peer, addr, port, pps, stream, layer)
+            try:
+                sel.register(fl.open(cfg["sndbuf"], cfg["bind_ip"]),
+                             selectors.EVENT_READ, fl)
+            except OSError as exc:
+                sys.stderr.write("mx agent: worker %d cannot reach %s (%s:%d): %s\n"
+                                 % (wid, peer, addr, port, exc))
+                sys.stderr.flush()
+                continue
+            fl.last = monotonic()
+            built.append(fl)
+        return built
+
+    # Layered runs switch on the wall clock, each host on its own: the
+    # responder answers whatever arrives whoever sends it, so no host
+    # needs to agree with any other about when to switch -- skew only
+    # costs a blurred boundary interval. The small bias absorbs a tick
+    # that fires a few ms before the boundary it was aligned to.
+    nlayers = cfg.get("nlayers", 1)
+    dwell = cfg.get("dwell", 0.0)
+    layered = nlayers > 1
+
+    def wall_layer():
+        return int((time.time() + 0.01) // dwell) % nlayers
+
+    if layered:
+        layer = wall_layer()
+        flows = build_flows(flow_specs[layer], layer)
+    else:
+        layer = None
+        flows = build_flows(flow_specs, None)
+    draining = []      # (close_after, [flows]) -- oldest first
 
     # Responder. Every worker binds the same port with SO_REUSEPORT so the
     # kernel fans inbound requests across them.
@@ -659,8 +743,22 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
     prev = {}
     prev_cpu = read_self_cpu()
     interval = cfg["interval"]
+
+    def next_tick(now):
+        """When to report next. Layered runs align ticks to wall-clock
+        multiples of the interval: the dwell is a multiple of the interval,
+        so every layer switch lands exactly on a tick and no report row
+        ever straddles two layers. Ticks under half an interval away are
+        skipped, so a report never covers a sliver."""
+        if not layered:
+            return now + interval
+        wait = interval - (time.time() % interval)
+        if wait < interval * 0.5:
+            wait += interval
+        return now + wait
+
     last_report = monotonic()
-    next_report = last_report + interval
+    next_report = next_tick(last_report)
     deadline = last_report + cfg["duration"] if cfg["duration"] > 0 else None
     parent = os.getppid()
 
@@ -784,14 +882,42 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
             if cur_cpu is not None and prev_cpu is not None:
                 cpu_pct = (cur_cpu - prev_cpu) / elapsed * 100.0
             prev_cpu = cur_cpu
-            stats = _collect(wid, flows, srv_counts, view, me, prev,
+            # Draining flows are collected too: their late replies belong
+            # to the layer that just ended, and this is where they land.
+            drains = [fl for _dl, fls in draining for fl in fls]
+            stats = _collect(wid, flows + drains, srv_counts, view, me, prev,
                              elapsed, cpu_pct)
             try:
                 queue.put(stats, block=False)
             except Exception:                     # noqa: BLE001 - full queue
                 pass
             last_report = now
-            next_report = now + interval
+            next_report = next_tick(now)
+
+            # Only after their tail was collected may drained flows close;
+            # forgetting their deltas is what lets the same pair start
+            # from zero when its layer comes around next cycle.
+            while draining and draining[0][0] <= now:
+                for fl in draining.pop(0)[1]:
+                    try:
+                        sel.unregister(fl.sock)
+                    except (KeyError, ValueError):
+                        pass
+                    try:
+                        fl.sock.close()
+                    except OSError:
+                        pass
+                    _forget_flow(prev, fl.key)
+
+            if layered:
+                lj = wall_layer()
+                if lj != layer:
+                    for fl in flows:
+                        fl.draining = True
+                    if flows:
+                        draining.append((now + interval * 0.5, flows))
+                    flows = build_flows(flow_specs[lj], lj)
+                    layer = lj
 
         if deadline is not None and now >= deadline:
             break
@@ -800,7 +926,7 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
         if os.getppid() != parent:
             break
 
-    for fl in flows:
+    for fl in flows + [fl for _dl, fls in draining for fl in fls]:
         try:
             fl.sock.close()
         except OSError:
@@ -811,6 +937,16 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
         except OSError:
             pass
     sel.close()
+
+
+def _forget_flow(prev, key):
+    """Drop a closed flow's delta baselines. When its pair comes around
+    again next cycle the new flow's counters start at zero, and a stale
+    baseline would turn that into a huge negative delta."""
+    for k in ("tx", "txb", "rx", "rxb", "rs", "rn"):
+        prev.pop((k, key), None)
+    for i in range(RTT_NBUCKETS):
+        prev.pop(("h", key, i), None)
 
 
 def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct):
@@ -835,9 +971,18 @@ def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct):
         for i, n in enumerate(fl.rtt_hist):
             hist.append(n - prev.get(("h", fl.key, i), 0))
             prev[("h", fl.key, i)] = n
+        # A drained flow that caught no more replies has nothing left to
+        # say; a row of zeroes would read as a flow that stalled.
+        if fl.draining and not (d_tx or d_rx or d_n):
+            continue
         frows.append({
             "peer": fl.peer,
-            "target": None if not fl.paced else fl.target_pps,
+            "layer": fl.layer,
+            "drain": fl.draining,
+            # A draining flow offers nothing, so it carries no target --
+            # otherwise every switch interval would inflate the host's
+            # target by a whole layer's worth.
+            "target": None if not fl.paced or fl.draining else fl.target_pps,
             "pps": d_tx / elapsed,
             "mbps": d_txb * 8.0 / elapsed / 1e6,
             "rep_pps": d_rx / elapsed,
@@ -878,7 +1023,7 @@ def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct):
 REPORT_FIELDS = ["ts", "host", "dir", "peer", "size", "rep_size", "target_pps",
                  "pps", "mbps", "rep_pps", "rep_mbps", "loss_pct",
                  "rtt_avg_us", "rtt_p50_us", "rtt_p99_us", "rtt_max_us",
-                 "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"]
+                 "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers", "layer"]
 
 
 def _num(v, fmt="%.1f"):
@@ -898,6 +1043,8 @@ def _merge_flow(a, b):
     weight = sum(w for _v, w in avgs)
     return {
         "peer": a["peer"],
+        "layer": a.get("layer"),
+        "drain": a.get("drain") or b.get("drain"),
         "target": None if a["target"] is None or b["target"] is None
                   else a["target"] + b["target"],
         "pps": pps,
@@ -980,26 +1127,45 @@ class Reporter(object):
 
         tx_pps = rx_pps = tx_bps = rx_bps = target = 0.0
         unpaced = 0
+        cur_layer = None
         hist = [0] * RTT_NBUCKETS
         for peer in sorted(flows):
             f = flows[peer]
+            drain = f.get("drain")
+            layer = f.get("layer")
             tx_pps += f["pps"]
             rx_pps += f["rep_pps"]
             tx_bps += f["mbps"] * 1e6
             rx_bps += f["rep_mbps"] * 1e6
-            if f["target"] is None:
-                unpaced += 1
-            else:
-                target += f["target"]
+            if not drain:
+                if layer is not None:
+                    cur_layer = layer
+                if f["target"] is None:
+                    unpaced += 1
+                else:
+                    target += f["target"]
             for i, n in enumerate(f["hist"]):
                 hist[i] += n
+            if drain:
+                # The tail of a finished layer: replies (and their RTTs)
+                # that landed after the switch. The send-side cells stay
+                # blank -- a zero rate here is an artifact of the switch,
+                # and averaged in it would halve every mean downstream.
+                self.csv.writerow([
+                    now, self.host, "tx", peer, self.tx_size, self.rx_size,
+                    "", "", "", _num(f["rep_pps"]), _num(f["rep_mbps"], "%.3f"),
+                    "", _num(f["rtt_avg"], "%.0f"), _num(f["rtt_p50"], "%.0f"),
+                    _num(f["rtt_p99"], "%.0f"), _num(f["rtt_max"], "%.0f"),
+                    "", "", "", "", _num(layer, "%d")])
+                continue
             self.csv.writerow([
                 now, self.host, "tx", peer, self.tx_size, self.rx_size,
                 _num(f["target"]), _num(f["pps"]), _num(f["mbps"], "%.3f"),
                 _num(f["rep_pps"]), _num(f["rep_mbps"], "%.3f"),
                 _num(f["loss"], "%.3f"), _num(f["rtt_avg"], "%.0f"),
                 _num(f["rtt_p50"], "%.0f"), _num(f["rtt_p99"], "%.0f"),
-                _num(f["rtt_max"], "%.0f"), "", "", "", ""])
+                _num(f["rtt_max"], "%.0f"), "", "", "", "",
+                _num(layer, "%d")])
 
         srv_pps = 0.0
         for peer in sorted(srv):
@@ -1009,7 +1175,7 @@ class Reporter(object):
                 now, self.host, "rx", peer, self.tx_size, self.rx_size,
                 "", _num(s["pps"]), _num(s["mbps"], "%.3f"),
                 _num(s["rep_pps"]), _num(s["rep_mbps"], "%.3f"),
-                "", "", "", "", "", "", "", "", ""])
+                "", "", "", "", "", "", "", "", "", ""])
 
         # The busiest worker, not the average: one pegged worker is the
         # ceiling even when its siblings are idle, and averaging hides it.
@@ -1031,7 +1197,8 @@ class Reporter(object):
             _num(100.0 - pct(rx_pps, tx_pps), "%.3f") if tx_pps else "",
             "", _num(rtt_percentile(hist, 0.50), "%.0f"),
             _num(rtt_percentile(hist, 0.99), "%.0f"), "",
-            _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers])
+            _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers,
+            _num(cur_layer, "%d")])
         self.fh.flush()
         npeers = len(flows)
 
@@ -1045,6 +1212,7 @@ class Reporter(object):
                fmt_us(rtt_percentile(hist, 0.99)),
                "%.0f%%(max %.0f%%)" % (cpu, cpu_max) if cpu is not None else "n/a",
                self.nworkers, npeers)
+            + (" layer=%d" % cur_layer if cur_layer is not None else "")
             + (" busiest_worker=%.0f%% of a core" % agent_cpu
                if agent_cpu is not None else ""))
 
@@ -1190,31 +1358,59 @@ def cmd_agent(args):
 
     peers = matrix.peers_of(me)
     streams = resolve_streams(args.streams)
+    lay = matrix.layering
 
     # Each stream is its own socket, so it is its own 4-tuple: that is what
     # gives the kernel, the fabric's ECMP hash and our own workers more
     # than one thing to spread. The pair's rate is split across them, so
     # the offered load is identical however many streams carry it.
-    specs = []
-    for peer, pps in peers:
-        addr, port = matrix.endpoint(peer)
-        per_stream = pps if pps == float("inf") else pps / streams
-        for s in range(streams):
-            specs.append((peer, addr, port, per_stream, s))
-
-    nworkers = resolve_workers(args.workers, len(specs))
-    # Before any worker forks, so they all inherit the raised limit.
-    raise_fd_limit(len(specs))
+    if lay:
+        # A layer switch is purely local -- the responder answers whatever
+        # arrives -- but the accounting is only clean when switches land
+        # on report ticks, which needs the dwell to be a whole number of
+        # intervals. Warn rather than refuse: `mx start` refuses up
+        # front, and a hand-run agent is better blurry than dead.
+        ratio = lay.dwell / args.interval
+        if lay.dwell < args.interval or abs(ratio - round(ratio)) > 0.01:
+            log("mx agent: dwell %gs is not a whole multiple of the %gs "
+                "interval -- layer switches will land mid-interval and "
+                "blur the boundary rows" % (lay.dwell, args.interval))
+        layer_specs = layered_flow_specs(matrix, me, streams)
+        maxflows = max(len(s) for s in layer_specs)
+        nworkers = resolve_workers(args.workers, maxflows)
+        # x2: at every switch the old layer's sockets stay open one
+        # interval to catch in-flight replies while the new layer sends.
+        raise_fd_limit(2 * maxflows)
+    else:
+        specs = []
+        for peer, pps in peers:
+            addr, port = matrix.endpoint(peer)
+            per_stream = pps if pps == float("inf") else pps / streams
+            for s in range(streams):
+                specs.append((peer, addr, port, per_stream, s))
+        nworkers = resolve_workers(args.workers, len(specs))
+        # Before any worker forks, so they all inherit the raised limit.
+        raise_fd_limit(len(specs))
 
     cfg = {"sndbuf": args.sndbuf, "rcvbuf": args.rcvbuf, "bind_ip": bind_ip,
-           "interval": args.interval, "duration": args.duration}
+           "interval": args.interval, "duration": args.duration,
+           "nlayers": lay.layers if lay else 1,
+           "dwell": lay.dwell if lay else 0.0}
 
     # Round-robin so that when the flow count does not divide evenly the
     # remainder is spread, not piled on worker 0. Striding by stream means
     # one peer's streams land on different workers, which is the point.
-    shards = [[] for _ in range(nworkers)]
-    for i, spec in enumerate(specs):
-        shards[i % nworkers].append(spec)
+    # Layered shards are sharded layer by layer, so every layer spreads
+    # across the workers the same way.
+    if lay:
+        shards = [[[] for _ in layer_specs] for _ in range(nworkers)]
+        for j, lspecs in enumerate(layer_specs):
+            for i, spec in enumerate(lspecs):
+                shards[i % nworkers][j].append(spec)
+    else:
+        shards = [[] for _ in range(nworkers)]
+        for i, spec in enumerate(specs):
+            shards[i % nworkers].append(spec)
 
     view = WorkerView(matrix, me)
     stop = multiprocessing.Event()
@@ -1241,8 +1437,14 @@ def cmd_agent(args):
 
     log("mx agent %s: host=%s port=%d peers=%d streams=%d flows=%d "
         "tx_size=%d rx_size=%d workers=%d report=%s"
-        % (VERSION, me, matrix.ports[me], len(peers), streams, len(specs),
+        % (VERSION, me, matrix.ports[me], len(peers), streams,
+           maxflows if lay else len(specs),
            matrix.tx_size, matrix.rx_size, nworkers, args.report))
+    if lay:
+        log("mx agent: layered -- %d layers of %d peers, dwell %gs, cycle "
+            "%s; starting in layer %d"
+            % (lay.layers, lay.peers, lay.dwell, fmt_secs(lay.cycle()),
+               int((time.time() + 0.01) // lay.dwell) % lay.layers))
 
     deadline = time.monotonic() + args.duration if args.duration > 0 else None
     interval = args.interval
@@ -1497,12 +1699,82 @@ def sparse_edges(n, k, seed):
     rng = random.Random(seed)
     relabel = list(range(n))
     rng.shuffle(relabel)
-    shifts = rng.sample(range(1, n), k)
+    return shift_edges(relabel, rng.sample(range(1, n), k))
+
+
+def shift_edges(relabel, shifts):
+    """The edges of the given shifts on one relabeling: position i sends
+    to position (i + shift) % n, translated back to host indices."""
+    n = len(relabel)
     edges = set()
     for shift in shifts:
         for i in range(n):
             edges.add((relabel[i], relabel[(i + shift) % n]))
     return edges
+
+
+def layer_partition(n, k, seed):
+    """The layers of `--peers K --dwell T`: ONE permutation shared by every
+    layer, and the n-1 nonzero shifts dealt out k at a time.
+
+    The union of all n-1 shifts on one relabeling is the complete digraph,
+    every ordered pair exactly once -- so disjoint shift sets make the
+    layers edge-disjoint by construction, and a full rotation measures
+    every pair exactly once. Independent random matrices per layer would
+    instead collide by birthday and leave a tail of pairs never measured.
+
+    The last layer keeps the remainder when k does not divide n-1: fewer
+    peers for one dwell, never a pair measured twice or missed.
+
+    Returns (relabel, [shift list per layer]).
+    """
+    rng = random.Random(seed)
+    relabel = list(range(n))
+    rng.shuffle(relabel)
+    shifts = list(range(1, n))
+    rng.shuffle(shifts)
+    return relabel, [shifts[i:i + k] for i in range(0, n - 1, k)]
+
+
+def layered_flow_specs(matrix, me, streams):
+    """Every layer's flow specs for this host, derived locally.
+
+    sparse layers are a pure function of (hosts, peers, seed) and every
+    host holds the identical host list, so each agent derives the whole
+    schedule itself -- one matrix file deploys however many layers it
+    rotates through, and there is no control channel to fail.
+    """
+    lay = matrix.layering
+    n = len(matrix.hosts)
+    relabel, shift_layers = layer_partition(n, lay.peers, lay.seed)
+    pos = [0] * n
+    for i, h in enumerate(relabel):
+        pos[h] = i
+    my_pos = pos[matrix.index[me]]
+    # Per-pair pps is held constant across layers (so per-host load is
+    # flat), and every populated cell of a layered matrix carries that
+    # same one value -- any of this host's layer-0 cells is the rate.
+    rate = matrix.peers_of(me)[0][1]
+    specs = []
+    for shifts in shift_layers:
+        one = []
+        for shift in shifts:
+            peer = matrix.hosts[relabel[(my_pos + shift) % n]]
+            addr, port = matrix.endpoint(peer)
+            per_stream = rate if rate == float("inf") else rate / streams
+            for s in range(streams):
+                one.append((peer, addr, port, per_stream, s))
+        specs.append(one)
+    # Layer 0 must be exactly what the grid in the file says, or the
+    # header and the body have drifted apart (a hand edit): refuse rather
+    # than run a schedule half the fleet would disagree with.
+    body = set(p for p, _r in matrix.peers_of(me))
+    derived = set(s[0] for s in specs[0])
+    if body != derived:
+        die("%s: the grid does not match its layers header (edited by "
+            "hand?) -- regenerate with `mx gen --peers %d --dwell %g "
+            "--seed %d`" % (matrix.path, lay.peers, lay.dwell, lay.seed))
+    return specs
 
 
 def cmd_gen(args):
@@ -1514,13 +1786,35 @@ def cmd_gen(args):
     peers = n - 1
     edges = None
     seed = None
+    nlayers = 1
+    if args.dwell is not None and args.peers is None:
+        die("--dwell rotates a --peers matrix through its layers; it needs "
+            "--peers K to say how many flows each layer carries")
     if args.peers is not None:
         if not 1 <= args.peers <= n - 1:
             die("--peers must be between 1 and %d for %d hosts (got %d)"
                 % (n - 1, n, args.peers))
         peers = args.peers
         seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2 ** 32)
-        if peers < n - 1:
+        if args.dwell is not None:
+            if seed < 0:
+                die("--seed must be non-negative for a layered matrix")
+            if args.dwell < 1.0:
+                die("--dwell below 1 second cannot be measured: the report "
+                    "interval is the floor, and a layer needs a few clean "
+                    "intervals to mean anything (3x the interval is a good "
+                    "dwell; the default interval is %gs)" % DEFAULT_INTERVAL)
+            # The layer count is derived, never chosen: that is the hard
+            # guarantee that a full cycle covers every ordered pair
+            # exactly once, with no pair repeated and none missed.
+            nlayers = -(-(n - 1) // peers)
+            if nlayers < 2:
+                die("--peers %d already reaches all %d peers in one layer; "
+                    "--dwell has nothing to rotate. Lower --peers, or drop "
+                    "--dwell for a fixed sparse matrix." % (peers, n - 1))
+            relabel, shift_layers = layer_partition(n, peers, seed)
+            edges = shift_edges(relabel, shift_layers[0])
+        elif peers < n - 1:
             edges = sparse_edges(n, peers, seed)
 
     if args.pps is not None:
@@ -1557,6 +1851,13 @@ def cmd_gen(args):
     if args.peers is not None:
         extra = ("# peers=%d seed=%d -- k-regular shuffle: every host sends to "
                  "and receives from exactly %d others\n" % (peers, seed, peers))
+    if nlayers > 1:
+        extra += ("# layers=%d dwell=%g -- disjoint-shift layers on that one "
+                  "shuffle: the grid below\n"
+                  "#   is layer 0; every agent derives layer "
+                  "(walltime // dwell) %% layers itself,\n"
+                  "#   and one full cycle measures every ordered pair "
+                  "exactly once\n" % (nlayers, args.dwell))
     write_matrix(args.output, tokens, cell_for, tx_size, rx_size, args.port,
                  extra_comment=extra)
     if args.output == "-":
@@ -1569,6 +1870,17 @@ def cmd_gen(args):
     if edges is not None:
         log("  shape    : k-regular shuffle, %d peers per host (seed %d -- "
             "reuse --seed %d to replay)" % (peers, seed, seed))
+    if nlayers > 1:
+        last = (n - 1) - peers * (nlayers - 1)
+        cycle = nlayers * args.dwell
+        log("  layers   : %d, held %gs each -- every ordered pair measured "
+            "exactly once per %s cycle" % (nlayers, args.dwell, fmt_secs(cycle)))
+        if last != peers:
+            log("             the last layer carries the remainder: %d "
+                "peer%s per host instead of %d"
+                % (last, "" if last == 1 else "s", peers))
+        log("             dwell must be a whole multiple of the agents' "
+            "--interval (default %gs); `mx start` checks" % DEFAULT_INTERVAL)
     if cell == float("inf"):
         log("  rate: unpaced (send as fast as each host can)")
     else:
@@ -1603,6 +1915,15 @@ def cmd_check(args):
 
     log("matrix %s: %d hosts, %d flows, %d bytes out -> %d bytes back, port %d"
         % (m.path, len(m.hosts), len(m.rates), m.tx_size, m.rx_size, m.port))
+    if m.layering:
+        lay = m.layering
+        # The grid is layer 0, so every per-host figure below is one
+        # layer's load -- which is the whole point: it never gets bigger,
+        # the rotation only changes WHO carries it.
+        log("  layered: %d layers of %d peers, dwell %gs -- the loads below "
+            "are one layer's, held constant while the pairs rotate; every "
+            "ordered pair is measured once per %s cycle"
+            % (lay.layers, lay.peers, lay.dwell, fmt_secs(lay.cycle())))
     if unpaced:
         log("  %d flows are unpaced ('max'): offered load is whatever the "
             "senders manage, so the caps below cannot be checked" % unpaced)
@@ -1702,11 +2023,32 @@ def _write_retargeted_matrix(m, addr_of, path):
             return ""
         return "max" if pps == float("inf") else "%.3f" % pps
 
-    write_matrix(path, tokens, cell, m.tx_size, m.rx_size, m.port)
+    # The layering header is load-bearing: it is the only place the other
+    # layers exist, so dropping it here would silently freeze the fleet
+    # in layer 0.
+    extra = ""
+    if m.layering:
+        lay = m.layering
+        extra = ("# peers=%d seed=%d layers=%d dwell=%g -- layered; the grid "
+                 "is layer 0\n" % (lay.peers, lay.seed, lay.layers, lay.dwell))
+    write_matrix(path, tokens, cell, m.tx_size, m.rx_size, m.port,
+                 extra_comment=extra)
 
 
 def cmd_start(args):
     m = load_matrix(args.matrix)
+    if m.layering:
+        # Refuse here, once, rather than deploying a fleet of agents that
+        # would each warn about blurred boundaries. A tick-aligned dwell
+        # is what keeps every report row inside a single layer.
+        lay = m.layering
+        ratio = lay.dwell / args.interval
+        if lay.dwell < args.interval or abs(ratio - round(ratio)) > 0.01:
+            die("layered matrix: dwell %gs must be a whole multiple of "
+                "--interval (%gs) so layer switches land on report ticks. "
+                "Try --interval %g."
+                % (lay.dwell, args.interval,
+                   lay.dwell / max(1, round(ratio))))
     fleet = Fleet(m, args)
     agent_src = _agent_source()
     flags = _agent_flags(args)
@@ -1789,6 +2131,12 @@ fi
         % (len(m.hosts), len(m.rates), m.tx_size, m.rx_size,
            "unpaced" if any(v == float("inf") for v in m.rates.values())
            else fmt_pps(sum(m.rates.values()))))
+    if m.layering:
+        lay = m.layering
+        log("[mx] layered: %d layers of %d peers, dwell %gs -- every "
+            "ordered pair measured once per %s cycle; keep it running at "
+            "least that long for full coverage"
+            % (lay.layers, lay.peers, lay.dwell, fmt_secs(lay.cycle())))
     log("[mx] next: mx status      # one line per host")
     log("[mx]       mx summarize   # pps / Gbps / loss / rtt")
     log("[mx]       mx stop        # when you are done")
@@ -1995,19 +2343,40 @@ def cmd_summarize(args):
             srv.setdefault((r["host"], r["peer"]), Agg()).add(r, ["pps", "rep_pps"])
         elif d == "host":
             hostagg.setdefault(r["host"], Agg()).add(
-                r, ["cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"])
+                r, ["target_pps", "pps", "mbps", "rep_pps", "rep_mbps",
+                    "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"])
     if not tx:
         die("no client rows in the last %ds -- are the agents still running?"
             % args.window)
 
-    tx_pps = sum(a.mean("pps") for a in tx.values())
-    rep_pps = sum(a.mean("rep_pps") for a in tx.values())
-    target = sum(a.mean("target_pps") for a in tx.values())
-    tx_bps = sum(a.mean("mbps") for a in tx.values()) * 1e6
-    rep_bps = sum(a.mean("rep_mbps") for a in tx.values()) * 1e6
-    # Requests that actually landed, counted by the hosts that received
-    # them: the ground truth the senders cannot see.
-    fwd_pps = sum(a.mean("pps") for a in srv.values())
+    layered = m.layering is not None
+    # How many complete intervals each host reported in the window: the
+    # divisor that turns a sparse pile of per-pair rows back into a
+    # time-averaged rate.
+    nticks = {h: a.counts.get("pps", 0) for h, a in hostagg.items()}
+
+    if layered and hostagg:
+        # In a layered run most pairs are idle for most of the window, and
+        # a pair's Agg only averages its ACTIVE intervals -- summing pair
+        # means would count every layer as if it ran the whole time. The
+        # host rows are instantaneous sums over whatever was active, so
+        # their time-average is the truth.
+        tx_pps = sum(a.mean("pps") for a in hostagg.values())
+        rep_pps = sum(a.mean("rep_pps") for a in hostagg.values())
+        target = sum(a.mean("target_pps") for a in hostagg.values())
+        tx_bps = sum(a.mean("mbps") for a in hostagg.values()) * 1e6
+        rep_bps = sum(a.mean("rep_mbps") for a in hostagg.values()) * 1e6
+        fwd_pps = sum(a.sums.get("pps", 0.0) / nticks[h]
+                      for (h, _p), a in srv.items() if nticks.get(h))
+    else:
+        tx_pps = sum(a.mean("pps") for a in tx.values())
+        rep_pps = sum(a.mean("rep_pps") for a in tx.values())
+        target = sum(a.mean("target_pps") for a in tx.values())
+        tx_bps = sum(a.mean("mbps") for a in tx.values()) * 1e6
+        rep_bps = sum(a.mean("rep_mbps") for a in tx.values()) * 1e6
+        # Requests that actually landed, counted by the hosts that received
+        # them: the ground truth the senders cannot see.
+        fwd_pps = sum(a.mean("pps") for a in srv.values())
 
     # avg is the mean across flows; p50/p99 are the worst flow's, because
     # a fleet-wide percentile of percentiles would hide the sick pair.
@@ -2020,6 +2389,10 @@ def cmd_summarize(args):
     log("")
     log("mx summarize -- last %ds, %d hosts, %d flows, %d bytes out -> %d bytes back"
         % (args.window, len(m.hosts), len(tx), tx_size, rx_size))
+    if layered:
+        log("layered -- %d layers of %d peers rotating every %gs; rates are "
+            "time averages over the window"
+            % (m.layering.layers, m.layering.peers, m.layering.dwell))
     log("")
     log("  REQUESTS  %14s   %12s wire   %12s payload"
         % (fmt_pps(tx_pps), fmt_gbps(wire_bps(tx_pps, tx_size)), fmt_gbps(tx_bps)))
@@ -2043,26 +2416,49 @@ def cmd_summarize(args):
     per_host = {}
     for (host, peer), a in tx.items():
         h = per_host.setdefault(host, [0.0, 0.0, 0.0, 0.0])
-        h[0] += a.mean("pps")
-        h[1] += a.mean("rep_pps")
-        h[2] += a.mean("target_pps")
+        if not layered:
+            h[0] += a.mean("pps")
+            h[1] += a.mean("rep_pps")
+            h[2] += a.mean("target_pps")
         h[3] = max(h[3], a.mean("rtt_p99_us"))
-    served = {}
+    if layered:
+        # Same reasoning as the fleet totals: rates come from the host
+        # rows, only the worst p99 comes from the per-pair rows.
+        for host, a in hostagg.items():
+            h = per_host.setdefault(host, [0.0, 0.0, 0.0, 0.0])
+            h[0] = a.mean("pps")
+            h[1] = a.mean("rep_pps")
+            h[2] = a.mean("target_pps")
+    served, served_rep = {}, {}
     for (host, peer), a in srv.items():
-        served[host] = served.get(host, 0.0) + a.mean("pps")
+        if layered:
+            if not nticks.get(host):
+                continue
+            served[host] = (served.get(host, 0.0)
+                            + a.sums.get("pps", 0.0) / nticks[host])
+            served_rep[host] = (served_rep.get(host, 0.0)
+                                + a.sums.get("rep_pps", 0.0) / nticks[host])
+        else:
+            served[host] = served.get(host, 0.0) + a.mean("pps")
+            served_rep[host] = served_rep.get(host, 0.0) + a.mean("rep_pps")
 
     log("")
     # "agent" is the agent process's own CPU as a share of ONE core --
     # near 100% means the agent is the ceiling, whatever the box shows.
-    log("  %-20s %11s %11s %11s %8s %9s %6s %7s %6s"
-        % ("host", "sent", "back", "serving", "loss", "rtt p99",
+    # "egress" is everything the host puts on the wire: its own requests
+    # plus the replies it owes the hosts that call it.
+    log("  %-20s %11s %11s %11s %10s %8s %9s %6s %7s %6s"
+        % ("host", "sent", "back", "serving", "egress", "loss", "rtt p99",
            "cpu", "1 core", "agent"))
     ranked = sorted(per_host.items(),
                     key=lambda kv: pct(kv[1][1], kv[1][0]) if kv[1][0] else 100.0)
     for host, (s, b, t, p99) in ranked[:args.top_hosts]:
         ha = hostagg.get(host)
-        log("  %-20s %11s %11s %11s %7.2f%% %9s %5s %6s %5s"
+        egress = wire_bps(s, tx_size) + wire_bps(served_rep.get(host, 0.0),
+                                                 rx_size)
+        log("  %-20s %11s %11s %11s %10s %7.2f%% %9s %5s %6s %5s"
             % (host, fmt_pps(s), fmt_pps(b), fmt_pps(served.get(host, 0.0)),
+               fmt_gbps(egress),
                max(0.0, 100.0 - pct(b, s)) if s else 0.0, fmt_us(p99),
                "%.0f%%" % ha.mean("cpu_pct") if ha else "-",
                "%.0f%%" % ha.mean("cpu_max_pct") if ha else "-",
@@ -2077,9 +2473,24 @@ def cmd_summarize(args):
         sent = a.mean("pps")
         if sent <= 0:
             continue
-        back = a.mean("rep_pps")
-        arrived = srv[(peer, host)].mean("pps") if (peer, host) in srv else None
-        flows.append((pct(back, sent), host, peer, sent, back, arrived,
+        if layered:
+            # Ratio of totals, not of per-row means: the replies still in
+            # flight at a layer switch land in a drain row with nothing
+            # sent against them, and only the totals put the two halves
+            # of that boundary back together.
+            tot_tx = a.sums.get("pps", 0.0)
+            frac = pct(a.sums.get("rep_pps", 0.0), tot_tx) if tot_tx else 0.0
+            back = sent * frac / 100.0
+            arrived = None
+            if (peer, host) in srv and tot_tx:
+                arrived = sent * (srv[(peer, host)].sums.get("pps", 0.0)
+                                  / tot_tx)
+        else:
+            back = a.mean("rep_pps")
+            frac = pct(back, sent)
+            arrived = srv[(peer, host)].mean("pps") if (peer, host) in srv \
+                else None
+        flows.append((frac, host, peer, sent, back, arrived,
                       a.mean("target_pps"), a.mean("rtt_p99_us")))
     flows.sort()
     bad = [f for f in flows if f[0] < 99.5]
@@ -2098,6 +2509,92 @@ def cmd_summarize(args):
         log("")
         log("  every flow is delivering >= 99.5% of its replies")
 
+    coverage = None
+    if layered:
+        lay = m.layering
+        # Coverage is cumulative over the WHOLE report history, not the
+        # --window: the window says how the run is going, coverage says
+        # how far around the rotation it has come.
+        counts = {}
+        for r in rows:
+            if r.get("dir") != "tx" or not r.get("pps"):
+                continue
+            try:
+                if float(r["pps"]) <= 0:
+                    continue
+            except ValueError:
+                continue
+            k = (r["host"], r["peer"])
+            counts[k] = counts.get(k, 0) + 1
+        total = len(m.hosts) * (len(m.hosts) - 1)
+        measured = len(counts)
+        coverage = (measured, total, lay.cycle())
+        log("")
+        log("  COVERAGE  %d of %d ordered pairs measured so far (%.1f%%)"
+            % (measured, total, pct(measured, total)))
+        log("            %d layers x %gs dwell = one full cycle every %s"
+            % (lay.layers, lay.dwell, fmt_secs(lay.cycle())))
+        if measured < total:
+            missing = []
+            for s in m.hosts:
+                for d in m.hosts:
+                    if s != d and (s, d) not in counts:
+                        missing.append("%s->%s" % (s, d))
+                    if len(missing) >= 4:
+                        break
+                if len(missing) >= 4:
+                    break
+            rest = total - measured - len(missing)
+            log("            still unmeasured: %s%s"
+                % (", ".join(missing),
+                   " (+%d more)" % rest if rest > 0 else ""))
+        if args.grid:
+            os.makedirs(args.grid, exist_ok=True)
+            path = os.path.join(args.grid, "coverage_grid.csv")
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["src\\dst"] + m.hosts)
+                for s in m.hosts:
+                    w.writerow([s] + ["" if s == d else
+                                      (counts.get((s, d), "") or "")
+                                      for d in m.hosts])
+            log("")
+            log("  wrote %s (cells: intervals measured; empty = never yet)"
+                % path)
+
+        # What the window saw, layer by layer. `sent` averages over the
+        # intervals the layer was actually active; delivery is the ratio
+        # of totals, so drain-row tails count for their own layer.
+        per_layer = {}
+        for r in recent:
+            if r.get("dir") != "tx" or r.get("layer") in (None, ""):
+                continue
+            try:
+                lj = int(float(r["layer"]))
+            except ValueError:
+                continue
+            tss, pairs, agg = per_layer.setdefault(lj, (set(), set(), Agg()))
+            if r.get("pps"):
+                tss.add(r["ts"])
+                pairs.add((r["host"], r["peer"]))
+            agg.add(r, ["pps", "rep_pps", "rtt_p99_us"])
+        if per_layer:
+            log("")
+            log("  LAYERS in the window: %d of %d" % (len(per_layer), lay.layers))
+            log("  %7s %8s %12s %10s %10s"
+                % ("layer", "pairs", "sent", "delivery", "worst p99"))
+            for shown, lj in enumerate(sorted(per_layer)):
+                if shown >= 10 and len(per_layer) > 11:
+                    log("  ... %d more layers" % (len(per_layer) - shown))
+                    break
+                tss, pairs, agg = per_layer[lj]
+                tot = agg.sums.get("pps", 0.0)
+                sent = tot / max(1, len(tss))
+                dlv = pct(agg.sums.get("rep_pps", 0.0), tot) if tot else 0.0
+                log("  %7d %8d %12s %9.2f%% %10s"
+                    % (lj, len(pairs), fmt_pps(sent), dlv,
+                       fmt_us(agg.peak("rtt_p99_us"))))
+
     if args.grid:
         _write_grids(args.grid, m, tx, srv)
 
@@ -2107,7 +2604,7 @@ def cmd_summarize(args):
     for (host, _peer) in tx:
         flowcount[host] = flowcount.get(host, 0) + 1
     _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
-                   fwd_pps, rtt_p50, rtt_p99)
+                   fwd_pps, rtt_p50, rtt_p99, coverage)
     return 0
 
 
@@ -2139,9 +2636,18 @@ def _write_grids(gdir, m, tx, srv):
 
 
 def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
-                   fwd_pps, rtt_p50, rtt_p99):
+                   fwd_pps, rtt_p50, rtt_p99, coverage=None):
     """Turn what the numbers say into what to do next."""
     hints = []
+    if coverage:
+        measured, total, cycle = coverage
+        if measured < total:
+            hints.append("the rotation has measured %d of %d ordered pairs "
+                         "(%.1f%%). A full cycle takes %s -- keep the run "
+                         "alive at least that long (mx run --for %d) and "
+                         "every pair gets its turn."
+                         % (measured, total, pct(measured, total),
+                            fmt_secs(cycle), int(cycle + cycle // 10)))
     hot = [(h, a.mean("cpu_max_pct")) for h, a in hostagg.items()
            if a.mean("cpu_max_pct") >= 85.0]
     # Each worker is one Python process, so the GIL caps it near 100% of a
@@ -2247,6 +2753,12 @@ def cmd_run(args):
     log("")
     log("[mx] running for %gs -- ctrl-c stops the agents and summarizes early"
         % wait)
+    m = load_matrix(args.matrix)
+    if m.layering and wait < m.layering.cycle():
+        log("[mx] note: %gs is less than one full rotation (%s) -- some "
+            "ordered pairs will not be measured this run; the summary's "
+            "COVERAGE section says which"
+            % (wait, fmt_secs(m.layering.cycle())))
     end = time.monotonic() + wait
     try:
         while time.monotonic() < end:
@@ -2553,6 +3065,15 @@ def build_parser():
     g.add_argument("--seed", type=int, metavar="N",
                    help="replay a --peers shuffle (default: random, printed "
                         "and stored in the matrix header)")
+    g.add_argument("--dwell", type=float, metavar="SECONDS",
+                   help="rotate the --peers K matrix through "
+                        "ceil((N-1)/K) disjoint layers, holding each for "
+                        "SECONDS, so a full cycle measures every ordered "
+                        "pair exactly once while only K flows per host are "
+                        "ever live. Each agent switches on its own wall "
+                        "clock; dwell must be a whole multiple of the "
+                        "run's --interval, and 3x the interval is the "
+                        "sensible floor")
     g.add_argument("--tx-size", type=int, default=64, metavar="BYTES",
                    help="request size, %d-%d (default: %%(default)s)" % (HDR_SIZE, MAX_SIZE))
     g.add_argument("--rx-size", type=int, default=64, metavar="BYTES",

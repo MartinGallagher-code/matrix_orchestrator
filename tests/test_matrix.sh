@@ -181,6 +181,71 @@ test_peers_bounds_are_enforced() {
     assert_status 0 "$RUN_RC" "--peers N-1 is just the full mesh" || return 1
 }
 
+test_dwell_layers_partition_every_ordered_pair() {
+    # The hard guarantee of --dwell: the layers are edge-disjoint and
+    # their union is the complete digraph -- every ordered pair exactly
+    # once per rotation. Asserted on the generator itself, because a
+    # collision or a gap here would silently break the whole feature.
+    printf 'h%02d\n' $(seq 1 11) > servers.txt
+    run_mx gen --servers servers.txt --peers 3 --pps 1000 --seed 5 --dwell 30
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "layers   : 4" "ceil(10/3) = 4 layers" || return 1
+    assert_contains "$RUN_OUT" "remainder: 1 peer" "10 = 3+3+3+1" || return 1
+    assert_contains "$(head -8 matrix.csv)" "layers=4 dwell=30" \
+        "the schedule lives in the header" || return 1
+    python3 - <<'EOF'
+import sys, os
+sys.path.insert(0, os.environ["REPO_ROOT"] + "/matrix_orchestrator")
+import mx
+n = 11
+relabel, layers = mx.layer_partition(n, 3, 5)
+assert [len(s) for s in layers] == [3, 3, 3, 1], layers
+seen = set()
+for shifts in layers:
+    edges = mx.shift_edges(relabel, shifts)
+    assert not (edges & seen), "layers share an edge"
+    seen |= edges
+assert seen == set((s, d) for s in range(n) for d in range(n) if s != d), \
+    "union of the layers is not the complete digraph"
+EOF
+    assert_status 0 $? "layers must partition the N(N-1) ordered pairs" || return 1
+}
+
+test_dwell_flag_is_validated() {
+    printf 'a\nb\nc\nd\n' > servers.txt
+    run_mx gen --servers servers.txt --dwell 60
+    assert_status 2 "$RUN_RC" "--dwell without --peers refused" || return 1
+    assert_contains "$RUN_OUT" "--peers" || return 1
+    run_mx gen --servers servers.txt --peers 3 --dwell 60
+    assert_status 2 "$RUN_RC" "nothing to rotate when one layer covers all" || return 1
+    assert_contains "$RUN_OUT" "nothing to rotate" || return 1
+    run_mx gen --servers servers.txt --peers 1 --dwell 0.5
+    assert_status 2 "$RUN_RC" "a dwell below the report interval floor refused" || return 1
+}
+
+test_edited_layers_header_is_refused() {
+    # layers is derived from (hosts, peers), never free: an edited count
+    # would break the every-pair-once guarantee, so loading refuses it.
+    printf 'a\nb\nc\nd\n' > servers.txt
+    run_mx gen --servers servers.txt --peers 1 --dwell 10 --seed 3
+    assert_status 0 "$RUN_RC" || return 1
+    sed -i 's/layers=3/layers=2/' matrix.csv
+    run_mx check --matrix matrix.csv
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "partition into 3 layers" || return 1
+}
+
+test_start_refuses_a_dwell_off_the_report_tick() {
+    # Switches must land on report ticks or every boundary row blurs;
+    # this is caught before a single agent is deployed.
+    printf 'a\nb\nc\nd\n' > servers.txt
+    run_mx gen --servers servers.txt --peers 1 --dwell 7
+    run_mx start --matrix matrix.csv --interval 5 --dry-run
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "whole multiple" || return 1
+    assert_contains "$RUN_OUT" "Try --interval 7" "a working interval is suggested" || return 1
+}
+
 run_test test_gen_writes_grid_with_config_header
 run_test test_gen_max_writes_unpaced_cells
 run_test test_gen_gbps_sizes_the_rate
@@ -196,4 +261,8 @@ run_test test_peers_builds_an_exactly_k_regular_graph
 run_test test_peers_seed_replays_and_is_recorded
 run_test test_peers_splits_a_gbps_budget_over_k_not_n
 run_test test_peers_bounds_are_enforced
+run_test test_dwell_layers_partition_every_ordered_pair
+run_test test_dwell_flag_is_validated
+run_test test_edited_layers_header_is_refused
+run_test test_start_refuses_a_dwell_off_the_report_tick
 report_tests
