@@ -225,6 +225,95 @@ mx gen --servers servers.txt --peers 8 --pps 250000 --seed 42
 mx start --streams 4 --workers auto
 ```
 
+### How `--peers` and `--streams` compose
+
+The two flags answer different questions and multiply cleanly:
+
+- **`--peers K`** picks *who* each host talks to — K peers instead of
+  N−1. It shapes the graph and the per-flow rate (each pair's cell gets
+  the whole per-pair rate).
+- **`--streams S`** picks *how many sockets carry each pair* — the
+  pair's rate is split across S sockets, not multiplied. More 4-tuples
+  is what gives worker processes, NIC RSS queues and ECMP paths
+  something to spread.
+
+A host therefore holds **K × S client sockets**, and that product is
+what everything scales by: the fd budget (the agent raises its own soft
+limit to cover it), the worker ceiling (workers are capped at flows+1,
+so on a sparse mesh `--streams` is the lever that lets more cores help),
+and the number of distinct paths the fabric sees. `--peers` without
+`--streams` concentrates each pair onto one path; `--peers 8
+--streams 4` keeps 8 fat flows but hashes each across 4 paths — usually
+the shape you want on an ECMP fabric.
+
+## Every pair, K sockets: the layered rotation (`--peers K --dwell T`)
+
+`--peers K` holds equal load with K flows per host, but it measures only
+those K·N of the N·(N−1) ordered pairs. When the question is "show me
+the sick *pair*", coverage has to be complete. The full mesh gets you
+that at N−1 sockets per host; the layered rotation gets you the same
+guarantee at K:
+
+```bash
+mx gen --servers servers.txt --peers 8 --pps 20000 --dwell 60
+mx run --for 7500        # >= one full cycle
+mx summarize --grid g    # COVERAGE section + g/coverage_grid.csv
+```
+
+The construction is why this is a guarantee and not a hope. The
+`--peers` graph is K shifted permutations of one shuffle, and the
+complete digraph is exactly the union of all N−1 possible shifts — so
+`--dwell` deals those N−1 shifts out K at a time into **⌈(N−1)/K⌉
+edge-disjoint layers**. Every agent holds one layer's flows for T
+seconds, then switches; after one full cycle every ordered pair has been
+measured **exactly once** — no pair repeated, none missed, and the layer
+count is derived rather than chosen so the guarantee cannot be
+configured away. (Independent random matrices per layer would instead
+collide by birthday and leave a tail of pairs never measured.) If K does
+not divide N−1 the last layer carries the remainder and is simply a
+little lighter.
+
+Per-pair pps is held constant across layers, so **per-host load never
+changes** — the rotation only changes who carries it. `mx check` on a
+layered matrix is therefore checking every layer at once.
+
+The file stays one ordinary matrix: the grid in it is layer 0, and the
+other layers exist only as four header keys (`peers seed layers dwell`).
+Each agent derives the whole schedule from the seed — every host already
+has the identical host list — and switches on its own wall clock
+(`layer = walltime // dwell mod layers`). No control channel, no
+coordinated cutover: the responder answers whatever arrives, so a host
+that switches a second late just reads as a mixed boundary interval.
+At each switch the old layer's sockets stay open one report interval to
+catch replies still in flight (peak fd cost 2·K·S, independent of layer
+count), and those tails land in rows whose send-side cells are blank, so
+no average downstream is poisoned by them.
+
+**How short can the dwell be?** The mechanical floor is one report
+interval — switches land on report ticks, and `mx start` refuses a dwell
+that is not a whole multiple of `--interval`. The *useful* floor is
+about **3× the interval**, so each layer gets a couple of clean interior
+intervals; packet counts stop mattering long before that (at 10k pps
+even a 1 s visit is 10 000 samples). At the default 5 s interval start
+at `--dwell 15`; for the fastest full sweeps drop the interval too:
+
+```bash
+mx gen --servers servers.txt --peers 8 --pps 20000 --dwell 3
+mx start --interval 1      # 1000 hosts: 125 layers x 3s = full
+                           # every-pair-once coverage every ~6 min,
+                           # 8 sockets per host at any moment
+```
+
+Below that, the boundary blur (one drain interval per switch, plus NTP
+skew) starts to be a visible fraction of every layer, and you are
+measuring the switching, not the fabric.
+
+`mx summarize` on a layered run reports time-averaged rates, a
+**COVERAGE** line (cumulative pairs measured across the whole run, with
+the still-unmeasured ones named), a per-layer table for the window, and
+with `--grid` a `coverage_grid.csv` — the N×N of how many intervals each
+pair has been measured, where an empty cell means "never yet".
+
 ## Finding the limit
 
 Raise the rate until delivery stops keeping up:
@@ -357,6 +446,11 @@ mx gen --servers servers.txt --pps 5000 --tx-size 128 --rx-size 8192
 # continuously, with 8 sockets instead of N-1 (seed printed, replayable)
 mx gen --servers servers.txt --peers 8 --pps 100000
 
+# ...and rotated through disjoint layers so every ordered pair is
+# measured exactly once per cycle, still with only 8 sockets per host
+mx gen --servers servers.txt --peers 8 --pps 100000 --dwell 15
+mx run --for 2000 && mx summarize --grid g   # coverage grid included
+
 # Size the rate from a bandwidth budget instead of a packet rate
 mx gen --servers servers.txt --gbps 10 --tx-size 1400
 
@@ -426,7 +520,7 @@ Each agent appends one row per flow per interval to `report.csv`, which
 ```
 ts,host,dir,peer,size,rep_size,target_pps,pps,mbps,rep_pps,rep_mbps,
 loss_pct,rtt_avg_us,rtt_p50_us,rtt_p99_us,rtt_max_us,cpu_pct,cpu_max_pct,
-agent_cpu_pct,workers
+agent_cpu_pct,workers,layer
 ```
 
 `dir=tx` rows are this host as a client (requests it sent, replies it got
@@ -438,6 +532,13 @@ One row per peer per interval, whatever the worker count — the parent
 merges its workers' numbers before writing, so nothing downstream has to
 know how the host was sharded. It is a plain CSV; take it to whatever you
 normally plot with.
+
+On a layered run (`--dwell`) each `tx` row also carries its `layer`, and
+a switch leaves one *drain* row per finished flow: the replies that were
+still in flight when the layer ended, with the send-side cells left
+blank. Blank, not zero — a zero rate there is an artifact of the switch,
+and any tool averaging the column would be poisoned by it. Treat
+`pps == ""` as "not sending this interval", not as zero.
 
 ---
 

@@ -393,6 +393,82 @@ test_workers_flag_is_validated() {
     assert_status 2 "$RUN_RC" || return 1
 }
 
+test_layered_agents_rotate_and_cover_every_pair() {
+    # The whole point of --dwell: 4 hosts at --peers 1 rotate through 3
+    # layers, and after one full cycle every host has measured every
+    # other -- with only ONE flow live per host at any moment. 14s at a
+    # 4s dwell spans a 12s cycle from any starting phase.
+    local p; p=$(pick_port)
+    write_servers "$p" a b c d > /dev/null
+    run_mx gen --servers servers.txt --pps 1000 --peers 1 --dwell 4 --seed 7
+    assert_status 0 "$RUN_RC" || return 1
+    mkdir -p rep
+    local h pids=()
+    for h in a b c d; do
+        python3 "$MX" agent --matrix matrix.csv --host "$h" \
+            --report "rep/$h.csv" --interval 2 --duration 14 --workers 1 \
+            > "rep/$h.log" 2>&1 &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    assert_contains "$(cat rep/a.log)" "layered -- 3 layers" \
+        "the agent announces the rotation" || return 1
+    # Every host must have visited every peer, one layer at a time.
+    python3 - <<'EOF'
+import csv
+for h in "abcd":
+    peers, layers = set(), set()
+    with open("rep/%s.csv" % h, newline="") as f:
+        for r in csv.DictReader(f):
+            if r["dir"] == "tx" and r.get("pps"):
+                peers.add(r["peer"])
+                layers.add(r["layer"])
+    want = set("abcd") - {h}
+    assert peers == want, "%s covered %r, wanted %r" % (h, peers, want)
+    assert len(layers) == 3, "%s saw layers %r" % (h, layers)
+    assert all(l != "" for l in layers), "tx rows must carry their layer"
+EOF
+    assert_status 0 $? "a full cycle covers every ordered pair" || return 1
+    # And the per-host rate never exceeds one layer's load: the rotation
+    # changes who carries the pps, not how much of it there is.
+    local sent; sent=$(csv_col rep/a.csv tx pps)
+    assert_between 700 1300 "$sent" "per-host load stays one layer's" || return 1
+}
+
+test_layered_summarize_reports_coverage() {
+    local p; p=$(pick_port)
+    write_servers "$p" a b c d > /dev/null
+    run_mx gen --servers servers.txt --pps 1000 --peers 1 --dwell 4 --seed 7
+    mkdir -p rep
+    local h pids=()
+    for h in a b c d; do
+        python3 "$MX" agent --matrix matrix.csv --host "$h" \
+            --report "rep/$h.csv" --interval 2 --duration 14 --workers 1 \
+            > "rep/$h.log" 2>&1 &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    run_mx summarize --reports rep --no-collect --window 60 --grid g
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "COVERAGE  12 of 12" \
+        "a full cycle measures all N(N-1) pairs" || return 1
+    assert_contains "$RUN_OUT" "LAYERS in the window" || return 1
+    assert_contains "$RUN_OUT" "egress" "the per-host table shows egress" || return 1
+    assert_file_exists g/coverage_grid.csv || return 1
+    # Sums of pair means would triple the per-host rate here; the time
+    # average must stay one layer's worth.
+    printf '%s' "$RUN_OUT" > summ.txt
+    python3 - <<'EOF'
+import re
+out = open("summ.txt").read()
+m = re.search(r"^  a\s+([\d.]+) (k?)pps", out, re.M)
+assert m, "no per-host row for a in:\n%s" % out
+pps = float(m.group(1)) * (1000 if m.group(2) else 1)
+assert 600 <= pps <= 1400, "per-host sent %s pps, want ~one layer" % pps
+EOF
+    assert_status 0 $? "per-host rate is a time average, not a sum of layers" || return 1
+}
+
 run_test test_two_agents_hit_the_target_rate
 run_test test_multiple_workers_share_the_port_and_the_flows
 run_test test_one_row_per_peer_per_interval_however_many_workers
@@ -409,6 +485,8 @@ run_test test_reply_size_differs_from_request_size
 run_test test_report_has_every_column_summarize_needs
 run_test test_rtt_is_measured
 run_test test_three_hosts_form_a_full_mesh
+run_test test_layered_agents_rotate_and_cover_every_pair
+run_test test_layered_summarize_reports_coverage
 run_test test_summarize_reports_pps_gbps_loss_and_hints
 run_test test_summarize_writes_grids
 run_test test_agent_refuses_a_host_not_in_the_matrix
