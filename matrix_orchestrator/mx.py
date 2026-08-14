@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -1286,12 +1286,12 @@ def _is_local_ipv4(addr):
 def resolve_workers(spec, nflows):
     """--workers N | auto. 'auto' is one per core, capped at MAX_AUTO_WORKERS
     so a big box does not fork 64 processes for a trickle of traffic."""
+    cores = 1
+    try:
+        cores = multiprocessing.cpu_count()
+    except NotImplementedError:
+        pass
     if spec in (None, "", "auto"):
-        cores = 1
-        try:
-            cores = multiprocessing.cpu_count()
-        except NotImplementedError:
-            pass
         n = min(max(1, cores), MAX_AUTO_WORKERS)
     else:
         try:
@@ -1304,7 +1304,33 @@ def resolve_workers(spec, nflows):
     # help: inbound requests are spread by hashing the 4-tuple, so with F
     # flows arriving there are only F tuples to spread. Raise --streams to
     # raise this ceiling.
-    return max(1, min(n, max(1, nflows) + 1)) if nflows else n
+    n = max(1, min(n, max(1, nflows) + 1)) if nflows else n
+    # Started, not refused -- somebody may be measuring the thrash on
+    # purpose -- but said out loud: the classic mistake is one worker per
+    # FLOW, and it costs a debugging session every time.
+    if n > cores:
+        log("workers: %d on a %d-core box. Each worker is a whole python "
+            "process, and flows shard across however few there are, so "
+            "workers beyond the cores add scheduling thrash, memory and "
+            "partial intervals -- never packet rate. `--workers auto` "
+            "sizes this sanely." % (n, cores))
+    return n
+
+
+def resolve_grace(interval, nworkers):
+    """How long past a report tick the parent waits for straggling
+    workers before writing the interval as partial.
+
+    One second absorbs scheduler jitter, plus 10 ms per worker so a
+    deliberately large-but-sane worker count gets a wider net. The hard
+    ceiling is half the interval: a flush still open when the next
+    round's reports arrive would trip the newest-batch-only rule and
+    silently drop the older round's deltas -- a stale row is honest,
+    lost data is not. Past this window a straggler is not jitter, it is
+    a starved or dead worker, and `partial interval` in the log is the
+    truthful report of that.
+    """
+    return min(interval * 0.5, 1.0 + 0.01 * nworkers)
 
 
 def raise_fd_limit(nflows):
@@ -1501,7 +1527,7 @@ def cmd_agent(args):
     # Wait a little past the tick for stragglers, rather than reporting a
     # window with one worker's numbers missing -- which would read as a
     # host that stopped serving.
-    grace = min(1.0, interval * 0.5)
+    grace = resolve_grace(interval, nworkers)
     pending, seen = [], set()
 
     while not stop.is_set():
