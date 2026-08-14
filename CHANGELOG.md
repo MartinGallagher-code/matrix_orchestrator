@@ -9,6 +9,35 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.4.2] - 2026-08-14
+
+### Changed
+
+- **`--workers` beyond the core count now warns at startup.** Each
+  worker is a whole Python process and flows shard across however few
+  there are, so the classic mistake — one worker per *flow* — buys
+  scheduling thrash, memory pressure, dead workers with permanently
+  unmeasured pairs, and chronic partial intervals, never packet rate.
+  The run still starts (somebody may be measuring the thrash on
+  purpose), but the log now says so up front instead of costing a
+  debugging session.
+- **The straggler grace scales with the worker count.** The parent
+  waits 1 s + 10 ms per worker past each report tick before writing the
+  interval as partial, so a deliberately large-but-sane worker count
+  gets a proportionally wider net. The ceiling stays at half the
+  report interval — beyond that a still-open flush would collide with
+  the next round's reports and the newest-batch rule would silently
+  drop data, which is worse than an honestly-partial row.
+
+## [1.4.1] - 2026-08-14
+
+### Changed
+
+- `mx --version` now prints the full notice in the canonical GNU form:
+  the version line first (scripts parse it), then
+  `Copyright (C) 2026 Martin J. Gallagher`, the GPLv3+ license line,
+  and the two free-software/no-warranty lines.
+
 ## [1.4.0] - 2026-08-14
 
 ### Added

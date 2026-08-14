@@ -259,6 +259,33 @@ test_workers_auto_picks_a_sane_number() {
     assert_between 1 8 "$n" "auto should pick between 1 and the cap" || return 1
 }
 
+test_worker_guardrails_warn_and_scale_grace() {
+    python3 - <<'EOF'
+import contextlib, io, os, sys
+sys.path.insert(0, os.environ["REPO_ROOT"] + "/matrix_orchestrator")
+import mx
+# More workers than cores is started, not refused -- but warned, because
+# one-worker-per-flow costs a debugging session every time.
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    n = mx.resolve_workers("64", 100)
+assert n == 64, n
+out = buf.getvalue()
+assert "core" in out and "auto" in out, "no warning in: %r" % out
+# auto never overshoots the cores, so it must stay silent.
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    mx.resolve_workers("auto", 100)
+assert buf.getvalue() == "", buf.getvalue()
+# The straggler grace widens with the worker count, capped at half the
+# report interval so a flush can never collide with the next round.
+assert abs(mx.resolve_grace(5.0, 8) - 1.08) < 1e-9
+assert mx.resolve_grace(5.0, 504) == 2.5
+assert mx.resolve_grace(2.0, 504) == 1.0
+EOF
+    assert_status 0 $? "worker warning and adaptive grace" || return 1
+}
+
 test_streams_split_the_rate_rather_than_multiplying_it() {
     # The whole premise: N sockets per pair carry the same offered load,
     # so a run with --streams 8 must not send 8x the packets.
@@ -544,6 +571,7 @@ run_test test_two_agents_hit_the_target_rate
 run_test test_multiple_workers_share_the_port_and_the_flows
 run_test test_one_row_per_peer_per_interval_however_many_workers
 run_test test_workers_auto_picks_a_sane_number
+run_test test_worker_guardrails_warn_and_scale_grace
 run_test test_streams_split_the_rate_rather_than_multiplying_it
 run_test test_streams_report_as_one_row_per_peer
 run_test test_streams_raise_the_worker_ceiling

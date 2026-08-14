@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matrix-orchestrator"
-version = "1.4.0"
+version = "1.4.2"
 description = "Request/response traffic matrix across a fleet, measured in packets per second"
 readme = "README.md"
 requires-python = ">=3.6"
