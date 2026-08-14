@@ -586,8 +586,13 @@ class Flow(object):
         # the layer that just ended.
         self.draining = False
         # Counters are kept per stream but reported per peer, so the key
-        # has to carry the stream and the label must not.
-        self.key = "%s#%d" % (peer, stream)
+        # has to carry the stream and the label must not. It carries the
+        # layer too: --equal-layers lets the padded layer share a pair
+        # with layer 0, so at the cycle wrap a draining flow and a new
+        # active flow to the SAME peer overlap for one interval -- with
+        # one key they would read each other's delta baselines.
+        self.key = "%s#%d@%s" % (peer, stream,
+                                 "-" if layer is None else layer)
         self.addr = addr
         self.port = port
         self.target_pps = target_pps
@@ -1125,8 +1130,15 @@ class Reporter(object):
             if b.cpu_pct is not None:
                 cpus.append(b.cpu_pct)
             for f in b.flows:
-                cur = flows.get(f["peer"])
-                flows[f["peer"]] = f if cur is None else _merge_flow(cur, f)
+                # Keyed by (peer, layer, drain), not peer alone: at an
+                # --equal-layers cycle wrap the old layer's drain and the
+                # new layer's active flow are the SAME peer in the same
+                # interval, and folding them into one row would blank the
+                # active flow's traffic under the drain's flag. Two rows,
+                # each under its own layer, is the correct accounting.
+                fkey = (f["peer"], f.get("layer"), bool(f.get("drain")))
+                cur = flows.get(fkey)
+                flows[fkey] = f if cur is None else _merge_flow(cur, f)
             for s in b.srv:
                 cur = srv.get(s["peer"])
                 srv[s["peer"]] = s if cur is None else _merge_srv(cur, s)
@@ -1135,8 +1147,9 @@ class Reporter(object):
         unpaced = 0
         cur_layer = None
         hist = [0] * RTT_NBUCKETS
-        for peer in sorted(flows):
-            f = flows[peer]
+        for fkey in sorted(flows, key=lambda t: (t[0], str(t[1]), t[2])):
+            f = flows[fkey]
+            peer = f["peer"]
             drain = f.get("drain")
             layer = f.get("layer")
             tx_pps += f["pps"]
@@ -1212,7 +1225,7 @@ class Reporter(object):
             _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers,
             _num(cur_layer, "%d")])
         self.fh.flush()
-        npeers = len(flows)
+        npeers = len(set(p for p, _l, drain in flows if not drain))
 
         log("ts=%d tx=%s/%s rx=%s serving=%s loss=%.2f%% rtt_p50=%s rtt_p99=%s "
             "cpu=%s workers=%d peers=%d"

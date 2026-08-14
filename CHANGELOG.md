@@ -29,6 +29,14 @@ project uses [semantic versioning](https://semver.org/).
   seed like everything else, so it deploys as the same single file. A
   no-op (with a note) when K already divides N−1.
 
+  Boundary accounting is layer-aware to make this correct: at the cycle
+  wrap a padded pair exists in the draining layer and the incoming one
+  at once, so flow counters and report rows are keyed by
+  (peer, stream, layer) rather than peer alone — that interval writes
+  two rows for the pair, the old layer's drain tail and the new layer's
+  live rate, each under its own `layer`, instead of folding them into
+  one corrupted row.
+
 ## [1.3.1] - 2026-08-14
 
 ### Fixed

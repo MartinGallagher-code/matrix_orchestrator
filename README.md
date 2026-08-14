@@ -551,6 +551,12 @@ blank. Blank, not zero — a zero rate there is an artifact of the switch,
 and any tool averaging the column would be poisoned by it. Treat
 `pps == ""` as "not sending this interval", not as zero.
 
+With `--equal-layers` a boundary interval at the cycle wrap can hold
+*two* rows for the same peer — the old layer's drain tail and the new
+layer's live flow — told apart by the `layer` column. Group by
+`(peer, layer)` rather than peer alone if you post-process layered
+reports yourself.
+
 ---
 
 ## Testing

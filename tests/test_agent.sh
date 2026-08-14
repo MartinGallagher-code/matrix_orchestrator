@@ -491,6 +491,11 @@ for h in "abcd":
     with open("rep/%s.csv" % h, newline="") as f:
         for r in csv.DictReader(f):
             if r["dir"] == "tx" and r.get("pps") and r.get("layer") != "":
+                # A negative rate is a delta computed across two flows
+                # sharing one baseline -- the padded pair's failure mode
+                # at the cycle wrap, where old and new layer overlap on
+                # the same peer.
+                assert float(r["pps"]) >= 0, "negative pps: %r" % r
                 by_layer[r["layer"]].add(r["peer"])
                 peers.add(r["peer"])
     assert peers == set("abcd") - {h}, "%s covered only %r" % (h, peers)
