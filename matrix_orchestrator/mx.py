@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -1184,9 +1184,15 @@ class Reporter(object):
         # The host row and the status line both sum across workers, so
         # they only mean anything when every worker is in. A partial one
         # reads as a host that went quiet -- the per-peer rows above are
-        # self-contained and stay either way.
+        # self-contained and stay either way. Say so in the log rather
+        # than skipping silently: a host whose intervals are chronically
+        # partial would otherwise never log at all, and `mx status`
+        # (which tails this log) would show its startup banner forever.
         if not complete:
             self.fh.flush()
+            log("ts=%d partial interval: %d of %d workers reported -- "
+                "per-peer rows written, host totals skipped"
+                % (now, len(latest), self.nworkers))
             return
 
         self.csv.writerow([
@@ -1360,6 +1366,28 @@ def cmd_agent(args):
     streams = resolve_streams(args.streams)
     lay = matrix.layering
 
+    # Resolve every peer address ONCE, here in the parent, before any
+    # worker forks. A layered agent rebuilds its flows at every switch,
+    # and resolving per flow there would put the DNS resolver -- with
+    # its own timeouts -- inside the workers' report schedule: a worker
+    # blocked in a lookup misses its ticks, and a host whose workers
+    # never all report in one interval never logs a stats line at all,
+    # which reads in `mx status` as an agent that went quiet.
+    addr_cache = {}
+
+    def resolved(addr):
+        ip = addr_cache.get(addr)
+        if ip is None:
+            try:
+                ip = socket.getaddrinfo(addr, None, socket.AF_INET,
+                                        socket.SOCK_DGRAM)[0][4][0]
+            except OSError:
+                # Keep the name: the flow's open() will fail with the
+                # real resolver error, once, where it can be seen.
+                ip = addr
+            addr_cache[addr] = ip
+        return ip
+
     # Each stream is its own socket, so it is its own 4-tuple: that is what
     # gives the kernel, the fabric's ECMP hash and our own workers more
     # than one thing to spread. The pair's rate is split across them, so
@@ -1375,7 +1403,8 @@ def cmd_agent(args):
             log("mx agent: dwell %gs is not a whole multiple of the %gs "
                 "interval -- layer switches will land mid-interval and "
                 "blur the boundary rows" % (lay.dwell, args.interval))
-        layer_specs = layered_flow_specs(matrix, me, streams)
+        layer_specs = [[(p, resolved(a), pt, r, s) for p, a, pt, r, s in ls]
+                       for ls in layered_flow_specs(matrix, me, streams)]
         maxflows = max(len(s) for s in layer_specs)
         nworkers = resolve_workers(args.workers, maxflows)
         # x2: at every switch the old layer's sockets stay open one
@@ -1387,7 +1416,7 @@ def cmd_agent(args):
             addr, port = matrix.endpoint(peer)
             per_stream = pps if pps == float("inf") else pps / streams
             for s in range(streams):
-                specs.append((peer, addr, port, per_stream, s))
+                specs.append((peer, resolved(addr), port, per_stream, s))
         nworkers = resolve_workers(args.workers, len(specs))
         # Before any worker forks, so they all inherit the raised limit.
         raise_fd_limit(len(specs))

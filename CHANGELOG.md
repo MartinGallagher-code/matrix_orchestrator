@@ -9,6 +9,30 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.3.1] - 2026-08-14
+
+### Fixed
+
+- **Peer addresses are resolved once, in the agent's parent process,
+  before any worker forks.** Workers used to call `getaddrinfo` per
+  flow as they opened it; harmless at startup, but a layered agent
+  rebuilds its flows at every switch, so a matrix that carries
+  hostnames put the DNS resolver — with its own timeouts — inside the
+  workers' report schedule. A worker blocked in a lookup misses its
+  ticks, a host whose workers never all report in one interval never
+  logs a stats line, and `mx status` (which tails the log) shows the
+  startup banner forever while `report.csv` quietly keeps growing.
+  Resolution now happens once per peer in the parent; workers only
+  ever see IP literals, and layer switches touch no resolver at all.
+  A name that fails to resolve is still reported per flow, once, with
+  the real error, exactly as before.
+- **Partial intervals say so in the log.** A report interval missing
+  some workers writes its per-peer rows but skips the host totals —
+  that part is unchanged — but it used to skip silently. It now logs
+  `partial interval: N of M workers reported`, so a host in that state
+  shows a live, truthful line in `mx status` instead of an agent that
+  looks like it went quiet at startup.
+
 ## [1.3.0] - 2026-08-14
 
 ### Added
