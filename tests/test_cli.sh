@@ -40,8 +40,8 @@ test_version() {
     # The full notice, GNU style: holder by full name, license, the two
     # free-software lines.
     assert_contains "$RUN_OUT" "Copyright (C) 2026 Martin J. Gallagher" || return 1
-    assert_contains "$RUN_OUT" "GNU GPL version 3 or later" || return 1
-    assert_contains "$RUN_OUT" "NO WARRANTY" || return 1
+    assert_contains "$RUN_OUT" "GPL-3.0-or-later" || return 1
+    assert_contains "$RUN_OUT" "no warranty" || return 1
 }
 
 test_hints_cheatsheet_covers_the_goals() {
