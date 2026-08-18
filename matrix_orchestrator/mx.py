@@ -3155,16 +3155,16 @@ def build_parser():
     ap = argparse.ArgumentParser(
         prog="mx", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    # The canonical GNU form: version line first (scripts parse it), then
-    # holder, license and the two GPL notice lines.
+    # Version line first (scripts parse it), then holder, license and the
+    # two GPL notice lines — the same layout every provost-suite tool uses.
     ap.add_argument("--version", action="version",
                     version="mx %s\n"
                             "Copyright (C) 2026 Martin J. Gallagher\n"
-                            "License GPLv3+: GNU GPL version 3 or later "
-                            "<https://gnu.org/licenses/gpl.html>\n"
+                            "License: GPL-3.0-or-later "
+                            "<https://www.gnu.org/licenses/gpl-3.0.html>\n"
                             "This is free software: you are free to change "
                             "and redistribute it.\n"
-                            "There is NO WARRANTY, to the extent permitted "
+                            "There is no warranty, to the extent permitted "
                             "by law." % VERSION)
     sub = ap.add_subparsers(dest="cmd")
 
