@@ -38,6 +38,7 @@ Python 3.6+, standard library only, on the orchestrator and on every host.
 
 import argparse
 import csv
+import json
 import multiprocessing
 import os
 import random
@@ -54,7 +55,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -2399,6 +2400,102 @@ class Agg(object):
         return v if v is not None else 0.0
 
 
+# The report columns each aggregate needs. Named once, because
+# `summarize` and `export` have to read the same run the same way.
+TX_KEYS = ["target_pps", "pps", "mbps", "rep_pps", "rep_mbps",
+           "rtt_avg_us", "rtt_p50_us", "rtt_p99_us", "rtt_max_us"]
+HOST_KEYS = ["target_pps", "pps", "mbps", "rep_pps", "rep_mbps",
+             "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"]
+
+
+def _aggregate(recent):
+    """Sort a window of report rows into the three aggregates every
+    analysis needs: the client side per pair, the server side per pair,
+    and the host totals. Blank cells are skipped by `Agg`, never counted
+    as zero."""
+    tx = {}       # (host, peer) -> Agg   (client side: what we sent/got back)
+    srv = {}      # (host, peer) -> Agg   (server side: what actually arrived)
+    hostagg = {}  # host -> Agg
+    for r in recent:
+        d = r.get("dir")
+        if d == "tx":
+            tx.setdefault((r["host"], r["peer"]), Agg()).add(r, TX_KEYS)
+        elif d == "rx":
+            srv.setdefault((r["host"], r["peer"]), Agg()).add(r, ["pps", "rep_pps"])
+        elif d == "host":
+            hostagg.setdefault(r["host"], Agg()).add(r, HOST_KEYS)
+    return tx, srv, hostagg
+
+
+def _per_host(tx, srv, hostagg, nticks, layered):
+    """Per-host rates over the window, aggregated the way the fleet totals
+    are: from the per-pair rows in a full mesh, and from the host rows in a
+    layered run, where most pairs are idle most of the time and summing
+    per-pair means would count every layer as if it had run the whole
+    window.
+
+    Latency is always the worst peer's, never a mean of percentiles.
+    """
+    stats = {}
+
+    def entry(host):
+        h = stats.get(host)
+        if h is None:
+            h = stats[host] = {"sent": 0.0, "back": 0.0, "target": 0.0,
+                               "served": 0.0, "served_rep": 0.0,
+                               "rtt_p50": 0.0, "rtt_p99": 0.0, "rtt_max": 0.0,
+                               "peers": 0}
+        return h
+
+    for (host, _peer), a in tx.items():
+        h = entry(host)
+        h["peers"] += 1
+        if not layered:
+            h["sent"] += a.mean("pps")
+            h["back"] += a.mean("rep_pps")
+            h["target"] += a.mean("target_pps")
+        h["rtt_p50"] = max(h["rtt_p50"], a.mean("rtt_p50_us"))
+        h["rtt_p99"] = max(h["rtt_p99"], a.mean("rtt_p99_us"))
+        h["rtt_max"] = max(h["rtt_max"], a.peak("rtt_max_us"))
+    if layered:
+        for host, a in hostagg.items():
+            h = entry(host)
+            h["sent"] = a.mean("pps")
+            h["back"] = a.mean("rep_pps")
+            h["target"] = a.mean("target_pps")
+    for (host, _peer), a in srv.items():
+        h = entry(host)
+        if layered:
+            # The server rows are per-interval counts of what arrived; in a
+            # layered run only the intervals the host itself reported can
+            # turn them back into a rate.
+            if not nticks.get(host):
+                continue
+            h["served"] += a.sums.get("pps", 0.0) / nticks[host]
+            h["served_rep"] += a.sums.get("rep_pps", 0.0) / nticks[host]
+        else:
+            h["served"] += a.mean("pps")
+            h["served_rep"] += a.mean("rep_pps")
+    return stats
+
+
+def _report_sizes(rows, tx_size, rx_size):
+    """The packet sizes the run actually used.
+
+    They come from the reports, not from the matrix: the matrix may have
+    been re-generated since the run, and the bytes that were on the wire
+    are the ones worth converting to Gbps.
+    """
+    for r in rows:
+        if r.get("size") and r.get("rep_size"):
+            try:
+                return int(r["size"]), int(r["rep_size"])
+            except ValueError:
+                pass
+            break
+    return tx_size, rx_size
+
+
 def _read_reports(paths):
     rows = []
     for p in paths:
@@ -2429,33 +2526,9 @@ def cmd_summarize(args):
     cutoff = latest - args.window
     recent = [r for r in rows if int(float(r["ts"])) >= cutoff]
 
-    # Packet sizes come from the reports, not from the matrix: the matrix
-    # may have been re-generated since the run, and the bytes that were
-    # actually on the wire are the ones worth converting to Gbps.
-    tx_size, rx_size = m.tx_size, m.rx_size
-    for r in recent:
-        if r.get("size") and r.get("rep_size"):
-            try:
-                tx_size, rx_size = int(r["size"]), int(r["rep_size"])
-            except ValueError:
-                pass
-            break
+    tx_size, rx_size = _report_sizes(recent, m.tx_size, m.rx_size)
 
-    tx = {}       # (host, peer) -> Agg   (client side: what we sent/got back)
-    srv = {}      # (host, peer) -> Agg   (server side: what actually arrived)
-    hostagg = {}  # host -> Agg
-    TXK = ["target_pps", "pps", "mbps", "rep_pps", "rep_mbps",
-           "rtt_avg_us", "rtt_p50_us", "rtt_p99_us", "rtt_max_us"]
-    for r in recent:
-        d = r.get("dir")
-        if d == "tx":
-            tx.setdefault((r["host"], r["peer"]), Agg()).add(r, TXK)
-        elif d == "rx":
-            srv.setdefault((r["host"], r["peer"]), Agg()).add(r, ["pps", "rep_pps"])
-        elif d == "host":
-            hostagg.setdefault(r["host"], Agg()).add(
-                r, ["target_pps", "pps", "mbps", "rep_pps", "rep_mbps",
-                    "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"])
+    tx, srv, hostagg = _aggregate(recent)
     if not tx:
         die("no client rows in the last %ds -- are the agents still running?"
             % args.window)
@@ -2524,34 +2597,7 @@ def cmd_summarize(args):
         % (fmt_us(rtt_avg), fmt_us(rtt_p50), fmt_us(rtt_p99), fmt_us(rtt_max)))
 
     # Per host, worst delivery first.
-    per_host = {}
-    for (host, peer), a in tx.items():
-        h = per_host.setdefault(host, [0.0, 0.0, 0.0, 0.0])
-        if not layered:
-            h[0] += a.mean("pps")
-            h[1] += a.mean("rep_pps")
-            h[2] += a.mean("target_pps")
-        h[3] = max(h[3], a.mean("rtt_p99_us"))
-    if layered:
-        # Same reasoning as the fleet totals: rates come from the host
-        # rows, only the worst p99 comes from the per-pair rows.
-        for host, a in hostagg.items():
-            h = per_host.setdefault(host, [0.0, 0.0, 0.0, 0.0])
-            h[0] = a.mean("pps")
-            h[1] = a.mean("rep_pps")
-            h[2] = a.mean("target_pps")
-    served, served_rep = {}, {}
-    for (host, peer), a in srv.items():
-        if layered:
-            if not nticks.get(host):
-                continue
-            served[host] = (served.get(host, 0.0)
-                            + a.sums.get("pps", 0.0) / nticks[host])
-            served_rep[host] = (served_rep.get(host, 0.0)
-                                + a.sums.get("rep_pps", 0.0) / nticks[host])
-        else:
-            served[host] = served.get(host, 0.0) + a.mean("pps")
-            served_rep[host] = served_rep.get(host, 0.0) + a.mean("rep_pps")
+    stats = _per_host(tx, srv, hostagg, nticks, layered)
 
     log("")
     # "agent" is the agent process's own CPU as a share of ONE core --
@@ -2561,16 +2607,18 @@ def cmd_summarize(args):
     log("  %-20s %11s %11s %11s %10s %8s %9s %6s %7s %6s"
         % ("host", "sent", "back", "serving", "egress", "loss", "rtt p99",
            "cpu", "1 core", "agent"))
-    ranked = sorted(per_host.items(),
-                    key=lambda kv: pct(kv[1][1], kv[1][0]) if kv[1][0] else 100.0)
-    for host, (s, b, t, p99) in ranked[:args.top_hosts]:
+    ranked = sorted(stats.items(),
+                    key=lambda kv: (pct(kv[1]["back"], kv[1]["sent"])
+                                    if kv[1]["sent"] else 100.0))
+    for host, h in ranked[:args.top_hosts]:
         ha = hostagg.get(host)
-        egress = wire_bps(s, tx_size) + wire_bps(served_rep.get(host, 0.0),
-                                                 rx_size)
+        egress = wire_bps(h["sent"], tx_size) + wire_bps(h["served_rep"],
+                                                         rx_size)
         log("  %-20s %11s %11s %11s %10s %7.2f%% %9s %5s %6s %5s"
-            % (host, fmt_pps(s), fmt_pps(b), fmt_pps(served.get(host, 0.0)),
-               fmt_gbps(egress),
-               max(0.0, 100.0 - pct(b, s)) if s else 0.0, fmt_us(p99),
+            % (host, fmt_pps(h["sent"]), fmt_pps(h["back"]),
+               fmt_pps(h["served"]), fmt_gbps(egress),
+               max(0.0, 100.0 - pct(h["back"], h["sent"])) if h["sent"] else 0.0,
+               fmt_us(h["rtt_p99"]),
                "%.0f%%" % ha.mean("cpu_pct") if ha else "-",
                "%.0f%%" % ha.mean("cpu_max_pct") if ha else "-",
                "%.0f%%" % ha.mean("agent_cpu_pct") if ha else "-"))
@@ -2711,9 +2759,7 @@ def cmd_summarize(args):
 
     # How many peers each host is a client for -- the cap on how many
     # workers it can ever put to work.
-    flowcount = {}
-    for (host, _peer) in tx:
-        flowcount[host] = flowcount.get(host, 0) + 1
+    flowcount = dict((host, h["peers"]) for host, h in stats.items())
     _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
                    fwd_pps, rtt_p50, rtt_p99, coverage)
     return 0
@@ -2850,6 +2896,396 @@ def _wrap(prefix, text, width=78):
     for line in textwrap.wrap(text, width=width, initial_indent=prefix,
                               subsequent_indent=" " * len(prefix)):
         log(line)
+
+
+# ---------------------------------------------------------------------------
+# export: a run as an overlay for the datacenter layout viewer
+# ---------------------------------------------------------------------------
+#
+# The viewer (github.com/MartinGallagher-code/datacenter_visualization) draws
+# a floor from a `.dc` layout and colours it from a results file: one sample
+# per line,
+#
+#     <test>  <target>  <value>  [key=value ...]
+#
+# tab separated, append-only, with `!test` lines carrying each overlay's
+# units and palette direction. `mx export >> results.tsv` after every run is
+# the whole integration; `--json` writes the same samples as NDJSON for a
+# pipeline rather than a person.
+#
+# The numbers are the ones `mx summarize` prints, computed here, by the
+# report's own rules: a blank cell is "not measured" and never zero, a
+# layered run's rates come from the host rows because most pairs are idle
+# most of the window, loss is a ratio of totals rather than a mean of
+# ratios, and latency is the worst peer's rather than a percentile of
+# percentiles. That is why this is an export and not somebody else's
+# importer -- a tool reading reports/*.csv from outside cannot know any of
+# it, and every one of those rules is the difference between a number and a
+# flattering number.
+
+# (test, `!test` metadata). One sample per host per window, from the
+# aggregates `mx summarize` prints.
+EXPORT_HOST_TESTS = [
+    ("pps", 'unit=pps higher=good short=PPS label="Requests sent"'),
+    ("rep_pps", 'unit=pps higher=good short=REP label="Replies received"'),
+    ("served_pps", 'unit=pps higher=good short=SRV label="Requests arriving here"'),
+    ("egress_gbps", 'unit=Gb/s higher=good short=EGR label="Egress on the wire"'),
+    ("loss", 'unit=% higher=bad short=LOSS label="Round-trip loss"'),
+    ("achieved", 'unit=% higher=good short=ACHV label="Rate achieved vs target"'),
+    ("rtt_p50", 'unit=us higher=bad short=P50 label="RTT p50, worst peer"'),
+    ("rtt_p99", 'unit=us higher=bad short=P99 label="RTT p99, worst peer"'),
+    ("rtt_max", 'unit=us higher=bad short=MAX label="RTT max, worst peer"'),
+    ("cpu", 'unit=% higher=bad short=CPU label="Host CPU"'),
+    ("cpu_core", 'unit=% higher=bad short=CORE label="Busiest core"'),
+    ("agent_cpu", 'unit=% higher=bad short=ACPU label="Busiest mx worker, share of a core"'),
+    ("peers", 'higher=good short=PEER label="Flows this host sends"'),
+    ("intervals", 'higher=good short=IVL label="Report intervals in the window"'),
+    ("state", 'agg=last short=STATE label="Did this host report?"'),
+]
+
+# One sample per flow, under their own names so that `max` on a peer
+# overlay reads as "the worst peer of this host" -- and so that per-peer
+# samples can never be averaged in with the per-host ones.
+EXPORT_PEER_TESTS = [
+    ("peer_pps", 'unit=pps higher=good short=PPS agg=mean label="Requests sent to one peer"'),
+    ("peer_loss", 'unit=% higher=bad short=LOSS agg=max label="Round-trip loss, worst peer"'),
+    ("peer_rtt_p99", 'unit=us higher=bad short=P99 agg=max label="RTT p99, worst peer"'),
+]
+
+# --raw: the columns a `dir=host` row carries as they stand, one sample per
+# reporting interval. The derived overlays (served_pps, egress_gbps, peers)
+# have no per-interval meaning and are left out.
+EXPORT_RAW_COLUMNS = [
+    ("pps", "pps"),
+    ("rep_pps", "rep_pps"),
+    ("loss", "loss_pct"),
+    ("rtt_p50", "rtt_p50_us"),
+    ("rtt_p99", "rtt_p99_us"),
+    ("cpu", "cpu_pct"),
+    ("cpu_core", "cpu_max_pct"),
+    ("agent_cpu", "agent_cpu_pct"),
+]
+
+EXPORT_META = dict(EXPORT_HOST_TESTS + EXPORT_PEER_TESTS)
+
+
+# A results line is whitespace separated, and a double quote is how a value
+# with a space in it is written -- so neither can appear inside a field.
+BAD_IN_FIELD = ' \t\n\r"'
+
+
+def _fmt_num(value):
+    """A number for a results file: four significant digits, fixed
+    notation. `%g` would write a megapacket rate as 1.235e+06, which is
+    correct and unreadable in a file people grep."""
+    text = "%.4g" % value
+    if "e" in text or "E" in text:
+        text = "%.0f" % value
+    return text
+
+
+def _report_number(cell):
+    """A report cell as a float, or None when it is blank or unparseable.
+
+    Blank means "not measured" everywhere in a report, and importing it as
+    zero is the one mistake that quietly flatters every number downstream.
+    """
+    if cell is None:
+        return None
+    text = str(cell).strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
+
+
+def _load_names(path):
+    """`--names`: mx host name -> the name the layout knows it by.
+
+    One mapping per line, `mxname target`, separated by whitespace or '='.
+    Blank lines and '#' comments are ignored, and a host the file does not
+    mention keeps its matrix name -- so the file only has to carry the
+    exceptions.
+    """
+    names = {}
+    try:
+        with open(path) as f:
+            for lineno, raw in enumerate(f, 1):
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.replace("=", " ").split()
+                if len(parts) != 2:
+                    die("%s line %d: want `mxname target`, got %r"
+                        % (path, lineno, line))
+                names[parts[0]] = parts[1]
+    except OSError as exc:
+        die("cannot read %s: %s" % (path, exc))
+    return names
+
+
+class Overlay(object):
+    """The results file being built: `!test` declarations, then samples.
+
+    A test is declared the first time something is filed under it, so an
+    overlay never appears in the file with no data behind it.
+    """
+
+    def __init__(self, test_prefix="mx_", target_prefix="", names=None,
+                 run=None):
+        self.test_prefix = test_prefix
+        self.target_prefix = target_prefix
+        self.names = names or {}
+        self.run = run
+        self.meta = []          # [(test, "key=value ...")]
+        self.samples = []       # [(test, target, value, [key=value ...])]
+        self._declared = set()
+
+    def target(self, host):
+        """The layout's name for an mx host: mapped by --names, then
+        prefixed by --target-prefix. The viewer resolves a bare name, a
+        path, or any unique tail of a path, so `wr01r01u07`, `R01/u07` and
+        `DH1/A/R01/u07` all land on the same node."""
+        name = self.target_prefix + self.names.get(host, host)
+        if not name or any(c in name for c in BAD_IN_FIELD):
+            die("target %r: a results file is whitespace separated and quote "
+                "aware, so a target can hold neither (host %r)" % (name, host))
+        return name
+
+    def add(self, test, host, value, extras=()):
+        """File one sample. `None` is dropped: not measured is not zero."""
+        if value is None:
+            return
+        if not isinstance(value, str):
+            if value != value or value in (float("inf"), float("-inf")):
+                return
+            value = _fmt_num(value)
+        name = self.test_prefix + test
+        if test not in self._declared:
+            self._declared.add(test)
+            meta = EXPORT_META.get(test)
+            if meta:
+                self.meta.append((name, meta))
+        extras = list(extras)
+        if self.run:
+            extras.append("run=%s" % self.run)
+        self.samples.append((name, self.target(host), value, extras))
+
+    def tsv_lines(self, with_meta=True):
+        out = []
+        if with_meta:
+            for test, meta in self.meta:
+                out.append("!test\t%s\t%s" % (test, meta))
+        for test, target, value, extras in self.samples:
+            out.append("\t".join([test, target, value] + extras))
+        return out
+
+    def json_lines(self, with_meta=True):
+        """NDJSON: one object per line, so concatenating two runs is still a
+        valid file -- which a top-level `[ ... ]` array would not be."""
+        out = []
+        if with_meta:
+            for test, meta in self.meta:
+                entry = {"!test": test}
+                entry.update(_meta_pairs(meta))
+                out.append(json.dumps(entry, sort_keys=True))
+        for test, target, value, extras in self.samples:
+            number = _report_number(value)
+            entry = {"test": test, "target": target,
+                     "value": value if number is None else number}
+            if extras:
+                entry["meta"] = _meta_pairs(" ".join(extras))
+            out.append(json.dumps(entry, sort_keys=True))
+        return out
+
+
+def _meta_pairs(text):
+    """`unit=us higher=bad label="RTT p50"` -> a dict, quotes removed."""
+    pairs = {}
+    for token in shlex.split(text):
+        if "=" in token:
+            key, value = token.split("=", 1)
+            pairs[key] = value
+    return pairs
+
+
+def cmd_export(args):
+    m = load_matrix(args.matrix) if os.path.isfile(args.matrix) else None
+    if m is None:
+        if not args.no_collect:
+            die("matrix not found: %s -- `mx export --no-collect` exports the "
+                "reports already in %s/ without it" % (args.matrix, args.reports))
+        # Everything but the roll call survives without it: a host that never
+        # reported is only knowable from the list of hosts there should be.
+        sys.stderr.write("[mx] export: no %s, so hosts that never reported "
+                         "cannot be listed\n" % args.matrix)
+
+    stdout = args.output in ("-", "")
+    if not args.no_collect:
+        # `mx collect` narrates to stdout, which is where the results file
+        # itself goes when there is no -o. Nothing but samples may land there.
+        saved = sys.stdout
+        if stdout:
+            sys.stdout = sys.stderr
+        try:
+            cmd_collect(args)
+        finally:
+            sys.stdout = saved
+
+    paths = sorted(os.path.join(args.reports, f)
+                   for f in os.listdir(args.reports)
+                   if f.endswith(".csv")) if os.path.isdir(args.reports) else []
+    if not paths:
+        die("no reports in %s/ -- is the run started? (mx status)" % args.reports)
+    rows = _read_reports(paths)
+    if not rows:
+        die("reports are empty -- give the agents an interval or two, then retry")
+
+    latest = max(int(float(r["ts"])) for r in rows)
+    if args.window > 0:
+        recent = [r for r in rows if int(float(r["ts"])) >= latest - args.window]
+    else:
+        recent = rows          # --window 0: the whole history
+    if not recent:
+        die("no rows in the last %ds -- widen --window, or --window 0 for "
+            "everything the reports hold" % args.window)
+
+    # The matrix is the authority on whether a run is layered; without one,
+    # the layer column says so just as well.
+    layered = (m.layering is not None) if m else any(r.get("layer") for r in recent)
+    tx, srv, hostagg = _aggregate(recent)
+    if not tx and not hostagg:
+        die("nothing measured in the window -- are the agents still running? "
+            "(mx status)")
+    nticks = {h: a.counts.get("pps", 0) for h, a in hostagg.items()}
+    tx_size, rx_size = _report_sizes(
+        recent, m.tx_size if m else 64, m.rx_size if m else 64)
+    stats = _per_host(tx, srv, hostagg, nticks, layered)
+
+    if args.run and any(c in args.run for c in BAD_IN_FIELD):
+        die("--run %r: the label is written onto every sample line, so it "
+            "can hold no whitespace or quotes" % args.run)
+
+    out = Overlay(test_prefix=args.test_prefix,
+                  target_prefix=args.target_prefix,
+                  names=_load_names(args.names) if args.names else None,
+                  run=args.run)
+
+    if args.raw:
+        for r in recent:
+            if r.get("dir") != "host":
+                continue
+            extras = ["ts=%s" % r["ts"]]
+            for test, column in EXPORT_RAW_COLUMNS:
+                out.add(test, r["host"], _report_number(r.get(column)), extras)
+            target_pps = _report_number(r.get("target_pps"))
+            sent = _report_number(r.get("pps"))
+            if target_pps and sent is not None:
+                out.add("achieved", r["host"], pct(sent, target_pps), extras)
+    else:
+        for host in sorted(stats):
+            h = stats[host]
+            agg = hostagg.get(host)
+            out.add("pps", host, h["sent"])
+            out.add("rep_pps", host, h["back"])
+            out.add("served_pps", host, h["served"])
+            # What this host puts on the wire: its own requests, plus the
+            # replies it owes every host that calls it. The number a NIC
+            # has to carry, which is the one a floor plan is drawn for.
+            out.add("egress_gbps", host,
+                    (wire_bps(h["sent"], tx_size)
+                     + wire_bps(h["served_rep"], rx_size)) / 1e9)
+            if h["sent"] > 0:
+                out.add("loss", host, max(0.0, 100.0 - pct(h["back"], h["sent"])))
+            if h["target"] > 0:
+                out.add("achieved", host, pct(h["sent"], h["target"]))
+            for test in ("rtt_p50", "rtt_p99", "rtt_max"):
+                if h[test] > 0:
+                    out.add(test, host, h[test])
+            if agg:
+                for test, column in (("cpu", "cpu_pct"),
+                                     ("cpu_core", "cpu_max_pct"),
+                                     ("agent_cpu", "agent_cpu_pct")):
+                    if agg.counts.get(column):
+                        out.add(test, host, agg.mean(column))
+            out.add("peers", host, float(h["peers"]))
+            out.add("intervals", host, float(nticks.get(host, 0)))
+
+    # Which hosts were heard from at all, in either mode: the overlay that
+    # says a rack went quiet.
+    for host in sorted(stats):
+        out.add("state", host, "REPORTING")
+
+    if args.peers:
+        pair_layer = {}
+        for r in recent:
+            if r.get("dir") == "tx" and r.get("layer"):
+                pair_layer.setdefault((r["host"], r["peer"]), r["layer"])
+        for (host, peer) in sorted(tx):
+            a = tx[(host, peer)]
+            extras = ["peer=%s" % out.target(peer)]
+            layer = pair_layer.get((host, peer))
+            if layer:
+                extras.append("layer=%s" % layer)
+            sent = a.mean("pps")
+            out.add("peer_pps", host, sent if sent > 0 else None, extras)
+            if layered:
+                # A ratio of totals, not of per-row means: the replies still
+                # in flight at a layer switch land in a drain row with
+                # nothing sent against them, and only the totals put the two
+                # halves of that boundary back together.
+                total = a.sums.get("pps", 0.0)
+                delivered = pct(a.sums.get("rep_pps", 0.0), total) if total else None
+            else:
+                delivered = pct(a.mean("rep_pps"), sent) if sent > 0 else None
+            if delivered is not None:
+                out.add("peer_loss", host, max(0.0, 100.0 - delivered), extras)
+            p99 = a.mean("rtt_p99_us")
+            out.add("peer_rtt_p99", host, p99 if p99 > 0 else None, extras)
+
+    # Hosts the matrix knows about that said nothing in the window: the one
+    # thing a results file can show that a report cannot, because a host
+    # with no report has no row to carry it.
+    silent = 0
+    if m:
+        for host in m.hosts:
+            if host not in stats:
+                out.add("state", host, "NO-DATA")
+                silent += 1
+
+    if not out.samples:
+        die("nothing to export from %s/ -- no measured rows in the window"
+            % args.reports, code=1)
+
+    header = ("# mx %s export -- %d host(s), %s, %d sample(s), latest ts=%d"
+              % (VERSION, len(stats),
+                 "whole history" if args.window <= 0 else "last %ds" % args.window,
+                 len(out.samples), latest))
+    lines = ([header] +
+             (out.json_lines(not args.no_meta) if args.json
+              else out.tsv_lines(not args.no_meta)))
+
+    if stdout:
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    else:
+        with open(args.output, "a" if args.append else "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+
+    tests = sorted(set(t for t, _target, _v, _e in out.samples))
+    sys.stderr.write(
+        "[mx] export: %d sample(s) over %d test(s) -> %s%s\n"
+        % (len(out.samples), len(tests),
+           "stdout" if stdout else args.output,
+           "; %d host(s) reported nothing" % silent if silent else ""))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3242,6 +3678,52 @@ def build_parser():
     _add_fleet_flags(sm)
     _add_report_flags(sm)
 
+    ex = sub.add_parser("export",
+                        help="the run as overlay samples for the datacenter "
+                             "layout viewer")
+    _add_fleet_flags(ex)
+    ex.add_argument("--reports", default=_env("MX_REPORTS", "reports"),
+                    help="local directory of collected reports "
+                         "(default: %(default)s)")
+    ex.add_argument("--window", type=int, default=60,
+                    help="seconds of history to reduce, 0 for everything the "
+                         "reports hold (default: %(default)s)")
+    ex.add_argument("--no-collect", action="store_true",
+                    help="export the reports already collected, no ssh")
+    ex.add_argument("--output", "-o", default="-",
+                    help="results file to write ('-' for stdout, the default)")
+    ex.add_argument("--append", action="store_true",
+                    help="append to --output instead of replacing it: results "
+                         "files are append-only, so a run per append is a "
+                         "history the viewer can aggregate over")
+    ex.add_argument("--json", action="store_true",
+                    help="write NDJSON (one sample object per line) instead "
+                         "of the tab-separated form")
+    ex.add_argument("--raw", action="store_true",
+                    help="one sample per host per report interval instead of "
+                         "one per host: the viewer can then show min/max/p95 "
+                         "over the run, not just the window's mean")
+    ex.add_argument("--peers", action="store_true",
+                    help="also export one sample per flow (mx_peer_*), each "
+                         "carrying peer= so the worst peer of a host is one "
+                         "`max` away. Reduced over the window even with "
+                         "--raw, which a full mesh's row count is the reason "
+                         "for")
+    ex.add_argument("--names", metavar="FILE",
+                    help="map mx host names to the names the layout uses: "
+                         "one `mxname target` per line")
+    ex.add_argument("--target-prefix", default="", metavar="STR",
+                    help="string prepended to every target, e.g. 'DH1/A/' "
+                         "when the layout addresses nodes by path")
+    ex.add_argument("--test-prefix", default="mx_", metavar="STR",
+                    help="string prepended to every test name, so mx overlays "
+                         "cannot collide with another tool's in the same "
+                         "results file (default: %(default)s)")
+    ex.add_argument("--run", metavar="LABEL",
+                    help="tag every sample with run=LABEL")
+    ex.add_argument("--no-meta", action="store_true",
+                    help="do not write the !test metadata lines")
+
     co = sub.add_parser("collect", help="pull report CSVs, no analysis")
     _add_fleet_flags(co)
     co.add_argument("--reports", default=_env("MX_REPORTS", "reports"),
@@ -3327,8 +3809,9 @@ def cmd_full_help(ap):
 COMMANDS = {
     "gen": cmd_gen, "check": cmd_check, "hints": cmd_hints, "start": cmd_start,
     "status": cmd_status, "summarize": cmd_summarize, "collect": cmd_collect,
-    "stop": cmd_stop, "logs": cmd_logs, "clean": cmd_clean, "run": cmd_run,
-    "doctor": cmd_doctor, "agent": cmd_agent,
+    "export": cmd_export, "stop": cmd_stop, "logs": cmd_logs,
+    "clean": cmd_clean, "run": cmd_run, "doctor": cmd_doctor,
+    "agent": cmd_agent,
 }
 
 
