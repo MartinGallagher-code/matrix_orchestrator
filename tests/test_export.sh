@@ -30,9 +30,20 @@ write_reports() {
     {
         echo "$REPORT_HEAD"
         echo "1000,beta,tx,alpha,64,64,1000.0,1000.0,0.520,1000.0,0.520,0.000,50,40,80,120,,,,,"
-        echo "1000,beta,rx,alpha,64,64,,1900.0,0.988,1900.0,0.988,,,,,,,,,,"
+        echo "1000,beta,rx,alpha,64,64,,1950.0,1.014,1950.0,1.014,,,,,,,,,,"
         echo "1000,beta,host,*,64,64,1000.0,1000.0,0.520,1000.0,0.520,0.000,,40,80,,5.0,9.0,12.0,1,"
     } > rep/beta.csv
+}
+
+# A host that reports its own send side and nothing else: no peer of its
+# ever wrote an rx row naming it, so its receive side was never measured.
+write_lonely_report() {
+    mkdir -p rep
+    {
+        echo "$REPORT_HEAD"
+        echo "1000,delta,tx,alpha,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,100,90,400,900,,,,,"
+        echo "1000,delta,host,*,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,,90,400,,10.0,20.0,30.0,1,"
+    } > rep/delta.csv
 }
 
 # A matrix the reports belong to, so export can say which hosts are silent.
@@ -55,9 +66,10 @@ test_export_declares_and_files_every_host_overlay() {
     assert_contains "$RUN_OUT" "!test	mx_pps	unit=pps higher=good" || return 1
     assert_contains "$RUN_OUT" "!test	mx_loss	unit=% higher=bad" || return 1
     local t
-    for t in mx_pps mx_rep_pps mx_served_pps mx_egress_gbps mx_loss \
-             mx_achieved mx_rtt_p50 mx_rtt_p99 mx_cpu mx_agent_cpu \
-             mx_peers mx_intervals mx_state; do
+    for t in mx_pps mx_rep_pps mx_served_pps mx_request_gbps mx_egress_gbps \
+             mx_loss mx_forward_loss mx_return_loss mx_achieved mx_rtt_avg \
+             mx_rtt_p50 mx_rtt_p99 mx_cpu mx_agent_cpu mx_peers mx_workers \
+             mx_intervals mx_state; do
         assert_contains "$RUN_OUT" "$t	alpha	" "$t sampled for alpha" || return 1
     done
 }
@@ -131,6 +143,68 @@ test_export_maps_host_names_onto_the_layout() {
     assert_status 0 "$RUN_RC" || return 1
     assert_contains "$RUN_OUT" "mx_pps	DH1/A/wr01r01u07	2000	run=nightly-7" || return 1
     assert_contains "$RUN_OUT" "mx_pps	DH1/A/beta	" "unmapped hosts keep their name" || return 1
+}
+
+test_export_splits_loss_into_the_leg_that_lost_it() {
+    write_reports
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    # alpha sent 2000; beta counted 1950 arriving; 1900 replies came back.
+    # 2.5% never arrived, another 2.5% arrived but never made it back --
+    # which is the difference between a sick sender and a sick receiver.
+    assert_eq "5" "$(sample "$RUN_OUT" mx_loss alpha)" "round trip" || return 1
+    assert_eq "2.5" "$(sample "$RUN_OUT" mx_forward_loss alpha)" "outbound leg" || return 1
+    assert_eq "2.5" "$(sample "$RUN_OUT" mx_return_loss alpha)" "return leg" || return 1
+}
+
+test_export_invents_no_zero_for_a_receive_side_nobody_measured() {
+    write_reports
+    write_lonely_report
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    # No peer of delta's ever wrote an rx row naming it, so "nothing served"
+    # is not a measurement of zero -- and a zero here would be averaged into
+    # every rack and room it sits in.
+    assert_eq "" "$(sample "$RUN_OUT" mx_served_pps delta)" "served is not zero" || return 1
+    assert_eq "" "$(sample "$RUN_OUT" mx_forward_loss delta)" "nor is forward loss" || return 1
+    # Egress needs the reply half; the request half is known on its own and
+    # is exported either way.
+    assert_eq "" "$(sample "$RUN_OUT" mx_egress_gbps delta)" "egress needs both halves" || return 1
+    assert_contains "$RUN_OUT" "mx_request_gbps	delta	" "requests are known alone" || return 1
+    # alpha's receive side *was* measured, so it keeps both.
+    assert_contains "$RUN_OUT" "mx_served_pps	alpha	" || return 1
+    assert_contains "$RUN_OUT" "mx_egress_gbps	alpha	" || return 1
+}
+
+test_export_reports_a_rotation_that_has_not_come_round_yet() {
+    write_matrix alpha beta gamma
+    run_mx gen --servers servers.txt --pps 2000 --peers 1 --dwell 6
+    assert_status 0 "$RUN_RC" || return 1
+    mkdir -p rep
+    {
+        echo "$REPORT_HEAD"
+        echo "1000,alpha,tx,beta,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,100,90,400,900,,,,,0"
+        echo "1000,alpha,host,*,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,,90,400,,10.0,20.0,30.0,1,0"
+    } > rep/alpha.csv
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    # One of the two peers alpha owes has had its turn: a floor plan drawn
+    # now is showing half a mesh, and says so.
+    assert_eq "50" "$(sample "$RUN_OUT" mx_coverage alpha)" "half the rotation" || return 1
+}
+
+test_export_raw_still_carries_the_derived_overlays() {
+    write_reports
+    run_mx export --no-collect --reports rep --window 0 --raw --no-meta
+    assert_status 0 "$RUN_RC" || return 1
+    # --raw is a superset: the per-interval columns many times over, and the
+    # overlays with no per-interval meaning exactly once.
+    local n; n=$(printf '%s\n' "$RUN_OUT" | grep -c '^mx_pps	alpha	')
+    assert_eq "2" "$n" "per-interval samples" || return 1
+    n=$(printf '%s\n' "$RUN_OUT" | grep -c '^mx_served_pps	alpha	')
+    assert_eq "1" "$n" "derived overlays once per host" || return 1
+    assert_contains "$RUN_OUT" "mx_forward_loss	alpha	" || return 1
+    assert_contains "$RUN_OUT" "mx_request_gbps	alpha	" || return 1
 }
 
 test_export_refuses_a_field_that_would_break_the_line() {
@@ -220,6 +294,10 @@ run_test test_export_peer_samples_carry_the_peer
 run_test test_export_raw_gives_one_sample_per_interval
 run_test test_export_window_keeps_only_recent_intervals
 run_test test_export_maps_host_names_onto_the_layout
+run_test test_export_splits_loss_into_the_leg_that_lost_it
+run_test test_export_invents_no_zero_for_a_receive_side_nobody_measured
+run_test test_export_reports_a_rotation_that_has_not_come_round_yet
+run_test test_export_raw_still_carries_the_derived_overlays
 run_test test_export_refuses_a_field_that_would_break_the_line
 run_test test_export_json_is_one_object_per_line
 run_test test_export_appends_a_run_to_an_existing_results_file

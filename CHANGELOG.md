@@ -9,6 +9,48 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.6.0] - 2026-08-30
+
+### Fixed
+
+- **`mx export` no longer invents a zero for a receive side nobody
+  measured.** A host with no `dir=rx` row at all was exported as
+  `mx_served_pps 0`, and its `mx_egress_gbps` silently counted only the
+  request half of the wire. In a table that zero reads as context; as an
+  overlay it is averaged into the rack and room above it and paints a
+  node with a number no agent ever reported. Both now appear only when
+  the receive side was measured — and `mx_request_gbps` carries the half
+  that is always known from the host's own rows.
+
+### Added
+
+- **`mx_forward_loss` and `mx_return_loss`: which leg lost the packet.**
+  Round-trip loss says a host is losing traffic; these say whether its
+  requests never arrived (the fabric or the receiver dropping them) or
+  arrived and the replies never came back — the difference between a
+  sick sender and a sick receiver, and the question a floor plan exists
+  to answer. Counted from the peers' own `rx` rows, and exported only
+  when every peer of that host reported one: with a peer missing the
+  total would be short, and the loss it implied would be invented.
+- **`mx_coverage`** — on a layered run, the share of its peers a host
+  has measured so far, counted over the whole report history rather than
+  the window. A floor plan drawn before a full rotation has elapsed is
+  showing a partial mesh; this is the overlay that says which hosts are
+  still short.
+- **`mx_rtt_avg`** (mean latency over a host's flows, the per-host form
+  of what `mx summarize` prints fleet-wide) and **`mx_workers`** (the
+  agent's worker count, which is what makes `mx_agent_cpu` readable: one
+  worker pegged at 100% of a core means something different at 1 worker
+  than at 8).
+
+### Changed
+
+- **`--raw` is now a superset of the default rather than a different
+  set.** The overlays derived from more than one row — `served_pps`,
+  `request_gbps`, `egress_gbps`, the loss split, `coverage`, `peers`,
+  `workers` — have no per-interval meaning, so they are written once per
+  host alongside the per-interval samples instead of being dropped.
+
 ## [1.5.0] - 2026-08-29
 
 ### Added
