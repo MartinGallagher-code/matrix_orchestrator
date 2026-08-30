@@ -591,13 +591,25 @@ One sample per host per overlay, reduced over `--window` seconds:
 |---|---|
 | `mx_pps` `mx_rep_pps` | requests this host sent; replies it got back |
 | `mx_served_pps` | requests that *arrived* here from its peers |
-| `mx_egress_gbps` | everything this host puts on the wire — its requests plus the replies it owes — framing included |
+| `mx_request_gbps` | this host's own requests on the wire, framing included |
+| `mx_egress_gbps` | everything it puts on the wire — those requests plus the replies it owes |
 | `mx_loss` | round-trip loss, % |
+| `mx_forward_loss` `mx_return_loss` | the same loss split by leg: what never arrived, and what arrived but never came back |
 | `mx_achieved` | delivered rate against the matrix's target, % |
+| `mx_coverage` | layered runs: the share of its peers this host has measured so far |
+| `mx_rtt_avg` | mean latency over this host's flows, µs |
 | `mx_rtt_p50` `mx_rtt_p99` `mx_rtt_max` | latency, worst peer, µs |
 | `mx_cpu` `mx_cpu_core` `mx_agent_cpu` | the box, its busiest core, and the busiest agent worker as a share of one core |
-| `mx_peers` `mx_intervals` | flows this host sends; intervals it reported in the window |
+| `mx_peers` `mx_workers` `mx_intervals` | flows this host sends; agent workers; intervals it reported in the window |
 | `mx_state` | `REPORTING`, or `NO-DATA` for a host in the matrix that said nothing at all |
+
+**Which leg lost it.** `mx_loss` says a host is losing traffic;
+`mx_forward_loss` and `mx_return_loss` say where. The forward number is
+counted by the hosts that *received* the requests — the truth a sender
+cannot see — so it appears only when every peer of that host reported an
+`rx` row for it. A rack that is red on `mx_forward_loss` and clean on
+`mx_return_loss` is a rack whose requests are being dropped on the way in;
+the reverse is a rack whose replies cannot get out.
 
 The numbers are the ones `mx summarize` prints, computed here by the
 report's own rules: a blank cell is *not measured* and never zero, a
@@ -620,12 +632,32 @@ mx export --names hosts.map --target-prefix DH1/A/ -o results.tsv
 `hosts.map` is one `mxname target` per line, and only has to carry the
 exceptions.
 
+**What is not exported, and why.** An overlay appears only when the number
+behind it was measured. `mx_served_pps` and `mx_egress_gbps` need at least
+one `rx` row, so a host whose receive side nobody reported gets neither —
+rather than a zero that would be averaged into the rack above it — while
+`mx_request_gbps` is known from the host's own rows and is always there.
+The loss split needs every peer's `rx` row, `mx_achieved` needs a paced
+matrix (an unpaced run has no target to achieve), and `mx_coverage` only
+means anything on a layered one. Payload Mb/s has no overlay of its own:
+`mx_request_gbps` and `mx_egress_gbps` carry the same shape as **wire**
+rate, which is what a NIC and a floor plan actually care about.
+
+**Two things to know about the numbers.** `mx`'s latency histogram holds
+four buckets per octave and a percentile reports its bucket's upper edge,
+so `mx_rtt_p99` rounds *up* — by up to ~25%, and it can read slightly
+higher than `mx_rtt_max`, which is an exact figure. (`mx summarize` prints
+the same pair; it is a property of the report, not of the export.) And the
+forward/return split compares two different hosts' counters over the same
+window, so at very small loss levels the two can disagree by a hundredth
+of a percent in either direction.
+
 **The other switches.**
 
 | Switch | What it changes |
 |---|---|
 | `--peers` | adds a per-flow overlay (`mx_peer_pps`, `mx_peer_loss`, `mx_peer_rtt_p99`), each sample tagged `peer=`; `max` on one of those reads as *the worst peer of this host* |
-| `--raw` | one sample per host per report **interval** instead of one per host, so the viewer can show min/max/p95 over the run |
+| `--raw` | adds one sample per host per report **interval** for the columns a host row carries, so the viewer can show min/max/p95 over the run; the overlays derived from more than one row are still written once per host |
 | `--json` | the same samples as NDJSON, one object per line, for a pipeline rather than a person |
 | `--window 0` | reduce the whole report history, not the last 60 s |
 | `--run LABEL` | tag every sample `run=LABEL` |

@@ -55,7 +55,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -2443,13 +2443,23 @@ def _per_host(tx, srv, hostagg, nticks, layered):
         if h is None:
             h = stats[host] = {"sent": 0.0, "back": 0.0, "target": 0.0,
                                "served": 0.0, "served_rep": 0.0,
-                               "rtt_p50": 0.0, "rtt_p99": 0.0, "rtt_max": 0.0,
-                               "peers": 0}
+                               "rtt_avg": 0.0, "rtt_p50": 0.0, "rtt_p99": 0.0,
+                               "rtt_max": 0.0, "peers": 0, "peer_set": set(),
+                               # Did anything report on this host's receive
+                               # side? Without a single rx row, "0 served" is
+                               # not a measurement of nothing -- it is nothing
+                               # measured, and must not be exported as a zero.
+                               "served_seen": False, "rtt_avg_n": 0}
         return h
 
-    for (host, _peer), a in tx.items():
+    for (host, peer), a in tx.items():
         h = entry(host)
         h["peers"] += 1
+        h["peer_set"].add(peer)
+        avg = a.mean("rtt_avg_us")
+        if avg > 0:
+            h["rtt_avg"] += avg
+            h["rtt_avg_n"] += 1
         if not layered:
             h["sent"] += a.mean("pps")
             h["back"] += a.mean("rep_pps")
@@ -2465,6 +2475,7 @@ def _per_host(tx, srv, hostagg, nticks, layered):
             h["target"] = a.mean("target_pps")
     for (host, _peer), a in srv.items():
         h = entry(host)
+        h["served_seen"] = True
         if layered:
             # The server rows are per-interval counts of what arrived; in a
             # layered run only the intervals the host itself reported can
@@ -2476,7 +2487,41 @@ def _per_host(tx, srv, hostagg, nticks, layered):
         else:
             h["served"] += a.mean("pps")
             h["served_rep"] += a.mean("rep_pps")
+    for h in stats.values():
+        if h["rtt_avg_n"]:
+            h["rtt_avg"] /= h["rtt_avg_n"]
     return stats
+
+
+def _forward_delivery(stats, srv, nticks, layered):
+    """host -> the packet rate of its requests that its peers actually
+    counted arriving, or None when that cannot be known.
+
+    This is the receiver-side truth a sender cannot see, and it is what
+    separates a host whose requests are being dropped on the way out from
+    one whose replies are lost coming back. It needs every peer's rx row
+    for this host: with even one missing, the total would be short and the
+    forward loss it implies would be invented rather than measured.
+    """
+    forward = {}
+    for host, h in stats.items():
+        arrived = 0.0
+        for peer in h["peer_set"]:
+            agg = srv.get((peer, host))
+            if agg is None:
+                arrived = None
+                break
+            if layered:
+                # Normalised by the *receiving* host's interval count, the
+                # same way the fleet total is.
+                if not nticks.get(peer):
+                    arrived = None
+                    break
+                arrived += agg.sums.get("pps", 0.0) / nticks[peer]
+            else:
+                arrived += agg.mean("pps")
+        forward[host] = arrived if h["peer_set"] else None
+    return forward
 
 
 def _report_sizes(rows, tx_size, rx_size):
@@ -2929,9 +2974,14 @@ EXPORT_HOST_TESTS = [
     ("pps", 'unit=pps higher=good short=PPS label="Requests sent"'),
     ("rep_pps", 'unit=pps higher=good short=REP label="Replies received"'),
     ("served_pps", 'unit=pps higher=good short=SRV label="Requests arriving here"'),
+    ("request_gbps", 'unit=Gb/s higher=good short=REQ label="Requests on the wire"'),
     ("egress_gbps", 'unit=Gb/s higher=good short=EGR label="Egress on the wire"'),
     ("loss", 'unit=% higher=bad short=LOSS label="Round-trip loss"'),
+    ("forward_loss", 'unit=% higher=bad short=FWD label="Requests lost on the way out"'),
+    ("return_loss", 'unit=% higher=bad short=RET label="Replies lost on the way back"'),
     ("achieved", 'unit=% higher=good short=ACHV label="Rate achieved vs target"'),
+    ("coverage", 'unit=% higher=good short=COV label="Peers measured so far"'),
+    ("rtt_avg", 'unit=us higher=bad short=AVG label="RTT mean over this host\'s flows"'),
     ("rtt_p50", 'unit=us higher=bad short=P50 label="RTT p50, worst peer"'),
     ("rtt_p99", 'unit=us higher=bad short=P99 label="RTT p99, worst peer"'),
     ("rtt_max", 'unit=us higher=bad short=MAX label="RTT max, worst peer"'),
@@ -2939,6 +2989,7 @@ EXPORT_HOST_TESTS = [
     ("cpu_core", 'unit=% higher=bad short=CORE label="Busiest core"'),
     ("agent_cpu", 'unit=% higher=bad short=ACPU label="Busiest mx worker, share of a core"'),
     ("peers", 'higher=good short=PEER label="Flows this host sends"'),
+    ("workers", 'higher=good short=WRK label="Agent worker processes"'),
     ("intervals", 'higher=good short=IVL label="Report intervals in the window"'),
     ("state", 'agg=last short=STATE label="Did this host report?"'),
 ]
@@ -2953,8 +3004,9 @@ EXPORT_PEER_TESTS = [
 ]
 
 # --raw: the columns a `dir=host` row carries as they stand, one sample per
-# reporting interval. The derived overlays (served_pps, egress_gbps, peers)
-# have no per-interval meaning and are left out.
+# reporting interval. The overlays that have no per-interval meaning are
+# still written once per host alongside them, so --raw is a superset of the
+# default rather than a different set.
 EXPORT_RAW_COLUMNS = [
     ("pps", "pps"),
     ("rep_pps", "rep_pps"),
@@ -3114,6 +3166,31 @@ def _meta_pairs(text):
     return pairs
 
 
+def _peer_coverage(rows, m):
+    """host -> % of the peers it should measure that it has measured yet.
+
+    Only a layered run needs this: its rotation reaches each peer once per
+    cycle, so a floor plan drawn before a full cycle has elapsed is showing
+    a partial mesh, and this is the overlay that says which hosts are still
+    short. Counted over the whole report history rather than the window --
+    coverage is cumulative, unlike every rate here.
+    """
+    seen = {}
+    for r in rows:
+        if r.get("dir") != "tx" or not r.get("pps"):
+            continue
+        try:
+            if float(r["pps"]) <= 0:
+                continue
+        except ValueError:
+            continue
+        seen.setdefault(r["host"], set()).add(r["peer"])
+    total = len(m.hosts) - 1
+    if total < 1:
+        return {}
+    return dict((host, pct(len(peers), total)) for host, peers in seen.items())
+
+
 def cmd_export(args):
     m = load_matrix(args.matrix) if os.path.isfile(args.matrix) else None
     if m is None:
@@ -3176,6 +3253,9 @@ def cmd_export(args):
                   names=_load_names(args.names) if args.names else None,
                   run=args.run)
 
+    forward = _forward_delivery(stats, srv, nticks, layered)
+    coverage = _peer_coverage(rows, m) if (layered and m) else {}
+
     if args.raw:
         for r in recent:
             if r.get("dir") != "host":
@@ -3187,24 +3267,18 @@ def cmd_export(args):
             sent = _report_number(r.get("pps"))
             if target_pps and sent is not None:
                 out.add("achieved", r["host"], pct(sent, target_pps), extras)
-    else:
-        for host in sorted(stats):
-            h = stats[host]
-            agg = hostagg.get(host)
+
+    for host in sorted(stats):
+        h = stats[host]
+        agg = hostagg.get(host)
+        if not args.raw:
             out.add("pps", host, h["sent"])
             out.add("rep_pps", host, h["back"])
-            out.add("served_pps", host, h["served"])
-            # What this host puts on the wire: its own requests, plus the
-            # replies it owes every host that calls it. The number a NIC
-            # has to carry, which is the one a floor plan is drawn for.
-            out.add("egress_gbps", host,
-                    (wire_bps(h["sent"], tx_size)
-                     + wire_bps(h["served_rep"], rx_size)) / 1e9)
             if h["sent"] > 0:
                 out.add("loss", host, max(0.0, 100.0 - pct(h["back"], h["sent"])))
             if h["target"] > 0:
                 out.add("achieved", host, pct(h["sent"], h["target"]))
-            for test in ("rtt_p50", "rtt_p99", "rtt_max"):
+            for test in ("rtt_avg", "rtt_p50", "rtt_p99", "rtt_max"):
                 if h[test] > 0:
                     out.add(test, host, h[test])
             if agg:
@@ -3213,8 +3287,36 @@ def cmd_export(args):
                                      ("agent_cpu", "agent_cpu_pct")):
                     if agg.counts.get(column):
                         out.add(test, host, agg.mean(column))
-            out.add("peers", host, float(h["peers"]))
-            out.add("intervals", host, float(nticks.get(host, 0)))
+
+        # Derived from more than one row, so they have no per-interval
+        # meaning and are written once per host in either mode.
+        if h["sent"] > 0:
+            # What this host's own requests put on the wire, framing
+            # included: known from its own rows alone.
+            out.add("request_gbps", host, wire_bps(h["sent"], tx_size) / 1e9)
+        if h["served_seen"]:
+            out.add("served_pps", host, h["served"])
+            # Everything the host puts on the wire: its requests plus the
+            # replies it owes the hosts that call it. The number a NIC has
+            # to carry -- and only a number at all once the reply half has
+            # been measured, which is what served_seen says.
+            out.add("egress_gbps", host,
+                    (wire_bps(h["sent"], tx_size)
+                     + wire_bps(h["served_rep"], rx_size)) / 1e9)
+        arrived = forward.get(host)
+        if arrived is not None and h["sent"] > 0:
+            # The split that tells a sick sender from a sick receiver:
+            # what never arrived, and what arrived but never came back.
+            fwd = max(0.0, 100.0 - pct(arrived, h["sent"]))
+            out.add("forward_loss", host, fwd)
+            out.add("return_loss", host,
+                    max(0.0, pct(arrived, h["sent"]) - pct(h["back"], h["sent"])))
+        if host in coverage:
+            out.add("coverage", host, coverage[host])
+        out.add("peers", host, float(h["peers"]))
+        out.add("intervals", host, float(nticks.get(host, 0)))
+        if agg and agg.counts.get("workers"):
+            out.add("workers", host, agg.mean("workers"))
 
     # Which hosts were heard from at all, in either mode: the overlay that
     # says a rack went quiet.
