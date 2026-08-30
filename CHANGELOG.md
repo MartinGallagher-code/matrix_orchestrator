@@ -9,6 +9,54 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.7.0] - 2026-08-30
+
+Brought `mx export` in line with `iperf_orchestrator`'s `export-overlay`,
+which paints the same floor plan from the other kind of test. The two now
+agree on how an overlay presents itself, and mx picks up the two readings
+that tool had and this one did not.
+
+### Added
+
+- **`mx_rel_median`: every host against the fleet's own median rate**, on
+  a diverging ramp pinned at 0-200%. 100% is "normal for this fabric", so
+  nobody has to know what the hardware is capable of to see which rack is
+  behind. It is the only relative reading an *unpaced* run has, since
+  `--pps max` leaves no target for `mx_achieved` to measure against.
+  Aggregates by median on purpose: every host in a mesh talks to the sick
+  host, so `min` would redden the whole floor and hide it, while a host
+  that is itself slow has all of its flows slow and its median drops.
+  That is "I am slow" against "I have a slow peer".
+- **`mx export --nic-gbps GBPS`** adds **`mx_line_util`** and pins the
+  throughput overlays to an absolute scale. This is the reading a
+  relative overlay cannot give: when the whole fleet runs at half its
+  NICs' rate, every host sits at 100% of a median that is itself wrong,
+  and only an absolute reference shows it.
+- **`mx_state SILENT`** for a host that reported earlier in the run but
+  nothing inside the window, told apart from `NO-DATA` for one that never
+  reported at all. Going quiet mid-run and never starting are different
+  failures and need different people.
+
+### Changed
+
+- **Every overlay now carries its display metadata**: `decimals=` so a
+  value prints at its real precision, `min`/`max` pinned to 0-100 on the
+  percentages that really are percentages (auto-fitting makes a 30% CPU
+  peak look alarming for no reason but being the highest), and `agg=`
+  presets that answer each overlay's own question when a rack or room is
+  collapsed — `max` for the worst peer's latency and the busiest agent
+  worker (one pegged worker is its rack's ceiling, and a mean buries it),
+  `min` for coverage, peers, workers and intervals, `median` for the two
+  overlays that diverge around 100%.
+- **The header says what the numbers are of**: packet sizes, the layered
+  rotation's shape, the wall-clock window the samples cover, and which
+  hosts went quiet or never reported.
+- **The summary explains every absent overlay.** Since an overlay appears
+  only when its number was measured, the run now names the hosts that
+  have no `rx` rows (so no `mx_served_pps` or `mx_egress_gbps`) and those
+  with a peer that never reported (so no loss split) — a sparse overlay
+  is this working, and it should not cost anyone an afternoon.
+
 ## [1.6.0] - 2026-08-30
 
 ### Fixed

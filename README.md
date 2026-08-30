@@ -593,6 +593,8 @@ One sample per host per overlay, reduced over `--window` seconds:
 | `mx_served_pps` | requests that *arrived* here from its peers |
 | `mx_request_gbps` | this host's own requests on the wire, framing included |
 | `mx_egress_gbps` | everything it puts on the wire — those requests plus the replies it owes |
+| `mx_rel_median` | its packet rate against the fleet's own median, % |
+| `mx_line_util` | egress against the NIC's line rate, % (with `--nic-gbps`) |
 | `mx_loss` | round-trip loss, % |
 | `mx_forward_loss` `mx_return_loss` | the same loss split by leg: what never arrived, and what arrived but never came back |
 | `mx_achieved` | delivered rate against the matrix's target, % |
@@ -601,7 +603,22 @@ One sample per host per overlay, reduced over `--window` seconds:
 | `mx_rtt_p50` `mx_rtt_p99` `mx_rtt_max` | latency, worst peer, µs |
 | `mx_cpu` `mx_cpu_core` `mx_agent_cpu` | the box, its busiest core, and the busiest agent worker as a share of one core |
 | `mx_peers` `mx_workers` `mx_intervals` | flows this host sends; agent workers; intervals it reported in the window |
-| `mx_state` | `REPORTING`, or `NO-DATA` for a host in the matrix that said nothing at all |
+| `mx_state` | `REPORTING`; `SILENT` for a host that reported earlier but not inside the window; `NO-DATA` for one in the matrix that never reported at all |
+
+**Reading a rate without knowing the hardware.** `mx_rel_median` puts every
+host against the fleet's own median, on a diverging ramp where 100% is
+"normal for this fabric" — so a slow rack stands out whatever the absolute
+numbers are, and an *unpaced* run (`--pps max`, no target, so no
+`mx_achieved`) still has a relative reading. It aggregates by **median**,
+and the choice carries the meaning: every host in a mesh talks to the sick
+host, so `min` would redden the whole floor and hide it, while a host that
+is itself slow has all of its flows slow. That is "I am slow" against "I
+have a slow peer".
+
+What it cannot see is a fleet that is *uniformly* slow — every host then
+reads 100% of a median that is itself wrong. `mx export --nic-gbps 25`
+fixes the scale to the hardware instead: it adds `mx_line_util` and pins
+the throughput overlays absolutely, so half speed looks like half speed.
 
 **Which leg lost it.** `mx_loss` says a host is losing traffic;
 `mx_forward_loss` and `mx_return_loss` say where. The forward number is
@@ -643,6 +660,16 @@ means anything on a layered one. Payload Mb/s has no overlay of its own:
 `mx_request_gbps` and `mx_egress_gbps` carry the same shape as **wire**
 rate, which is what a NIC and a floor plan actually care about.
 
+**Every overlay arrives ready to read.** Each carries its units, palette
+direction, decimal places, and — where the value really is a percentage of
+something — a pinned 0-100 scale, because auto-fitting makes a 30% CPU peak
+look alarming for no reason but being the highest. Each also presets the
+aggregation that answers its own question when a rack or room is collapsed:
+`max` for the worst peer's latency and the busiest agent worker (one pegged
+worker is its rack's ceiling, and a mean buries it), `min` for coverage,
+peers and intervals, `median` for the two overlays that diverge around
+100%. All of it is overridable in the viewer.
+
 **Two things to know about the numbers.** `mx`'s latency histogram holds
 four buckets per octave and a percentile reports its bucket's upper edge,
 so `mx_rtt_p99` rounds *up* — by up to ~25%, and it can read slightly
@@ -661,6 +688,7 @@ of a percent in either direction.
 | `--json` | the same samples as NDJSON, one object per line, for a pipeline rather than a person |
 | `--window 0` | reduce the whole report history, not the last 60 s |
 | `--run LABEL` | tag every sample `run=LABEL` |
+| `--nic-gbps GBPS` | add `mx_line_util` and pin the throughput overlays to the NIC's rate rather than to whatever this run produced |
 | `--test-prefix` | rename the overlays (default `mx_`), so mx's numbers cannot collide with another tool's in the same file |
 | `--no-collect` | export what is already in `reports/`, without ssh'ing to the fleet |
 
