@@ -9,6 +9,40 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.5.0] - 2026-08-29
+
+### Added
+
+- **`mx export`: a run as an overlay for the datacenter layout viewer.**
+  The reports become a results file the
+  [layout viewer](https://github.com/MartinGallagher-code/datacenter_visualization)
+  reads natively — one sample per line, `test target value [key=value
+  ...]`, with the `!test` lines that give each overlay its units and
+  palette direction — so a floor plan can be coloured by packets/sec,
+  round-trip loss, RTT p99, egress on the wire or host CPU with no
+  import step in between. `--json` writes the same samples as NDJSON,
+  `--peers` adds a per-flow overlay (so `max` on `mx_peer_loss` is "the
+  worst peer of this host"), `--raw` emits one sample per report
+  interval instead of one per host, and `--names` / `--target-prefix`
+  map mx host names onto whatever the layout calls those nodes.
+
+  The numbers are the ones `mx summarize` prints, computed by the
+  report's own rules: a blank cell is *not measured* and never zero, a
+  layered run's rates come from the host rows because most pairs are
+  idle for most of the window, per-flow loss is a ratio of totals so a
+  layer switch's drain rows land with the layer they belong to, and
+  latency is the worst peer's rather than a percentile of percentiles.
+  Hosts in the matrix that reported nothing at all are exported too, as
+  `mx_state NO-DATA` — the one thing a results file can show that a
+  report cannot, because a host with no report has no row to carry it.
+
+### Changed
+
+- The per-host table in `mx summarize` and the export now share one
+  aggregation, so the two can never drift. A host that only served
+  traffic — one whose client side never started — now appears in that
+  table instead of being left out of it.
+
 ## [1.4.2] - 2026-08-14
 
 ### Changed

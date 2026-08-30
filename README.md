@@ -90,10 +90,11 @@ no packages, no root. Key-based SSH must already work
 | `mx stop` | Stop the agents. Reports and logs stay on the hosts. |
 | `mx clean` | Stop, then delete everything. No trace left. |
 
-And five more when you want them: `mx run` (all of the above in one
+And six more when you want them: `mx run` (all of the above in one
 shot), `mx check` (will the NICs carry this?), `mx hints` (goal →
 command), `mx logs` (collect agent logs), `mx doctor` (is the fleet
-ready?).
+ready?), and `mx export` (the run as a floor-plan overlay — see
+[Draw it on the floor plan](#draw-it-on-the-floor-plan-mx-export)).
 
 ---
 
@@ -556,6 +557,80 @@ With `--equal-layers` a boundary interval at the cycle wrap can hold
 layer's live flow — told apart by the `layer` column. Group by
 `(peer, layer)` rather than peer alone if you post-process layered
 reports yourself.
+
+---
+
+## Draw it on the floor plan (`mx export`)
+
+A packet rate is a number; *which rack* it fell over in is the question.
+`mx export` turns a run into an overlay for the
+[datacenter layout viewer](https://github.com/MartinGallagher-code/datacenter_visualization),
+which draws your floor from a `.dc` file and colours every node by a
+measured value:
+
+```bash
+mx run --for 120                       # measure
+mx export --window 120 >> results.tsv  # colour the floor plan with it
+```
+
+That is the whole integration. The viewer's results format is one sample
+per line — `test  target  value  [key=value ...]` — so the file is
+append-only: export after every run and the viewer aggregates the history
+however you ask it to (mean, p95, max, last).
+
+```text
+!test	mx_pps	unit=pps higher=good short=PPS label="Requests sent"
+!test	mx_loss	unit=% higher=bad short=LOSS label="Round-trip loss"
+mx_pps	wr12r06u15	1998400	run=nightly-7
+mx_loss	wr12r06u15	0.36	run=nightly-7
+```
+
+One sample per host per overlay, reduced over `--window` seconds:
+
+| Overlay | What it is |
+|---|---|
+| `mx_pps` `mx_rep_pps` | requests this host sent; replies it got back |
+| `mx_served_pps` | requests that *arrived* here from its peers |
+| `mx_egress_gbps` | everything this host puts on the wire — its requests plus the replies it owes — framing included |
+| `mx_loss` | round-trip loss, % |
+| `mx_achieved` | delivered rate against the matrix's target, % |
+| `mx_rtt_p50` `mx_rtt_p99` `mx_rtt_max` | latency, worst peer, µs |
+| `mx_cpu` `mx_cpu_core` `mx_agent_cpu` | the box, its busiest core, and the busiest agent worker as a share of one core |
+| `mx_peers` `mx_intervals` | flows this host sends; intervals it reported in the window |
+| `mx_state` | `REPORTING`, or `NO-DATA` for a host in the matrix that said nothing at all |
+
+The numbers are the ones `mx summarize` prints, computed here by the
+report's own rules: a blank cell is *not measured* and never zero, a
+layered run's rates come from the host rows because most pairs are idle
+for most of the window, and latency is the worst peer's rather than a
+percentile of percentiles. That is why `mx` exports rather than the
+viewer importing — none of those rules are visible from outside a
+`reports/` directory, and every one of them is the difference between a
+number and a flattering number.
+
+**Making the names line up.** The target is the mx host name, and the
+viewer resolves a bare name, a full path, or any unique tail of one — so
+hosts named `wr12r06u15` in `servers.txt` already land on the right node.
+When they are not, map them:
+
+```bash
+mx export --names hosts.map --target-prefix DH1/A/ -o results.tsv
+```
+
+`hosts.map` is one `mxname target` per line, and only has to carry the
+exceptions.
+
+**The other switches.**
+
+| Switch | What it changes |
+|---|---|
+| `--peers` | adds a per-flow overlay (`mx_peer_pps`, `mx_peer_loss`, `mx_peer_rtt_p99`), each sample tagged `peer=`; `max` on one of those reads as *the worst peer of this host* |
+| `--raw` | one sample per host per report **interval** instead of one per host, so the viewer can show min/max/p95 over the run |
+| `--json` | the same samples as NDJSON, one object per line, for a pipeline rather than a person |
+| `--window 0` | reduce the whole report history, not the last 60 s |
+| `--run LABEL` | tag every sample `run=LABEL` |
+| `--test-prefix` | rename the overlays (default `mx_`), so mx's numbers cannot collide with another tool's in the same file |
+| `--no-collect` | export what is already in `reports/`, without ssh'ing to the fleet |
 
 ---
 

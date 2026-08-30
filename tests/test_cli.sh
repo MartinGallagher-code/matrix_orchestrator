@@ -10,7 +10,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test_helper.bash
 source "$DIR/test_helper.bash"
 
-ALL_COMMANDS="gen check hints start status summarize collect stop logs clean run doctor agent"
+ALL_COMMANDS="gen check hints start status summarize collect export stop logs clean run doctor agent"
 
 test_bare_invocation_points_somewhere() {
     run_mx
@@ -121,12 +121,13 @@ test_full_help_lists_every_switch_of_every_command() {
                 --interval --duration --workers --streams --bind --sndbuf \
                 --rcvbuf --no-deploy --watch --reports --window --top \
                 --top-hosts --grid --no-collect --for --keep --yes --host \
-                --report; do
+                --report --append --json --raw --peers --names \
+                --target-prefix --test-prefix --run; do
         assert_contains "$RUN_OUT" "$flag" "mx help must document $flag" || return 1
     done
     # Every command appears as a usage line.
     local c
-    for c in gen check hints start status summarize collect stop logs clean run doctor agent; do
+    for c in $ALL_COMMANDS; do
         assert_contains "$RUN_OUT" "usage: mx $c" "mx help covers $c" || return 1
     done
     assert_contains "$RUN_OUT" "MX_MATRIX" "env vars are listed" || return 1
