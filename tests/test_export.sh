@@ -207,6 +207,84 @@ test_export_raw_still_carries_the_derived_overlays() {
     assert_contains "$RUN_OUT" "mx_request_gbps	alpha	" || return 1
 }
 
+test_export_scales_every_host_against_the_fleet_median() {
+    write_reports
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    # alpha sends 2000 and beta 1000, so the median of the two is 1500:
+    # alpha reads 133% of the fleet, beta 67%. No one has to know what this
+    # hardware is capable of to see which is which.
+    assert_eq "133.3" "$(sample "$RUN_OUT" mx_rel_median alpha)" || return 1
+    assert_eq "66.67" "$(sample "$RUN_OUT" mx_rel_median beta)" || return 1
+    assert_contains "$RUN_OUT" "!test	mx_rel_median	unit=% higher=good palette=rdbu min=0 max=200 agg=median" \
+        "diverging around 100%, and a rack answers with its median" || return 1
+}
+
+test_export_needs_a_fleet_before_it_reports_a_fleet_median() {
+    mkdir -p rep
+    {
+        echo "$REPORT_HEAD"
+        echo "1000,alpha,tx,beta,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,100,90,400,900,,,,,"
+        echo "1000,alpha,host,*,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,,90,400,,10.0,20.0,30.0,1,"
+    } > rep/alpha.csv
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    # One host is not a fleet, and a median of one would paint it a
+    # confident 100% of itself.
+    assert_eq "" "$(sample "$RUN_OUT" mx_rel_median alpha)" "no median of one" || return 1
+}
+
+test_export_measures_against_the_nic_when_told_its_rate() {
+    write_reports
+    run_mx export --no-collect --reports rep --window 0 --nic-gbps 25
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "mx_line_util	alpha	" "utilisation is exported" || return 1
+    # And the throughput overlays stop auto-fitting to whatever the run
+    # produced: a fleet uniformly at half its NICs' rate has to look it.
+    assert_contains "$RUN_OUT" "!test	mx_egress_gbps	unit=Gb/s higher=good decimals=2 short=EGR label=\"Egress on the wire\" min=0 max=25" \
+        "the scale is pinned absolutely" || return 1
+    run_mx export --no-collect --reports rep --window 0
+    assert_eq "" "$(sample "$RUN_OUT" mx_line_util alpha)" "and only with a rate" || return 1
+}
+
+test_export_tells_going_quiet_apart_from_never_starting() {
+    write_matrix alpha beta gamma
+    write_reports
+    # delta reported, but everything it wrote is older than the window.
+    {
+        echo "$REPORT_HEAD"
+        echo "10,delta,tx,alpha,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,100,90,400,900,,,,,"
+        echo "10,delta,host,*,64,64,2000.0,2000.0,1.040,2000.0,1.040,0.000,,90,400,,10.0,20.0,30.0,1,"
+    } > rep/delta.csv
+    run_mx export --no-collect --reports rep --window 60
+    assert_status 0 "$RUN_RC" || return 1
+    # Two different failures, and they need two different people: delta went
+    # quiet while the run was going, gamma never started at all.
+    assert_eq "SILENT" "$(sample "$RUN_OUT" mx_state delta)" "went quiet" || return 1
+    assert_eq "NO-DATA" "$(sample "$RUN_OUT" mx_state gamma)" "never started" || return 1
+    assert_eq "REPORTING" "$(sample "$RUN_OUT" mx_state alpha)" || return 1
+}
+
+test_export_says_why_an_overlay_is_missing() {
+    write_reports
+    write_lonely_report
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    # A sparse overlay is the export working, so the summary says which
+    # hosts lost one and why rather than leaving it to be hunted.
+    assert_contains "$RUN_OUT" "no rx rows" "the omission is explained" || return 1
+    assert_contains "$RUN_OUT" "delta" "and named" || return 1
+    assert_contains "$RUN_OUT" "loss split is" "as is the loss split" || return 1
+}
+
+test_export_header_says_what_the_numbers_are_of() {
+    write_reports
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "# run shape: 64 bytes out -> 64 bytes back" || return 1
+    assert_contains "$RUN_OUT" "# window covers " "and when they were taken" || return 1
+}
+
 test_export_refuses_a_field_that_would_break_the_line() {
     write_reports
     run_mx export --no-collect --reports rep --window 0 --target-prefix "hall 1/"
@@ -298,6 +376,12 @@ run_test test_export_splits_loss_into_the_leg_that_lost_it
 run_test test_export_invents_no_zero_for_a_receive_side_nobody_measured
 run_test test_export_reports_a_rotation_that_has_not_come_round_yet
 run_test test_export_raw_still_carries_the_derived_overlays
+run_test test_export_scales_every_host_against_the_fleet_median
+run_test test_export_needs_a_fleet_before_it_reports_a_fleet_median
+run_test test_export_measures_against_the_nic_when_told_its_rate
+run_test test_export_tells_going_quiet_apart_from_never_starting
+run_test test_export_says_why_an_overlay_is_missing
+run_test test_export_header_says_what_the_numbers_are_of
 run_test test_export_refuses_a_field_that_would_break_the_line
 run_test test_export_json_is_one_object_per_line
 run_test test_export_appends_a_run_to_an_existing_results_file

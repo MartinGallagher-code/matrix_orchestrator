@@ -55,7 +55,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -2971,26 +2971,51 @@ def _wrap(prefix, text, width=78):
 # (test, `!test` metadata). One sample per host per window, from the
 # aggregates `mx summarize` prints.
 EXPORT_HOST_TESTS = [
-    ("pps", 'unit=pps higher=good short=PPS label="Requests sent"'),
-    ("rep_pps", 'unit=pps higher=good short=REP label="Replies received"'),
-    ("served_pps", 'unit=pps higher=good short=SRV label="Requests arriving here"'),
-    ("request_gbps", 'unit=Gb/s higher=good short=REQ label="Requests on the wire"'),
-    ("egress_gbps", 'unit=Gb/s higher=good short=EGR label="Egress on the wire"'),
-    ("loss", 'unit=% higher=bad short=LOSS label="Round-trip loss"'),
-    ("forward_loss", 'unit=% higher=bad short=FWD label="Requests lost on the way out"'),
-    ("return_loss", 'unit=% higher=bad short=RET label="Replies lost on the way back"'),
-    ("achieved", 'unit=% higher=good short=ACHV label="Rate achieved vs target"'),
-    ("coverage", 'unit=% higher=good short=COV label="Peers measured so far"'),
-    ("rtt_avg", 'unit=us higher=bad short=AVG label="RTT mean over this host\'s flows"'),
-    ("rtt_p50", 'unit=us higher=bad short=P50 label="RTT p50, worst peer"'),
-    ("rtt_p99", 'unit=us higher=bad short=P99 label="RTT p99, worst peer"'),
-    ("rtt_max", 'unit=us higher=bad short=MAX label="RTT max, worst peer"'),
-    ("cpu", 'unit=% higher=bad short=CPU label="Host CPU"'),
-    ("cpu_core", 'unit=% higher=bad short=CORE label="Busiest core"'),
-    ("agent_cpu", 'unit=% higher=bad short=ACPU label="Busiest mx worker, share of a core"'),
-    ("peers", 'higher=good short=PEER label="Flows this host sends"'),
-    ("workers", 'higher=good short=WRK label="Agent worker processes"'),
-    ("intervals", 'higher=good short=IVL label="Report intervals in the window"'),
+    ("pps", 'unit=pps higher=good decimals=0 short=PPS label="Requests sent"'),
+    ("rep_pps", 'unit=pps higher=good decimals=0 short=REP label="Replies received"'),
+    ("served_pps", 'unit=pps higher=good decimals=0 short=SRV label="Requests arriving here"'),
+    ("request_gbps", 'unit=Gb/s higher=good decimals=2 short=REQ label="Requests on the wire"'),
+    ("egress_gbps", 'unit=Gb/s higher=good decimals=2 short=EGR label="Egress on the wire"'),
+    # Only with --nic-gbps. The reading a relative overlay cannot give: when
+    # the whole fleet is at half its NICs' rate, every host sits at 100% of a
+    # median that is itself wrong, and only an absolute scale shows it.
+    ("line_util", 'unit=% higher=good min=0 max=100 agg=median decimals=0 short=UTIL label="Egress vs NIC line rate"'),
+    # Each host against the fleet's own median, on a diverging ramp pinned at
+    # 0-200%: 100% is "normal for this fabric", and no one has to know what
+    # good looks like on this hardware. It is the only relative reading an
+    # unpaced run has, since `max` leaves nothing to be achieved against.
+    #
+    # agg=median, and the choice carries the meaning. Every host in a mesh
+    # talks to the sick host, so `min` reddens the whole floor and hides it;
+    # a host that is itself slow has all of its flows slow, so its median
+    # drops while a healthy host with one bad peer stays near 100%. That is
+    # "I am slow" against "I have a slow peer".
+    ("rel_median", 'unit=% higher=good palette=rdbu min=0 max=200 agg=median decimals=0 short=REL label="Packet rate vs fleet median"'),
+    ("loss", 'unit=% higher=bad decimals=2 short=LOSS label="Round-trip loss"'),
+    ("forward_loss", 'unit=% higher=bad decimals=2 short=FWD label="Requests lost on the way out"'),
+    ("return_loss", 'unit=% higher=bad decimals=2 short=RET label="Replies lost on the way back"'),
+    # Diverging around 100% for the same reason as rel_median: on target is
+    # the midpoint, not the top of a ramp.
+    ("achieved", 'unit=% higher=good palette=rdbu min=0 max=200 agg=median decimals=0 short=ACHV label="Rate achieved vs target"'),
+    # agg=min: a rack has come round only when its slowest host has.
+    ("coverage", 'unit=% higher=good min=0 max=100 agg=min decimals=0 short=COV label="Peers measured so far"'),
+    ("rtt_avg", 'unit=us higher=bad decimals=0 short=AVG label="RTT mean over this host\'s flows"'),
+    ("rtt_p50", 'unit=us higher=bad decimals=0 short=P50 label="RTT p50, worst peer"'),
+    # Already the worst peer's; agg=max keeps it the worst peer's when a rack
+    # is collapsed, rather than averaging the sick pair away.
+    ("rtt_p99", 'unit=us higher=bad agg=max decimals=0 short=P99 label="RTT p99, worst peer"'),
+    ("rtt_max", 'unit=us higher=bad agg=max decimals=0 short=MAX label="RTT max, worst peer"'),
+    # Percentages pinned to the scale they are really on: auto-fitting makes
+    # a 30% peak look alarming for no reason but being the highest.
+    ("cpu", 'unit=% higher=bad min=0 max=100 decimals=0 short=CPU label="Host CPU"'),
+    ("cpu_core", 'unit=% higher=bad min=0 max=100 agg=max decimals=0 short=CORE label="Busiest core"'),
+    # Not pinned: this one is a share of ONE core and a multi-core box can
+    # report above 100%. agg=max -- one pegged worker is the ceiling for its
+    # whole rack, and a mean would bury it.
+    ("agent_cpu", 'unit=% higher=bad agg=max decimals=0 short=ACPU label="Busiest mx worker, share of a core"'),
+    ("peers", 'higher=good agg=min decimals=0 short=PEER label="Flows this host sends"'),
+    ("workers", 'higher=good agg=min decimals=0 short=WRK label="Agent worker processes"'),
+    ("intervals", 'higher=good agg=min decimals=0 short=IVL label="Report intervals in the window"'),
     ("state", 'agg=last short=STATE label="Did this host report?"'),
 ]
 
@@ -2998,9 +3023,9 @@ EXPORT_HOST_TESTS = [
 # overlay reads as "the worst peer of this host" -- and so that per-peer
 # samples can never be averaged in with the per-host ones.
 EXPORT_PEER_TESTS = [
-    ("peer_pps", 'unit=pps higher=good short=PPS agg=mean label="Requests sent to one peer"'),
-    ("peer_loss", 'unit=% higher=bad short=LOSS agg=max label="Round-trip loss, worst peer"'),
-    ("peer_rtt_p99", 'unit=us higher=bad short=P99 agg=max label="RTT p99, worst peer"'),
+    ("peer_pps", 'unit=pps higher=good agg=mean decimals=0 short=PPS label="Requests sent to one peer"'),
+    ("peer_loss", 'unit=% higher=bad agg=max decimals=2 short=LOSS label="Round-trip loss, worst peer"'),
+    ("peer_rtt_p99", 'unit=us higher=bad agg=max decimals=0 short=P99 label="RTT p99, worst peer"'),
 ]
 
 # --raw: the columns a `dir=host` row carries as they stand, one sample per
@@ -3089,7 +3114,8 @@ class Overlay(object):
     """
 
     def __init__(self, test_prefix="mx_", target_prefix="", names=None,
-                 run=None):
+                 run=None, meta_table=None):
+        self.meta_table = EXPORT_META if meta_table is None else meta_table
         self.test_prefix = test_prefix
         self.target_prefix = target_prefix
         self.names = names or {}
@@ -3120,7 +3146,7 @@ class Overlay(object):
         name = self.test_prefix + test
         if test not in self._declared:
             self._declared.add(test)
-            meta = EXPORT_META.get(test)
+            meta = self.meta_table.get(test)
             if meta:
                 self.meta.append((name, meta))
         extras = list(extras)
@@ -3164,6 +3190,15 @@ def _meta_pairs(text):
             key, value = token.split("=", 1)
             pairs[key] = value
     return pairs
+
+
+def _median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return None
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def _peer_coverage(rows, m):
@@ -3248,13 +3283,29 @@ def cmd_export(args):
         die("--run %r: the label is written onto every sample line, so it "
             "can hold no whitespace or quotes" % args.run)
 
-    out = Overlay(test_prefix=args.test_prefix,
+    meta_table = dict(EXPORT_META)
+    if args.nic_gbps:
+        # A known line rate turns the throughput overlays from relative
+        # shading into absolute readings: without it the viewer fits the ramp
+        # to whatever the run produced, so a floor uniformly at half speed
+        # still paints comfortably green.
+        for test, top in (("request_gbps", args.nic_gbps),
+                          ("egress_gbps", args.nic_gbps)):
+            meta_table[test] = "%s min=0 max=%g" % (meta_table[test], top)
+
+    out = Overlay(meta_table=meta_table,
+                  test_prefix=args.test_prefix,
                   target_prefix=args.target_prefix,
                   names=_load_names(args.names) if args.names else None,
                   run=args.run)
 
     forward = _forward_delivery(stats, srv, nticks, layered)
     coverage = _peer_coverage(rows, m) if (layered and m) else {}
+    # The fleet's own median rate, which is what makes a host's number
+    # readable without knowing the hardware. One host is not a fleet, and a
+    # median of one would paint it a confident 100%.
+    rates = [h["sent"] for h in stats.values() if h["sent"] > 0]
+    fleet_median = _median(rates) if len(rates) > 1 else None
 
     if args.raw:
         for r in recent:
@@ -3294,15 +3345,22 @@ def cmd_export(args):
             # What this host's own requests put on the wire, framing
             # included: known from its own rows alone.
             out.add("request_gbps", host, wire_bps(h["sent"], tx_size) / 1e9)
+        if fleet_median:
+            out.add("rel_median", host, pct(h["sent"], fleet_median))
         if h["served_seen"]:
             out.add("served_pps", host, h["served"])
             # Everything the host puts on the wire: its requests plus the
             # replies it owes the hosts that call it. The number a NIC has
             # to carry -- and only a number at all once the reply half has
             # been measured, which is what served_seen says.
-            out.add("egress_gbps", host,
-                    (wire_bps(h["sent"], tx_size)
-                     + wire_bps(h["served_rep"], rx_size)) / 1e9)
+            egress = (wire_bps(h["sent"], tx_size)
+                      + wire_bps(h["served_rep"], rx_size)) / 1e9
+            out.add("egress_gbps", host, egress)
+            if args.nic_gbps:
+                # Utilisation is of everything the NIC carries, so it waits
+                # on the reply half like egress does rather than reporting a
+                # comfortable half-truth from the request side alone.
+                out.add("line_util", host, pct(egress, args.nic_gbps))
         arrived = forward.get(host)
         if arrived is not None and h["sent"] > 0:
             # The split that tells a sick sender from a sick receiver:
@@ -3318,10 +3376,16 @@ def cmd_export(args):
         if agg and agg.counts.get("workers"):
             out.add("workers", host, agg.mean("workers"))
 
-    # Which hosts were heard from at all, in either mode: the overlay that
-    # says a rack went quiet.
+    # Which hosts were heard from, in either mode -- and how a host failed
+    # to be, which is not one thing. A host that reported earlier in the run
+    # and nothing inside the window went quiet while the run was going; a
+    # host with no row anywhere never started. Those need different people.
     for host in sorted(stats):
         out.add("state", host, "REPORTING")
+    ever = set(r["host"] for r in rows if r.get("host"))
+    silent = sorted(h for h in ever if h not in stats)
+    for host in silent:
+        out.add("state", host, "SILENT")
 
     if args.peers:
         pair_layer = {}
@@ -3353,22 +3417,42 @@ def cmd_export(args):
     # Hosts the matrix knows about that said nothing in the window: the one
     # thing a results file can show that a report cannot, because a host
     # with no report has no row to carry it.
-    silent = 0
+    missing = []
     if m:
         for host in m.hosts:
-            if host not in stats:
+            if host not in stats and host not in ever:
                 out.add("state", host, "NO-DATA")
-                silent += 1
+                missing.append(host)
 
     if not out.samples:
         die("nothing to export from %s/ -- no measured rows in the window"
             % args.reports, code=1)
 
-    header = ("# mx %s export -- %d host(s), %s, %d sample(s), latest ts=%d"
-              % (VERSION, len(stats),
-                 "whole history" if args.window <= 0 else "last %ds" % args.window,
-                 len(out.samples), latest))
-    lines = ([header] +
+    # What a reader needs to know a month later, when this file holds
+    # thirty runs: what the numbers are of, and what was missing from them.
+    stamp = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    earliest = min(int(float(r["ts"])) for r in recent)
+    header = [
+        "# mx %s export -- %d host(s), %s, %d sample(s)"
+        % (VERSION, len(stats),
+           "whole history" if args.window <= 0 else "last %ds" % args.window,
+           len(out.samples)),
+        "# run shape: %d bytes out -> %d bytes back%s"
+        % (tx_size, rx_size,
+           ", %d layers x %gs dwell" % (m.layering.layers, m.layering.dwell)
+           if (m and m.layering) else ""),
+        "# window covers %s .. %s" % (stamp(earliest), stamp(latest)),
+    ]
+    if args.nic_gbps:
+        header.append("# NIC line rate %g Gb/s: mx_line_util included"
+                      % args.nic_gbps)
+    if silent:
+        header.append("# %d host(s) went quiet before the window: %s"
+                      % (len(silent), " ".join(silent[:8])))
+    if missing:
+        header.append("# %d host(s) in the matrix never reported at all: %s"
+                      % (len(missing), " ".join(missing[:8])))
+    lines = (header +
              (out.json_lines(not args.no_meta) if args.json
               else out.tsv_lines(not args.no_meta)))
 
@@ -3382,11 +3466,33 @@ def cmd_export(args):
                 f.write(line + "\n")
 
     tests = sorted(set(t for t, _target, _v, _e in out.samples))
-    sys.stderr.write(
-        "[mx] export: %d sample(s) over %d test(s) -> %s%s\n"
-        % (len(out.samples), len(tests),
-           "stdout" if stdout else args.output,
-           "; %d host(s) reported nothing" % silent if silent else ""))
+    sys.stderr.write("[mx] export: %d sample(s) over %d overlay(s) on %d "
+                     "host(s) -> %s\n"
+                     % (len(out.samples), len(tests), len(stats),
+                        "stdout" if stdout else args.output))
+    # An overlay is left out when its number was not measured, so say which
+    # and why: a sparse overlay is this working, not a bug to hunt.
+    no_rx = [h for h in sorted(stats) if not stats[h]["served_seen"]]
+    if no_rx:
+        sys.stderr.write("[mx] export: %d host(s) have no rx rows, so "
+                         "mx_served_pps and mx_egress_gbps are omitted for "
+                         "them rather than exported as zero: %s\n"
+                         % (len(no_rx), " ".join(no_rx[:8])))
+    no_split = [h for h in sorted(stats)
+                if forward.get(h) is None and stats[h]["sent"] > 0]
+    if no_split:
+        sys.stderr.write("[mx] export: %d host(s) have a peer that reported "
+                         "nothing, so the forward/return loss split is "
+                         "omitted rather than counted short: %s\n"
+                         % (len(no_split), " ".join(no_split[:8])))
+    if silent:
+        sys.stderr.write("[mx] export: %d host(s) reported earlier but not in "
+                         "the window (mx_state SILENT): %s\n"
+                         % (len(silent), " ".join(silent[:8])))
+    if missing:
+        sys.stderr.write("[mx] export: %d host(s) in the matrix never reported "
+                         "(mx_state NO-DATA): %s\n"
+                         % (len(missing), " ".join(missing[:8])))
     return 0
 
 
@@ -3811,6 +3917,12 @@ def build_parser():
                          "`max` away. Reduced over the window even with "
                          "--raw, which a full mesh's row count is the reason "
                          "for")
+    ex.add_argument("--nic-gbps", type=float, metavar="GBPS",
+                    help="per-host NIC line rate. Adds mx_line_util and pins "
+                         "the throughput overlays to an absolute scale, which "
+                         "is what catches a whole fabric running at half "
+                         "speed -- every host reads a comfortable 100%% of a "
+                         "median that is itself wrong")
     ex.add_argument("--names", metavar="FILE",
                     help="map mx host names to the names the layout uses: "
                          "one `mxname target` per line")
