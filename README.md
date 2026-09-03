@@ -706,6 +706,10 @@ drives the entire fleet lifecycle — deploy, start, status, summarize,
 logs, stop, clean — through a fake `ssh`/`scp` that executes the remote
 commands in a local sandbox. No second machine required.
 
+Each test has a **60-second wall-clock limit** so a hung agent fails that
+one test loudly instead of wedging the run. Override it with
+`MX_TEST_TIMEOUT` (seconds); `MX_TEST_TIMEOUT=0` turns it off.
+
 ---
 
 ## License

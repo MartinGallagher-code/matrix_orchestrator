@@ -193,18 +193,54 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 FAILED_TESTS=()
 
+# A per-test wall-clock limit, so one hung test -- a loopback agent that
+# never exits, a start that blocks on a shim -- fails loudly instead of
+# wedging the whole run (and, in CI, burning the job's time budget on a
+# process nothing will ever reap). Override in seconds with MX_TEST_TIMEOUT;
+# 0 turns it off. Kept generous: the slowest real-agent test finishes in a
+# few seconds, so 60 only ever fires on a genuine hang.
+: "${MX_TEST_TIMEOUT:=60}"
+
 run_test() {
     local name="$1"; shift
     TESTS_RUN=$((TESTS_RUN + 1))
     setup_env
-    local rc=0
+    local rc=0 limit="${MX_TEST_TIMEOUT:-0}" timed_out=0
     (
         set +e
         cd "$TEST_TMPDIR" || exit 1
         "$name" "$@"
-    )
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
+    ) &
+    local pid=$!
+    if [ "$limit" -gt 0 ]; then
+        # Watchdog: give the test `limit` seconds, then TERM it, and KILL if
+        # it will not go. A flag file -- not the exit status -- records that
+        # the limit fired, since a test can exit non-zero on its own.
+        local flag="$TEST_TMPDIR/.timed_out"
+        (
+            sleep "$limit"
+            kill -0 "$pid" 2>/dev/null || exit 0
+            : > "$flag"
+            kill -TERM "$pid" 2>/dev/null
+            sleep 2
+            kill -KILL "$pid" 2>/dev/null
+        ) &
+        local watch=$!
+        wait "$pid" 2>/dev/null
+        rc=$?
+        # The test finished on its own; stop the watchdog before it fires.
+        kill "$watch" 2>/dev/null
+        wait "$watch" 2>/dev/null
+        [ -f "$flag" ] && timed_out=1
+    else
+        wait "$pid" 2>/dev/null
+        rc=$?
+    fi
+    if [ "$timed_out" -eq 1 ]; then
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        FAILED_TESTS+=("$name")
+        printf '    FAIL  %s (timed out after %ds)\n' "$name" "$limit"
+    elif [ "$rc" -eq 0 ]; then
         TESTS_PASSED=$((TESTS_PASSED + 1))
         printf '    PASS  %s\n' "$name"
     else
@@ -212,6 +248,7 @@ run_test() {
         FAILED_TESTS+=("$name")
         printf '    FAIL  %s (rc=%d)\n' "$name" "$rc"
     fi
+    # teardown_env's pkill sweeps up any agents a killed test left mid-blast.
     teardown_env
 }
 
