@@ -683,7 +683,7 @@ of a percent in either direction.
 
 | Switch | What it changes |
 |---|---|
-| `--peers` | adds a per-flow overlay (`mx_peer_pps`, `mx_peer_loss`, `mx_peer_rtt_p99`), each sample tagged `peer=`; `max` on one of those reads as *the worst peer of this host* |
+| `--peers` | exports one sample per flow, tagged `peer=`, so the viewer draws the measured host-to-host pairs and offers its **draw measured flows** checkbox. On a full mesh the flows **fold into the headline overlays** — `mx_pps` (now `agg=sum`, so it still reduces to the host total), `mx_loss`, `mx_rtt_p99` — so the flow rides the metric you already picked, the way an iperf export does. A **layered** run can't fold (per-pair window-means don't sum to a rotating offered rate), so there the flows keep their own `mx_peer_pps` / `mx_peer_loss` / `mx_peer_rtt_p99` overlays, each tagged with its `layer=` |
 | `--raw` | adds one sample per host per report **interval** for the columns a host row carries, so the viewer can show min/max/p95 over the run; the overlays derived from more than one row are still written once per host |
 | `--json` | the same samples as NDJSON, one object per line, for a pipeline rather than a person |
 | `--window 0` | reduce the whole report history, not the last 60 s |
@@ -705,6 +705,10 @@ The suite runs real agents exchanging real packets over loopback, and
 drives the entire fleet lifecycle — deploy, start, status, summarize,
 logs, stop, clean — through a fake `ssh`/`scp` that executes the remote
 commands in a local sandbox. No second machine required.
+
+Each test has a **60-second wall-clock limit** so a hung agent fails that
+one test loudly instead of wedging the run. Override it with
+`MX_TEST_TIMEOUT` (seconds); `MX_TEST_TIMEOUT=0` turns it off.
 
 ---
 

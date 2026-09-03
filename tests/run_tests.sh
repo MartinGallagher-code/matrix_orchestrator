@@ -47,6 +47,7 @@ echo "mx test suite"
 echo "  tool:       $MX"
 echo "  python:     $(python3 -V 2>&1)"
 echo "  test files: ${#files[@]}"
+echo "  time limit: ${MX_TEST_TIMEOUT:-60}s per test (MX_TEST_TIMEOUT=0 to disable)"
 echo
 
 file_pass=0
