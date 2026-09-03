@@ -9,6 +9,29 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.8.0] - 2026-09-03
+
+Made `mx export --peers` draw its flows from the metric you already reach
+for, the way an `iperf_orchestrator` export does.
+
+### Changed
+
+- **`mx export --peers` folds the per-flow rows into the headline overlays
+  on a full mesh.** The `peer=` samples now ride `mx_pps`, `mx_loss` and
+  `mx_rtt_p99` instead of separate `mx_peer_*` overlays, so the datacenter
+  viewer's **draw measured flows** checkbox appears on the metric you were
+  already looking at — the same place iperf's export puts it — rather than
+  only on a parallel per-peer overlay a reader had to know to select.
+  `mx_pps` now declares `agg=sum`, so folding does not change its host
+  figure: the per-flow samples reduce back to the host total, and a
+  collapsed rack reads as total throughput. `mx_rtt_p99` stays worst-peer
+  (`max`) and `mx_loss` is the per-peer mean, which equals the weighted
+  host ratio on the uniform mesh a `--peers` run builds.
+- **A layered run (`--dwell`) is unchanged**: per-pair window-means do not
+  sum to a rotating offered rate, so its host figures stay per-host and its
+  flows keep their own `mx_peer_pps` / `mx_peer_loss` / `mx_peer_rtt_p99`
+  overlays, each tagged with the `layer=` it was measured in.
+
 ## [1.7.0] - 2026-08-30
 
 Brought `mx export` in line with `iperf_orchestrator`'s `export-overlay`,

@@ -106,15 +106,40 @@ test_export_names_the_hosts_that_said_nothing() {
     assert_contains "$RUN_OUT" "mx_state	alpha	REPORTING" || return 1
 }
 
-test_export_peer_samples_carry_the_peer() {
+test_export_folds_flows_into_the_headline_overlays() {
     write_reports
     run_mx export --no-collect --reports rep --window 0 --peers
     assert_status 0 "$RUN_RC" || return 1
-    assert_contains "$RUN_OUT" "mx_peer_pps	alpha	2000	peer=beta" || return 1
-    assert_contains "$RUN_OUT" "mx_peer_loss	alpha	5	peer=beta" || return 1
-    # Per-peer samples live under their own test names, so a `mean` over
-    # mx_pps can never quietly mix per-host and per-flow numbers.
-    assert_contains "$RUN_OUT" "!test	mx_peer_loss" "peer overlays are declared" || return 1
+    # On a full mesh the per-pair rows fold into the headline overlays, so the
+    # flow (peer=) rides mx_pps/mx_loss/mx_rtt_p99 -- the metric you reach for,
+    # the way an iperf export does -- and the viewer shows its "draw measured
+    # flows" checkbox there.
+    assert_contains "$RUN_OUT" "mx_pps	alpha	2000	peer=beta" || return 1
+    assert_contains "$RUN_OUT" "mx_loss	alpha	5	peer=beta" || return 1
+    assert_contains "$RUN_OUT" "mx_rtt_p99	alpha	400	peer=beta" || return 1
+    # mx_pps sums its per-pair samples back to the host total, so a collapsed
+    # rack reads as total throughput rather than a mean of flows.
+    assert_contains "$RUN_OUT" "agg=sum" "mx_pps declares agg=sum" || return 1
+    # Folding replaces the dedicated per-peer overlays; they are not emitted.
+    assert_not_contains "$RUN_OUT" "mx_peer_pps" || return 1
+}
+
+test_export_keeps_per_peer_overlays_for_a_layered_run() {
+    write_matrix alpha beta gamma
+    run_mx gen --servers servers.txt --pps 2000 --peers 1 --dwell 6
+    assert_status 0 "$RUN_RC" || return 1
+    mkdir -p rep
+    {
+        echo "$REPORT_HEAD"
+        echo "1000,alpha,tx,beta,64,64,2000.0,2000.0,1.040,1900.0,0.988,5.000,100,90,400,900,,,,,0"
+        echo "1000,alpha,host,*,64,64,2000.0,2000.0,1.040,1900.0,0.988,5.000,,90,400,,10.0,20.0,30.0,1,0"
+    } > rep/alpha.csv
+    run_mx export --no-collect --reports rep --window 0 --peers
+    assert_status 0 "$RUN_RC" || return 1
+    # A layered run cannot fold: per-pair window-means do not sum to the
+    # offered rate, so the host figures stay per-host and the flow keeps its
+    # own mx_peer_* overlay, tagged with the layer it was measured in.
+    assert_contains "$RUN_OUT" "mx_peer_pps	alpha	2000	peer=beta	layer=0" || return 1
     assert_not_contains "$(sample "$RUN_OUT" mx_pps alpha)" "peer=" || return 1
 }
 
@@ -368,7 +393,8 @@ run_test test_export_declares_and_files_every_host_overlay
 run_test test_export_computes_what_summarize_prints
 run_test test_export_does_not_average_a_blank_cell_as_zero
 run_test test_export_names_the_hosts_that_said_nothing
-run_test test_export_peer_samples_carry_the_peer
+run_test test_export_folds_flows_into_the_headline_overlays
+run_test test_export_keeps_per_peer_overlays_for_a_layered_run
 run_test test_export_raw_gives_one_sample_per_interval
 run_test test_export_window_keeps_only_recent_intervals
 run_test test_export_maps_host_names_onto_the_layout

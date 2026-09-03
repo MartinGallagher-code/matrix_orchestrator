@@ -55,7 +55,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -3284,6 +3284,21 @@ def cmd_export(args):
             "can hold no whitespace or quotes" % args.run)
 
     meta_table = dict(EXPORT_META)
+    # With --peers on a full mesh, the per-pair rows fold straight into the
+    # headline overlays: pps/loss/rtt_p99 become one sample per flow (tagged
+    # peer=), so the viewer draws the measured flows from the metric you
+    # already reach for -- the way iperf's export does -- and reduces them
+    # back to the host figure with the overlay's own aggregation. It
+    # reconstructs the host value exactly: pps sums to the host total,
+    # rtt_p99 is the worst peer (max), and loss is the per-peer mean, which
+    # equals the weighted host ratio when the mesh is uniform -- and a
+    # --peers mesh is. A layered run cannot fold: most pairs are idle most
+    # of the window, so per-pair window-means do not sum to the offered rate.
+    # There the host figures stay per-host and the flows keep their own
+    # mx_peer_* overlays.
+    fold_flows = args.peers and not layered
+    if fold_flows:
+        meta_table["pps"] = meta_table["pps"] + " agg=sum"
     if args.nic_gbps:
         # A known line rate turns the throughput overlays from relative
         # shading into absolute readings: without it the viewer fits the ramp
@@ -3323,13 +3338,18 @@ def cmd_export(args):
         h = stats[host]
         agg = hostagg.get(host)
         if not args.raw:
-            out.add("pps", host, h["sent"])
+            # When folding, pps/loss/rtt_p99 are emitted per pair below so the
+            # flow rides the headline overlay; everything else stays per-host.
+            if not fold_flows:
+                out.add("pps", host, h["sent"])
             out.add("rep_pps", host, h["back"])
-            if h["sent"] > 0:
+            if not fold_flows and h["sent"] > 0:
                 out.add("loss", host, max(0.0, 100.0 - pct(h["back"], h["sent"])))
             if h["target"] > 0:
                 out.add("achieved", host, pct(h["sent"], h["target"]))
             for test in ("rtt_avg", "rtt_p50", "rtt_p99", "rtt_max"):
+                if test == "rtt_p99" and fold_flows:
+                    continue
                 if h[test] > 0:
                     out.add(test, host, h[test])
             if agg:
@@ -3388,6 +3408,12 @@ def cmd_export(args):
         out.add("state", host, "SILENT")
 
     if args.peers:
+        # Folded, the flow rides the headline overlay (mx_pps/mx_loss/
+        # mx_rtt_p99); layered, it keeps its own mx_peer_* overlay so the
+        # host figures above stay the correct per-host aggregate.
+        pps_test = "pps" if fold_flows else "peer_pps"
+        loss_test = "loss" if fold_flows else "peer_loss"
+        rtt_test = "rtt_p99" if fold_flows else "peer_rtt_p99"
         pair_layer = {}
         for r in recent:
             if r.get("dir") == "tx" and r.get("layer"):
@@ -3399,7 +3425,7 @@ def cmd_export(args):
             if layer:
                 extras.append("layer=%s" % layer)
             sent = a.mean("pps")
-            out.add("peer_pps", host, sent if sent > 0 else None, extras)
+            out.add(pps_test, host, sent if sent > 0 else None, extras)
             if layered:
                 # A ratio of totals, not of per-row means: the replies still
                 # in flight at a layer switch land in a drain row with
@@ -3410,9 +3436,9 @@ def cmd_export(args):
             else:
                 delivered = pct(a.mean("rep_pps"), sent) if sent > 0 else None
             if delivered is not None:
-                out.add("peer_loss", host, max(0.0, 100.0 - delivered), extras)
+                out.add(loss_test, host, max(0.0, 100.0 - delivered), extras)
             p99 = a.mean("rtt_p99_us")
-            out.add("peer_rtt_p99", host, p99 if p99 > 0 else None, extras)
+            out.add(rtt_test, host, p99 if p99 > 0 else None, extras)
 
     # Hosts the matrix knows about that said nothing in the window: the one
     # thing a results file can show that a report cannot, because a host
@@ -3912,11 +3938,15 @@ def build_parser():
                          "one per host: the viewer can then show min/max/p95 "
                          "over the run, not just the window's mean")
     ex.add_argument("--peers", action="store_true",
-                    help="also export one sample per flow (mx_peer_*), each "
-                         "carrying peer= so the worst peer of a host is one "
-                         "`max` away. Reduced over the window even with "
-                         "--raw, which a full mesh's row count is the reason "
-                         "for")
+                    help="export one sample per flow, tagged peer=, so the "
+                         "viewer draws the measured host-to-host pairs. On a "
+                         "full mesh these fold into the headline overlays "
+                         "(mx_pps sums to the host total, mx_loss, mx_rtt_p99) "
+                         "so the flow rides the metric you already picked, "
+                         "iperf-style; a layered run keeps them on their own "
+                         "mx_peer_* overlays. Reduced over the window even "
+                         "with --raw, which a full mesh's row count is the "
+                         "reason for")
     ex.add_argument("--nic-gbps", type=float, metavar="GBPS",
                     help="per-host NIC line rate. Adds mx_line_util and pins "
                          "the throughput overlays to an absolute scale, which "
