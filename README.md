@@ -90,8 +90,10 @@ no packages, no root. Key-based SSH must already work
 | `mx stop` | Stop the agents. Reports and logs stay on the hosts. |
 | `mx clean` | Stop, then delete everything. No trace left. |
 
-And six more when you want them: `mx run` (all of the above in one
-shot), `mx check` (will the NICs carry this?), `mx hints` (goal →
+And seven more when you want them: `mx run` (all of the above in one
+shot), `mx reload` (an edited matrix onto a *running* fleet — see
+[Editing the matrix mid-run](#editing-the-matrix-mid-run-mx-reload)),
+`mx check` (will the NICs carry this?), `mx hints` (goal →
 command), `mx logs` (collect agent logs), `mx doctor` (is the fleet
 ready?), and `mx export` (the run as a floor-plan overlay — see
 [Draw it on the floor plan](#draw-it-on-the-floor-plan-mx-export)).
@@ -142,9 +144,60 @@ Edit it by hand for anything non-uniform:
 - write **`max`** in a cell to let that pair run unpaced,
 - change the `tx_size`/`rx_size`/`port` line to reshape the packets.
 
-Then `mx start` again. Host tokens are `name[=addr[:port]]`, so a bare
-list of IPs works, and `hostA=10.0.0.10:5399` works when the name, the
-address and the port all differ.
+Then `mx start` again — or `mx reload` if the fleet is already running
+and you want to keep it that way. Host tokens are `name[=addr[:port]]`,
+so a bare list of IPs works, and `hostA=10.0.0.10:5399` works when the
+name, the address and the port all differ.
+
+---
+
+## Editing the matrix mid-run (`mx reload`)
+
+An agent reads its matrix **once**, at startup: it resolves its peers and
+forks workers with their flows already sharded, and nothing re-reads the
+file. So editing `matrix.csv` under a running fleet changes nothing by
+itself — the edit has to be pushed, and the agents it affects restarted.
+
+`mx reload` does exactly that, and only that:
+
+```bash
+vi matrix.csv     # change a cell, blank a flow, retune the header
+mx reload         # push it, restart the hosts it changed, leave the rest
+```
+
+**It restarts as little as it can.** Each agent stamps what it loaded when
+it started, so reload compares the edit host by host:
+
+| What you edited | What restarts |
+|---|---|
+| one host's row — its rates, or a blanked flow | **that host only** |
+| the `tx_size`/`rx_size`/`port` header, or the rotation header | **every host** |
+| a host's address or port, or adding/removing/reordering hosts | **every host** |
+| nothing | **nothing** — reload says so and exits 0 |
+
+The fleet-wide cases are not caution, they are the wire format: a request
+carries its sender's *index* into the matrix host list, and the responder
+decodes it against a table sized by that list. Change the roster or the
+packet shape and every agent's view of it has to change together.
+
+**What it preserves.** Unchanged hosts are never touched — not restarted,
+not even re-copied, so what is on their disk stays what their agent holds
+in memory. Restarted hosts keep their `report.csv` rather than having it
+wiped the way `mx start` wipes it: a reload is one run continuing under an
+edited matrix, so `mx summarize --window` can scope either side of the
+edit. Each host comes back with the **flags it was originally started
+with** — read off its own stamp — so `mx reload` takes no `--interval`,
+`--workers` or `--streams` of its own. Changing those is a different kind
+of change, and still a `mx stop && mx start`.
+
+Pass `--bind` if the run was started with it, so the matrix is retargeted
+the way it was deployed, and `--dry-run` to see the ssh and scp it would
+run. A host that is in the matrix but not running is started; one running
+without a stamp (started by an older `mx`, or by hand) is reported and
+left alone, since its flags cannot be known. **Removing** a host from the
+matrix is the one edit reload cannot finish for you: it restarts everyone
+who remains, but the retired host is no longer in the file, so stop it
+with the old matrix (or `mx clean`) before you cut it out.
 
 ---
 

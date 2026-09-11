@@ -249,9 +249,108 @@ EOF
     assert_contains "$RUN_OUT" "NOT-DEPLOYED" "nothing was deployed" || return 1
 }
 
+test_reload_restarts_only_the_host_whose_row_changed() {
+    # The point of reload: an edit confined to one host's row must not
+    # disturb the run on every other host.
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    run_mx start --interval 2 --duration 60
+    assert_status 0 "$RUN_RC" "start" || return 1
+    local a0 b0 a1 b1
+    a0=$(cat "$(host_dir 127.0.0.1)/agent.pid")
+    b0=$(cat "$(host_dir 127.0.0.2)/agent.pid")
+    # alpha's outgoing rate only: its row, nobody else's.
+    awk -F, 'BEGIN{OFS=","} /^alpha=/{$3=900} {print}' matrix.csv > m.new \
+        && mv m.new matrix.csv
+    run_mx reload
+    assert_status 0 "$RUN_RC" "reload" || return 1
+    a1=$(cat "$(host_dir 127.0.0.1)/agent.pid")
+    b1=$(cat "$(host_dir 127.0.0.2)/agent.pid")
+    assert_contains "$RUN_OUT" "matrix changed for 1 host" || return 1
+    assert_contains "$RUN_OUT" "unchanged, left running: 1 of 2" || return 1
+    [ "$a0" != "$a1" ] || { echo "alpha should have restarted" >&2; return 1; }
+    [ "$b0" = "$b1" ] || { echo "beta must not be touched" >&2; return 1; }
+    run_mx stop
+}
+
+test_reload_restarts_every_host_when_the_header_changes() {
+    # The host list and packet sizes are a wire contract -- a request
+    # carries its sender's index into that list -- so a header edit
+    # invalidates every agent at once.
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    run_mx start --interval 2 --duration 60
+    assert_status 0 "$RUN_RC" || return 1
+    local a0 b0
+    a0=$(cat "$(host_dir 127.0.0.1)/agent.pid")
+    b0=$(cat "$(host_dir 127.0.0.2)/agent.pid")
+    sed 's/tx_size=64/tx_size=128/' matrix.csv > m.new && mv m.new matrix.csv
+    run_mx reload
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "matrix changed for 2 host" || return 1
+    [ "$a0" != "$(cat "$(host_dir 127.0.0.1)/agent.pid")" ] || {
+        echo "alpha should have restarted" >&2; return 1; }
+    [ "$b0" != "$(cat "$(host_dir 127.0.0.2)/agent.pid")" ] || {
+        echo "beta should have restarted" >&2; return 1; }
+    run_mx stop
+}
+
+test_reload_on_an_unchanged_matrix_touches_nothing() {
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    run_mx start --interval 2 --duration 60
+    assert_status 0 "$RUN_RC" || return 1
+    local a0 b0
+    a0=$(cat "$(host_dir 127.0.0.1)/agent.pid")
+    b0=$(cat "$(host_dir 127.0.0.2)/agent.pid")
+    run_mx reload
+    assert_status 0 "$RUN_RC" "an unchanged reload is a success" || return 1
+    assert_contains "$RUN_OUT" "nothing to restart" || return 1
+    [ "$a0" = "$(cat "$(host_dir 127.0.0.1)/agent.pid")" ] || {
+        echo "alpha must not be touched" >&2; return 1; }
+    [ "$b0" = "$(cat "$(host_dir 127.0.0.2)/agent.pid")" ] || {
+        echo "beta must not be touched" >&2; return 1; }
+    run_mx stop
+}
+
+test_reload_keeps_the_report_across_the_restart() {
+    # `start` wipes the report; a reload is one run continuing under an
+    # edited matrix, so what was already measured has to survive it.
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    run_mx start --interval 2 --duration 60
+    assert_status 0 "$RUN_RC" || return 1
+    local report; report="$(host_dir 127.0.0.1)/report.csv"
+    echo "# sentinel-from-before-the-reload" >> "$report"
+    awk -F, 'BEGIN{OFS=","} /^alpha=/{$3=900} {print}' matrix.csv > m.new \
+        && mv m.new matrix.csv
+    run_mx reload
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$(cat "$report")" "sentinel-from-before-the-reload" \
+        "the report survives a reload" || return 1
+    run_mx stop
+}
+
+test_reload_reuses_the_flags_the_agent_was_started_with() {
+    # reload takes no runtime flags: each host comes back exactly as it was
+    # launched, read off the stamp it wrote at start.
+    setup_fleet "$(pick_port)" --pps 500 || return 1
+    run_mx start --interval 2 --duration 60 --streams 3
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$(cat "$(host_dir 127.0.0.1)/agent.stamp")" "--streams 3" \
+        "the stamp records the flags" || return 1
+    sed 's/tx_size=64/tx_size=128/' matrix.csv > m.new && mv m.new matrix.csv
+    run_mx reload
+    assert_status 0 "$RUN_RC" || return 1
+    assert_contains "$(cat "$FAKE_ROOT/calls.log")" "--streams 3" \
+        "the restart carries the original flags" || return 1
+    run_mx stop
+}
+
 run_test test_bind_retargets_the_matrix_at_data_plane_addresses
 run_test test_bind_pattern_matching_no_host_fails_before_starting
 run_test test_streams_and_workers_reach_the_remote_agents
+run_test test_reload_restarts_only_the_host_whose_row_changed
+run_test test_reload_restarts_every_host_when_the_header_changes
+run_test test_reload_on_an_unchanged_matrix_touches_nothing
+run_test test_reload_keeps_the_report_across_the_restart
+run_test test_reload_reuses_the_flags_the_agent_was_started_with
 run_test test_start_deploys_agent_and_matrix
 run_test test_start_returns_instead_of_hanging_on_the_agent
 run_test test_status_shows_running_then_not_running
