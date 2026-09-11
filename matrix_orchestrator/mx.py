@@ -38,6 +38,7 @@ Python 3.6+, standard library only, on the orchestrator and on every host.
 
 import argparse
 import csv
+import hashlib
 import json
 import multiprocessing
 import os
@@ -55,7 +56,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -101,6 +102,7 @@ MAX_STREAMS = 256
 REPORT_NAME = "report.csv"
 LOG_NAME = "agent.log"
 PID_NAME = "agent.pid"
+STAMP_NAME = "agent.stamp"   # what the running agent was started with
 MATRIX_NAME = "matrix.csv"          # name the matrix always takes on a host
 
 ZEROS = b"\0" * MAX_SIZE
@@ -1637,14 +1639,15 @@ class Fleet(object):
         except OSError as exc:
             return 127, str(exc)
 
-    def each(self, fn, label=None, quiet=False):
+    def each(self, fn, label=None, quiet=False, hosts=None):
         """Run fn(host) on every host, at most --jobs at a time.
 
         fn returns (rc, text). Output is printed host-prefixed in matrix
         order (not completion order, so runs are diffable), and the
-        number of failures is returned.
+        number of failures is returned. `hosts` narrows the run to a
+        subset -- what `mx reload` acts on when only some hosts changed.
         """
-        hosts = self.matrix.hosts
+        hosts = list(hosts) if hosts is not None else self.matrix.hosts
         if label:
             log("[mx] %s on %d hosts" % (label, len(hosts)))
         with ThreadPoolExecutor(max_workers=self.jobs) as pool:
@@ -2147,44 +2150,136 @@ def _write_retargeted_matrix(m, addr_of, path):
                  extra_comment=extra)
 
 
+# ---- Is this host still running the matrix on disk? --------------------------
+#
+# An agent loads its matrix once, at startup: it resolves its peers and forks
+# workers with their flows already sharded, and nothing ever re-reads the file.
+# So `mx reload` has to answer "did this host's configuration change?" from the
+# outside, and the answer has two halves.
+#
+# The fleet half is a wire contract. A request carries its sender's *index*
+# into the matrix host list, and the responder decodes it against a table sized
+# by that list -- so adding, removing or reordering a host, or changing any
+# address, port or packet size, invalidates every agent at once.
+#
+# The host half is just that host's own row: who it sends to, and how fast.
+# Edit one cell and only that sender has to come back.
+#
+# Folding the fleet half into every host's digest makes one comparison answer
+# both: a header edit flips every host, a single cell flips exactly one.
+
+def _fleet_terms(m):
+    terms = ["mx-stamp-v1", "tx=%d" % m.tx_size, "rx=%d" % m.rx_size,
+             "port=%d" % m.port]
+    if m.layering:
+        lay = m.layering
+        terms.append("rotation=%d,%d,%g,%d,%d"
+                     % (lay.peers, lay.layers, lay.dwell, lay.seed,
+                        1 if lay.fill else 0))
+    for h in m.hosts:
+        addr, port = m.endpoint(h)
+        terms.append("host=%s,%s,%d" % (h, addr, port))
+    return terms
+
+
+def host_fingerprint(m, host):
+    """A short digest of everything the agent on `host` loads from the
+    matrix. Equal digests mean restarting it would change nothing."""
+    terms = _fleet_terms(m)
+    terms.append("me=%s" % host)
+    for peer, pps in m.peers_of(host):
+        terms.append("flow=%s,%s"
+                     % (peer, "max" if pps == float("inf") else "%g" % pps))
+    return hashlib.sha256("\n".join(terms).encode("utf-8")).hexdigest()[:16]
+
+
+def _stamp_write(fp, flags):
+    """Shell that records what this agent was started with. `mx reload` reads
+    it back to tell a changed host from an untouched one -- and to restart the
+    changed one exactly as it was running."""
+    joined = " ".join(shlex.quote(f) for f in flags)
+    return ("printf 'fp=%%s\\nflags=%%s\\n' %s %s > %s\n"
+            % (shlex.quote(fp), shlex.quote(joined), STAMP_NAME))
+
+
+def _probe_block(rdir):
+    """Shell that reports whether an agent is up here and what it was started
+    with -- one round trip per host."""
+    return """
+d={d}
+cd "$d" 2>/dev/null || {{ echo 'state=absent'; exit 0; }}
+if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+    echo 'state=running'
+else
+    echo 'state=stopped'
+fi
+cat {stamp} 2>/dev/null || true
+""".format(d=shlex.quote(rdir), pid=PID_NAME, stamp=STAMP_NAME)
+
+
+def _parse_stamp(text):
+    info = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if "=" in line:
+            key, value = line.split("=", 1)
+            info[key.strip()] = value.strip()
+    return info
+
+
+def _check_dwell_interval(m, interval):
+    """A tick-aligned dwell is what keeps every report row inside a single
+    layer. Refuse once, here, rather than deploy a fleet of agents that would
+    each warn about blurred boundaries."""
+    if not m.layering:
+        return
+    lay = m.layering
+    ratio = lay.dwell / interval
+    if lay.dwell < interval or abs(ratio - round(ratio)) > 0.01:
+        die("layered matrix: dwell %gs must be a whole multiple of "
+            "--interval (%gs) so layer switches land on report ticks. "
+            "Try --interval %g."
+            % (lay.dwell, interval, lay.dwell / max(1, round(ratio))))
+
+
+def _stage_matrix(fleet, args, m):
+    """The matrix as it will land on the hosts, which is not always the one on
+    disk: scp lands a file under its own basename and the agent always looks
+    for matrix.csv, and with --bind the copy is retargeted at each host's
+    data-plane address. Returns (path, matrix, tmpdir); the matrix returned is
+    what the agents actually load, so it is what fingerprints are taken over.
+    """
+    tmpdir = None
+    path = args.matrix
+    staged = m
+    if getattr(args, "bind", "") and not fleet.dry_run:
+        bind_ips = _probe_bind_ips(fleet, args.bind)
+        tmpdir = tempfile.mkdtemp(prefix="mx-")
+        path = os.path.join(tmpdir, MATRIX_NAME)
+        _write_retargeted_matrix(m, bind_ips, path)
+        staged = load_matrix(path)
+        changed = sum(1 for h in m.hosts if m.addrs[h] != bind_ips[h])
+        log("[mx] --bind %r: matrix retargeted at each host's matching "
+            "address (%d of %d changed)" % (args.bind, changed, len(m.hosts)))
+    elif os.path.basename(path) != MATRIX_NAME:
+        tmpdir = tempfile.mkdtemp(prefix="mx-")
+        path = os.path.join(tmpdir, MATRIX_NAME)
+        shutil.copyfile(args.matrix, path)
+    return path, staged, tmpdir
+
+
 def cmd_start(args):
     m = load_matrix(args.matrix)
-    if m.layering:
-        # Refuse here, once, rather than deploying a fleet of agents that
-        # would each warn about blurred boundaries. A tick-aligned dwell
-        # is what keeps every report row inside a single layer.
-        lay = m.layering
-        ratio = lay.dwell / args.interval
-        if lay.dwell < args.interval or abs(ratio - round(ratio)) > 0.01:
-            die("layered matrix: dwell %gs must be a whole multiple of "
-                "--interval (%gs) so layer switches land on report ticks. "
-                "Try --interval %g."
-                % (lay.dwell, args.interval,
-                   lay.dwell / max(1, round(ratio))))
+    _check_dwell_interval(m, args.interval)
     fleet = Fleet(m, args)
     agent_src = _agent_source()
     flags = _agent_flags(args)
 
+    # What the agents will actually load -- retargeted by --bind, if given --
+    # and so what their stamps are fingerprints of.
+    staged = m
     if not args.no_deploy:
-        # scp lands a file under its own basename, and the agent always
-        # looks for matrix.csv -- so stage a copy under that name when the
-        # local file is called something else. With --bind the staged copy
-        # is retargeted at each host's data-plane IP, so the traffic rides
-        # the bound NIC end to end while ssh keeps the login addresses.
-        tmpdir = None
-        matrix_src = args.matrix
-        if args.bind and not fleet.dry_run:
-            bind_ips = _probe_bind_ips(fleet, args.bind)
-            tmpdir = tempfile.mkdtemp(prefix="mx-")
-            matrix_src = os.path.join(tmpdir, MATRIX_NAME)
-            _write_retargeted_matrix(m, bind_ips, matrix_src)
-            changed = sum(1 for h in m.hosts if m.addrs[h] != bind_ips[h])
-            log("[mx] --bind %r: matrix retargeted at each host's matching "
-                "address (%d of %d changed)" % (args.bind, changed, len(m.hosts)))
-        elif os.path.basename(matrix_src) != MATRIX_NAME:
-            tmpdir = tempfile.mkdtemp(prefix="mx-")
-            matrix_src = os.path.join(tmpdir, MATRIX_NAME)
-            shutil.copyfile(args.matrix, matrix_src)
+        matrix_src, staged, tmpdir = _stage_matrix(fleet, args, m)
 
         def deploy(host):
             rc, out = fleet.sh(host, "mkdir -p %s" % shlex.quote(fleet.dir))
@@ -2218,12 +2313,13 @@ cd "$d" 2>/dev/null || {{ echo 'not deployed (drop --no-deploy)'; exit 1; }}
 if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
     echo 'already running -- mx stop first'; exit 1
 fi
-rm -f {log} {report} {pid}
+rm -f {log} {report} {pid} {stampfile}
 {cmd}
 agent_pid=$!
 echo "$agent_pid" > {pid}
 sleep 0.5
 if kill -0 "$agent_pid" 2>/dev/null; then
+    {stamp}
     echo started
 else
     echo 'died on startup:'
@@ -2232,7 +2328,8 @@ else
     exit 1
 fi
 """.format(d=shlex.quote(fleet.dir), pid=PID_NAME, log=LOG_NAME,
-           report=REPORT_NAME, cmd=cmd)
+           report=REPORT_NAME, cmd=cmd, stampfile=STAMP_NAME,
+           stamp=_stamp_write(host_fingerprint(staged, host), flags))
         return fleet.sh(host, script)
 
     failed = fleet.each(start, "starting agents", quiet=True)
@@ -2252,6 +2349,174 @@ fi
     log("[mx] next: mx status      # one line per host")
     log("[mx]       mx summarize   # pps / Gbps / loss / rtt")
     log("[mx]       mx stop        # when you are done")
+    return 0
+
+
+def _stop_pid_block(rdir):
+    """Stop *this* agent, by its own pid, and wait for it to actually go.
+
+    Deliberately not `_kill_block`: that one falls back to a pgrep/pkill over
+    every mx agent on the box. On a reload that is wrong twice over -- it
+    would take down an agent belonging to a different --remote-dir, and
+    because the relaunch in the same script puts the literal "mx.py agent"
+    into this shell's own argv, the pkill pattern matches the shell running
+    it and kills the reload mid-flight. The pid is known here (the host
+    reported it running), so use it and nothing else.
+    """
+    return """
+d={d}
+cd "$d" 2>/dev/null || {{ echo 'not deployed'; exit 1; }}
+status=not-running
+if [ -f {pid} ]; then
+    agent=$(cat {pid} 2>/dev/null)
+    if [ -n "$agent" ] && kill -0 "$agent" 2>/dev/null; then
+        kill -TERM "$agent" 2>/dev/null
+        status=stopped
+        i=0
+        while [ $i -lt 60 ]; do
+            kill -0 "$agent" 2>/dev/null || break
+            sleep 0.25
+            i=$((i+1))
+        done
+        if kill -0 "$agent" 2>/dev/null; then
+            kill -KILL "$agent" 2>/dev/null
+            status=killed
+        fi
+    fi
+fi
+rm -f {pid}
+""".format(d=shlex.quote(rdir), pid=PID_NAME)
+
+
+def _interval_of(flags, default=DEFAULT_INTERVAL):
+    """The --interval an agent was started with, read back off its stamp."""
+    for i, flag in enumerate(flags):
+        if flag == "--interval" and i + 1 < len(flags):
+            try:
+                return float(flags[i + 1])
+            except ValueError:
+                break
+    return default
+
+
+def cmd_reload(args):
+    """Make a running fleet match an edited matrix: push it where it will be
+    picked up, and restart only the hosts whose own configuration changed.
+
+    An agent never re-reads its matrix, so a hand edit means a restart -- but
+    restarting the whole fleet throws away the run on hosts nothing changed
+    for. Each agent stamps what it loaded when it started, so the edit can be
+    compared host by host and the untouched ones left alone.
+    """
+    m = load_matrix(args.matrix)
+    fleet = Fleet(m, args)
+    agent_src = _agent_source()
+    matrix_src, staged, tmpdir = _stage_matrix(fleet, args, m)
+    try:
+        # Ask every host what it is running *before* changing anything: the
+        # stamps are the only record of it, and a restart overwrites the one
+        # it belongs to.
+        seen = {}
+
+        def probe(host):
+            rc, out = fleet.sh(host, _probe_block(fleet.dir))
+            seen[host] = _parse_stamp(out)
+            return (rc, "" if rc == 0 else out)
+
+        if fleet.each(probe, "checking %d host(s)" % len(m.hosts), quiet=True):
+            log("[mx] could not reach every host -- nothing was changed")
+            return 1
+
+        restart, relaunch, keep, unstamped = [], [], [], []
+        for host in m.hosts:
+            info = seen.get(host, {})
+            running = info.get("state") == "running"
+            fp = info.get("fp")
+            if not fp:
+                # Started by an older mx, or by hand: we do not know what it
+                # loaded or how it was launched, so we will not guess.
+                unstamped.append((host, running))
+            elif not running:
+                relaunch.append(host)
+            elif fp != host_fingerprint(staged, host):
+                restart.append(host)
+            else:
+                keep.append(host)
+
+        for host, running in unstamped:
+            log("[mx] %s: %s, and carries no stamp -- `mx stop && mx start` "
+                "brings it under reload" % (host, "running" if running
+                                            else "not running"))
+        if keep:
+            log("[mx] unchanged, left running: %d of %d host(s)"
+                % (len(keep), len(m.hosts)))
+        todo = restart + relaunch
+        if not todo:
+            log("[mx] every host already matches %s -- nothing to restart"
+                % args.matrix)
+            return 0
+        if restart:
+            log("[mx] matrix changed for %d host(s): %s"
+                % (len(restart), ", ".join(restart)))
+        if relaunch:
+            log("[mx] not running, will start: %d host(s): %s"
+                % (len(relaunch), ", ".join(relaunch)))
+
+        # The dwell guard start applies, against the interval each agent was
+        # actually started with rather than one this command never took.
+        for host in todo:
+            _check_dwell_interval(
+                staged, _interval_of(shlex.split(seen[host].get("flags", ""))))
+
+        def apply(host):
+            flags = shlex.split(seen[host].get("flags", ""))
+            rc, out = fleet.sh(host, "mkdir -p %s" % shlex.quote(fleet.dir))
+            if rc != 0:
+                return rc, "mkdir failed: %s" % out
+            # Only hosts that are about to restart get the new file: leaving
+            # an untouched host's copy alone keeps what is on its disk and
+            # what its agent holds in memory the same thing.
+            rc, out = fleet.push(host, [agent_src, matrix_src])
+            if rc != 0:
+                return rc, "copy failed: %s" % out
+            cmd = ("nohup %s %s agent --matrix %s --host %s --report %s %s "
+                   "< /dev/null >> %s 2>&1 &"
+                   % (shlex.quote(fleet.python), os.path.basename(agent_src),
+                      MATRIX_NAME, shlex.quote(host), REPORT_NAME,
+                      " ".join(shlex.quote(f) for f in flags), LOG_NAME))
+            # The report is deliberately *not* wiped the way `start` wipes it:
+            # a reload is one run continuing under an edited matrix, and the
+            # reporter appends, so the history either side of the edit stays
+            # in one file for `summarize --window` to scope.
+            script = _stop_pid_block(fleet.dir) + """
+{cmd}
+agent_pid=$!
+echo "$agent_pid" > {pid}
+sleep 0.5
+if kill -0 "$agent_pid" 2>/dev/null; then
+    {stamp}
+    echo "restarted (was $status)"
+else
+    echo 'died on startup:'
+    tail -n 5 {log} 2>/dev/null
+    rm -f {pid}
+    exit 1
+fi
+""".format(pid=PID_NAME, log=LOG_NAME, cmd=cmd,
+           stamp=_stamp_write(host_fingerprint(staged, host), flags))
+            return fleet.sh(host, script)
+
+        failed = fleet.each(apply, "restarting %d host(s)" % len(todo),
+                            hosts=todo)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    if failed:
+        log("[mx] some hosts did not come back; `mx logs` will tell you why")
+        return 1
+    log("[mx] reloaded: %d restarted, %d left running"
+        % (len(todo), len(keep)))
+    log("[mx] next: mx status      # one line per host")
     return 0
 
 
@@ -3903,6 +4168,14 @@ def build_parser():
     _add_fleet_flags(s)
     _add_run_flags(s)
 
+    rl = sub.add_parser("reload",
+                        help="push an edited matrix, restart only the hosts "
+                             "whose own configuration changed")
+    _add_fleet_flags(rl)
+    rl.add_argument("--bind", default=_env("IPERF_BIND", ""), metavar="SPEC",
+                    help="the same --bind the run was started with, so the "
+                         "matrix is retargeted the way it was deployed")
+
     st = sub.add_parser("status", help="one line per host: running? how fast?")
     _add_fleet_flags(st)
     st.add_argument("--watch", type=float, default=0, metavar="SECONDS",
@@ -4052,6 +4325,7 @@ def cmd_full_help(ap):
 
 COMMANDS = {
     "gen": cmd_gen, "check": cmd_check, "hints": cmd_hints, "start": cmd_start,
+    "reload": cmd_reload,
     "status": cmd_status, "summarize": cmd_summarize, "collect": cmd_collect,
     "export": cmd_export, "stop": cmd_stop, "logs": cmd_logs,
     "clean": cmd_clean, "run": cmd_run, "doctor": cmd_doctor,

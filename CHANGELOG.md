@@ -9,6 +9,41 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.9.0] - 2026-09-11
+
+Added a way to change the traffic without throwing the run away.
+
+### Added
+
+- **`mx reload`: push an edited matrix onto a running fleet and restart
+  only the hosts it changed.** An agent reads its matrix once, at startup
+  -- it resolves its peers and forks workers with their flows already
+  sharded, and nothing re-reads the file -- so a hand edit used to mean
+  `mx stop && mx start`, which throws away the run on every host,
+  including the ones the edit never touched. Each agent now stamps what
+  it loaded when it started, and `mx reload` compares the edit host by
+  host: one host's row restarts that host, the `tx_size`/`rx_size`/`port`
+  or rotation header restarts every host, and an unchanged matrix
+  restarts nothing and says so.
+
+  The fleet-wide cases are the wire format rather than caution: a request
+  carries its sender's *index* into the matrix host list, and the
+  responder decodes it against a table sized by that list, so changing the
+  roster, an address or the packet shape invalidates every agent at once.
+
+  Unchanged hosts are never touched -- not restarted, not re-copied, so
+  what is on their disk stays what their agent holds in memory. A
+  restarted host keeps its `report.csv` instead of having it wiped the way
+  `mx start` wipes it, because a reload is one run continuing under an
+  edited matrix; `mx summarize --window` scopes either side of it. And it
+  comes back with the flags it was originally started with, read off its
+  own stamp, so `reload` takes no `--interval`/`--workers`/`--streams` of
+  its own -- changing those is still a stop and start.
+
+  Removing a host from the matrix is the one edit it cannot finish: it
+  restarts everyone who remains, but the retired host is no longer in the
+  file, so stop it against the old matrix before cutting it out.
+
 ## [1.8.0] - 2026-09-03
 
 Made `mx export --peers` draw its flows from the metric you already reach
