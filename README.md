@@ -782,7 +782,8 @@ PARTICULAR PURPOSE. See the GNU General Public License for more details.
 You should have received a copy of the GNU General Public License along with
 this program. If not, see <https://www.gnu.org/licenses/>.
 
-Full text: [LICENSE](LICENSE) — SPDX identifier `GPL-3.0-or-later`. This
-repository follows the [REUSE Specification](https://reuse.software/): source
-files carry SPDX copyright and licence headers, and the licence text lives in
-[`LICENSES/`](LICENSES).
+Full text: the `LICENSE` file at the repository root, or
+<https://www.gnu.org/licenses/gpl-3.0.html> — SPDX identifier
+`GPL-3.0-or-later`. This repository follows the
+[REUSE Specification](https://reuse.software/): source files carry SPDX
+copyright and licence headers, and the licence text lives in `LICENSES/`.
