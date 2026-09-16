@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 # Real agents exchanging real packets on loopback: pacing accuracy, the
 # request-in/reply-out size contract, the report CSV, and summarize.
 #

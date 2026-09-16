@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 #
 # Top-level test runner. Discovers every `test_*.sh` next to it and runs
 # each as its own bash subprocess, so a fatal error in one file cannot

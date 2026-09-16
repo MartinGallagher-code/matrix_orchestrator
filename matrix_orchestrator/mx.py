@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 """mx -- run a request/response traffic matrix across a fleet of servers.
 
 One file. One command per thing you want to do. Every host talks to every

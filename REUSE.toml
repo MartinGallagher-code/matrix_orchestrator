@@ -1,12 +1,15 @@
+# REUSE compliance (https://reuse.software, spec 3.3).
+#
+# First-party source files carry their own SPDX headers; this file covers
+# everything else -- tests, docs, fixtures, workflows and metadata -- in bulk.
+# `precedence = "closest"` means any file with its own header keeps it.
 version = 1
-
-# The whole project is authored by Martin J. Gallagher and licensed
-# GPL-3.0-or-later. Files that carry their own SPDX headers keep them; this
-# blanket annotation supplies the same information for everything else
-# (docs, config, and anything generated).
+SPDX-PackageName = "matrix-orchestrator"
+SPDX-PackageSupplier = "Martin J. Gallagher <martinjgallagher@icloud.com>"
+SPDX-PackageDownloadLocation = "https://github.com/MartinGallagher-code/matrix_orchestrator"
 
 [[annotations]]
 path = "**"
-precedence = "aggregate"
+precedence = "closest"
 SPDX-FileCopyrightText = "2026 Martin J. Gallagher"
 SPDX-License-Identifier = "GPL-3.0-or-later"
