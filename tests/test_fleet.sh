@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 # The whole fleet lifecycle -- start, status, summarize, logs, stop,
 # clean -- driven through a fake ssh/scp that executes the "remote"
 # commands locally in a per-host sandbox. Real agents, real packets, no

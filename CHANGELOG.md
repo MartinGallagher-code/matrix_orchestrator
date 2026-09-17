@@ -9,6 +9,28 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Licensing and attribution are now identical across every repository in
+  the suite.** The notice said the same thing eleven slightly different ways —
+  different badge text, different `--version` wording, five styles of file
+  header, and in places a different holder or even a different licence. All of
+  it is now one form:
+  - **Holder:** `Martin J. Gallagher` everywhere (several places said
+    "Martin Gallagher", dropping the middle initial).
+  - **Licence:** `GPL-3.0-or-later` everywhere, with `LICENSE` and
+    `LICENSES/GPL-3.0-or-later.txt` the same verbatim FSF text in every repo.
+  - **File headers:** the two-line SPDX pair
+    (`SPDX-License-Identifier` then `SPDX-FileCopyrightText`), replacing the
+    `Copyright (C) …` variants and the long inline GPL notices.
+  - **`--version`:** the same five-line GNU-style block under every tool's own
+    name and version.
+  - **README:** the same licence badge and the same `## License` section.
+  - **REUSE:** a `REUSE.toml` of the same shape in every repo; `reuse lint`
+    passes in all of them.
+
 ## [1.9.0] - 2026-09-11
 
 Added a way to change the traffic without throwing the run away.

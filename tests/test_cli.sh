@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 # The operator-facing surface: dispatch, help, hints, and the env-var
 # defaults. This tool's whole premise is that it is simple to drive, so
 # the guidance it prints is part of the contract.

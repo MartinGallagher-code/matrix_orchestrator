@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 #
 # Guards the `requires-python = ">=3.6"` floor. The agent is copied to
 # every server and run by whatever python3 is there, which on a long-lived

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 """matrix_orchestrator: a request/response traffic matrix across a fleet.
 
 The whole tool is :mod:`matrix_orchestrator.mx` -- a single stdlib-only
