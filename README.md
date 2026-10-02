@@ -123,6 +123,88 @@ because that is the number a NIC actually has to carry.
 
 ---
 
+## Disks in the loop (`--disk`)
+
+A storage server is not a NIC that answers: every request costs it a disk
+I/O before the reply can go. `--disk` puts that I/O into the test, at
+both ends of the round trip:
+
+```bash
+mx gen --servers servers.txt --pps 2000 --tx-size 128 --rx-size 8192 \
+    --disk replies
+mx run --for 60
+```
+
+| `--disk` | The requester | The responder | Shaped like |
+|---|---|---|---|
+| `replies` | writes every reply it gets back to its disk | reads every reply's payload from its disk, then sends it | a storage **read** |
+| `requests` | reads every request's payload from its disk, then sends it | writes every request to its disk, then answers | a storage **write** |
+| `both` | both of the above | both of the above | a mixed workload |
+
+The sizes decide how much each I/O moves: `--tx-size 128 --rx-size 8192
+--disk replies` is a small ask that makes the target read 8 KB, and
+`--tx-size 8192 --rx-size 64 --disk requests` is an 8 KB write
+acknowledged with 64 bytes. The 32-byte header is never on disk, so a
+header-only packet costs no I/O at all.
+
+**The I/O is real, and it reaches the device.** Each host gets one data
+file, `disk.dat` in `--remote-dir`, of real bytes: never a sparse file,
+since a hole reads back without touching the disk. The bytes are
+incompressible and every 4 KiB block is different, so a compressing or
+deduplicating filesystem can't shrink the work either. Reads and writes
+land at random 4 KiB-aligned offsets with `O_DIRECT`, so the page cache
+cannot absorb them. A payload under 4 KiB still costs a whole block,
+because `O_DIRECT` cannot move less. If a filesystem refuses `O_DIRECT`,
+the agent falls back to buffered I/O and drops each block from the page
+cache after use, and says so in its log. It also warns when the file is on
+`tmpfs`, which accepts `O_DIRECT` on recent kernels and is still memory.
+None of the data is checked; the point is that the disk did the work.
+
+**The order is a storage server's.** A request is on disk before it is
+acknowledged, and a reply is read before it is sent. So with `--disk`,
+**RTT includes the responder's disk time**, which is the round trip a
+storage client would see. The requester's own I/O stays out of it: a
+request is timestamped after its payload is read, and a reply is written
+to disk after its arrival is timed.
+
+**The file is prepared before the run, once.** `mx start` writes every
+host's file and waits for all of them before it starts any agent, so no
+host is still writing a gigabyte while its peers are already sending to it.
+Later runs find the file in place and reuse it. `--disk-size` sets the size
+(default `1G`; bigger spreads the random I/O over more of the disk). To test
+a particular disk, point `--remote-dir` at it, since the file lives there.
+`mx stop` leaves the file for the next run, and `mx clean` removes it with
+everything else.
+
+**What gets reported.** The `mx status` line shows each host's disk read
+and write rate, IOPS, and `busy`: the share of its time the busiest worker
+spent blocked on the disk. `mx summarize` adds the fleet's figures and a
+per-host `disk` column:
+
+```
+  DISK READ       31.0 MB/s       3.8k IOPS   avg 174us, worst host p99 1.2ms
+  DISK WRITE      30.9 MB/s       3.8k IOPS   avg 178us, worst host p99 1.2ms
+  DISK BUSY           63%   of the busiest worker's time, on beta
+            RTT includes the responder's disk read: the round trip a storage client would see
+```
+
+`mx check` and `mx gen` print the IOPS and MB/s each host's disk will be
+asked for. `mx export` adds `mx_disk_*` overlays, so a slow rack of disks
+shows on the floor plan.
+
+**Each worker is one I/O in flight.** A worker does its disk I/O inline,
+between packets, so a host's queue depth is its `--workers`. A worker
+waiting on its disk is not reading its sockets, which has two effects.
+First, a slow disk slows the whole host down, the way it would slow a
+real storage server. Second, loss and RTT on a disk-bound run include the
+disk's time. `mx summarize` watches for this. When workers spend most of
+their time blocked on the disk, its advice names the disk rather than the
+fabric, and tells you which lever to pull: more `--workers`, a faster disk,
+or a lower `--pps`. Running the same matrix without `--disk` separates the
+two.
+
+---
+
 ## The matrix file
 
 `mx gen` writes a plain grid CSV, and everything about the traffic lives
@@ -143,7 +225,9 @@ Edit it by hand for anything non-uniform:
 - **blank a cell** to remove that flow,
 - **change a cell** to give one pair its own rate,
 - write **`max`** in a cell to let that pair run unpaced,
-- change the `tx_size`/`rx_size`/`port` line to reshape the packets.
+- change the `tx_size`/`rx_size`/`port` line to reshape the packets,
+- add or change **`disk=replies`** (or `requests`, `both`) on that same
+  line to put the disks in the loop — see [Disks in the loop](#disks-in-the-loop---disk).
 
 Then `mx start` again — or `mx reload` if the fleet is already running
 and you want to keep it that way. Host tokens are `name[=addr[:port]]`,
@@ -172,7 +256,7 @@ it started, so reload compares the edit host by host:
 | What you edited | What restarts |
 |---|---|
 | one host's row — its rates, or a blanked flow | **that host only** |
-| the `tx_size`/`rx_size`/`port` header, or the rotation header | **every host** |
+| the `tx_size`/`rx_size`/`port`/`disk` header, or the rotation header | **every host** |
 | a host's address or port, or adding/removing/reordering hosts | **every host** |
 | nothing | **nothing** — reload says so and exits 0 |
 
@@ -483,8 +567,9 @@ such hosts (`FDS-TOO-LOW`, from `ulimit -Hn`) before you deploy.
 
 Everything the tool touches on a server lives in one directory
 (`/var/tmp/mx` by default, `--remote-dir` to change it): the agent file,
-the matrix, the log, the report. Nothing is installed, no package is
-added, no sysctl or qdisc is changed, no unit file is written.
+the matrix, the log, the report, and with `--disk` the data file. Nothing
+is installed, no package is added, no sysctl or qdisc is changed, no unit
+file is written.
 
 ```bash
 mx logs         # take the logs first if you want them
@@ -519,6 +604,11 @@ mx run --for 2000 && mx summarize --grid g   # coverage grid included
 
 # Size the rate from a bandwidth budget instead of a packet rate
 mx gen --servers servers.txt --gbps 10 --tx-size 1400
+
+# Storage-shaped: every request makes its target read 8 KB off disk, and
+# the requester writes what comes back to its own -- on a 4 GB file each
+mx gen --servers servers.txt --pps 2000 --tx-size 128 --rx-size 8192 --disk replies
+mx run --for 120 --disk-size 4G
 
 # Pin everything to one NIC (interface name or address, both work)
 mx start --bind eth1
@@ -586,7 +676,9 @@ Each agent appends one row per flow per interval to `report.csv`, which
 ```
 ts,host,dir,peer,size,rep_size,target_pps,pps,mbps,rep_pps,rep_mbps,
 loss_pct,rtt_avg_us,rtt_p50_us,rtt_p99_us,rtt_max_us,cpu_pct,cpu_max_pct,
-agent_cpu_pct,workers,layer
+agent_cpu_pct,workers,layer,disk_rd_iops,disk_rd_mb_s,disk_rd_avg_us,
+disk_rd_p99_us,disk_wr_iops,disk_wr_mb_s,disk_wr_avg_us,disk_wr_p99_us,
+disk_busy_pct
 ```
 
 `dir=tx` rows are this host as a client (requests it sent, replies it got
@@ -598,6 +690,13 @@ One row per peer per interval, whatever the worker count — the parent
 merges its workers' numbers before writing, so nothing downstream has to
 know how the host was sharded. It is a plain CSV; take it to whatever you
 normally plot with.
+
+The `disk_*` columns are filled on `dir=host` rows of a `--disk` run and
+blank everywhere else. Unlike the network columns' `mbps` (megabits),
+`disk_*_mb_s` is megabytes per second — the unit disks are quoted in — and
+counts what the device moved, in whole 4 KiB blocks under `O_DIRECT`.
+`disk_busy_pct` is the busiest worker's share of the interval spent
+blocked on the disk.
 
 On a layered run (`--dwell`) each `tx` row also carries its `layer`, and
 a switch leaves one *drain* row per finished flow: the replies that were
@@ -656,6 +755,8 @@ One sample per host per overlay, reduced over `--window` seconds:
 | `mx_rtt_avg` | mean latency over this host's flows, µs |
 | `mx_rtt_p50` `mx_rtt_p99` `mx_rtt_max` | latency, worst peer, µs |
 | `mx_cpu` `mx_cpu_core` `mx_agent_cpu` | the box, its busiest core, and the busiest agent worker as a share of one core |
+| `mx_disk_read_mbs` `mx_disk_write_mbs` `mx_disk_read_iops` `mx_disk_write_iops` | `--disk` runs: what this host's disk read and wrote |
+| `mx_disk_read_p99` `mx_disk_write_p99` `mx_disk_busy` | `--disk` runs: its disk latency, µs, and the busiest worker's share of time blocked on the disk |
 | `mx_peers` `mx_workers` `mx_intervals` | flows this host sends; agent workers; intervals it reported in the window |
 | `mx_state` | `REPORTING`; `SILENT` for a host that reported earlier but not inside the window; `NO-DATA` for one in the matrix that never reported at all |
 
