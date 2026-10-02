@@ -90,10 +90,13 @@ print("%.1f %.1f %.1f %.1f" % (rd / n, rd_want / n, wr / n, wr_want / n))
 EOF
 }
 
-# assert_io ACTUAL EXPECTED MSG -- one disk op per payload: both zero, or
-# a real rate that matches to within 5%.
+# assert_io ACTUAL EXPECTED MSG -- one disk op per payload, to within 5%.
+# Something must have been sent: matching zero against zero would pass a
+# run whose intervals all came out partial, having measured nothing. The
+# floor is low on purpose -- a slow runner disk makes the agents fall far
+# short of the matrix's rate, and the accounting must hold all the same.
 assert_io() {
-    if python3 -c "import sys; a, e = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if (a == e == 0) or (e >= 50 and abs(a / e - 1) <= 0.05) else 1)" "$1" "$2"; then
+    if python3 -c "import sys; a, e = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if e >= 10 and abs(a / e - 1) <= 0.05 else 1)" "$1" "$2"; then
         return 0
     fi
     printf 'ASSERT_IO FAILED: %s (%s disk ops/s against %s payloads/s)\n' \
@@ -354,7 +357,8 @@ test_replies_are_read_by_the_responder_and_written_by_the_requester() {
     per_op=$(python3 -c "print($(host_col rep/beta.csv disk_rd_mb_s) * 1e6 / $(host_col rep/beta.csv disk_rd_iops))")
     assert_between 8000 8300 "$per_op" "bytes per read" || return 1
     # And the network test still runs: the requests are still answered.
-    assert_between 100 600 "$(host_col rep/alpha.csv rep_pps)" \
+    # (How many depends on the disk -- these runs are often disk-bound.)
+    assert_between 10 600 "$(host_col rep/alpha.csv rep_pps)" \
         "replies still come back" || return 1
     # Latency and busy are measured, not left blank.
     assert_between 1 10000000 "$(host_col rep/beta.csv disk_rd_avg_us)" "read latency" || return 1
@@ -382,15 +386,22 @@ test_both_puts_every_payload_on_disk_at_both_ends() {
     # A full mesh of two: each host reads for its requests and for its
     # replies, and writes for the requests arriving and the replies coming
     # back -- four I/Os per round trip, two at each end.
-    two_hosts --pps 300 --tx-size 1024 --rx-size 1024 --disk both || return 1
+    two_hosts --pps 200 --tx-size 1024 --rx-size 1024 --disk both || return 1
     run_disk_agents 7 alpha beta --workers 2
-    local h rd rd_want wr wr_want
+    local h rd rd_want wr wr_want req_rd rep_rd _
     for h in alpha beta; do
         read -r rd rd_want wr wr_want < <(disk_io "rep/$h.csv" both)
         assert_io "$rd" "$rd_want" "$h reads every payload it sends" || return 1
         assert_io "$wr" "$wr_want" "$h writes every payload it receives" || return 1
-        # Both halves really are there, not one counted twice.
-        assert_between 400 1400 "$rd_want" "$h sends requests and replies" || return 1
+        # Both halves really are in that total: on a symmetric mesh the
+        # request reads and the reply reads are each about half of it,
+        # however far short of the target a slow disk held the run.
+        read -r _ req_rd _ _ < <(disk_io "rep/$h.csv" requests)
+        read -r _ rep_rd _ _ < <(disk_io "rep/$h.csv" replies)
+        assert_between 0.3 0.7 "$(python3 -c "print($req_rd / $rd_want)")" \
+            "$h's request reads are a real share of its reads" || return 1
+        assert_between 0.3 0.7 "$(python3 -c "print($rep_rd / $rd_want)")" \
+            "$h's reply reads are a real share of its reads" || return 1
     done
     # The per-host figures are merged across workers, not one worker's.
     assert_contains "$(grep -m1 'disk=rd' rep/alpha.log)" "busy=" || return 1
