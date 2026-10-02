@@ -55,6 +55,52 @@ print("%.3f" % (sum(vals) / len(vals)) if vals else "0")
 EOF
 }
 
+# disk_io FILE MODE -- "reads expected writes expected": the disk ops the
+# report's host rows counted, beside the ops its own packet rows say the
+# mode promises -- per --disk MODE, a read for every payload this host sent
+# and a write for every one it received. Compared interval by interval, so
+# how fast the runner's disk is (and so whether the agents kept up with
+# the matrix's target) does not enter into it: what is asserted is which
+# end does which I/O, per packet.
+disk_io() {
+    python3 - "$1" "$2" <<'EOF'
+import collections, csv, sys
+path, mode = sys.argv[1:3]
+reqs, reps = mode in ("requests", "both"), mode in ("replies", "both")
+host, pkt = {}, collections.defaultdict(lambda: collections.defaultdict(float))
+with open(path, newline="") as f:
+    for r in csv.DictReader(f):
+        if r["dir"] == "host":
+            host[r["ts"]] = r
+        elif r["dir"] in ("tx", "rx"):
+            for col in ("pps", "rep_pps"):
+                pkt[r["ts"]][r["dir"] + "_" + col] += float(r[col] or 0)
+rd = wr = rd_want = wr_want = 0.0
+for ts, r in host.items():
+    p = pkt[ts]
+    rd += float(r["disk_rd_iops"] or 0)
+    wr += float(r["disk_wr_iops"] or 0)
+    # Requests: the requester reads each one it sends, the responder
+    # writes each one that arrives. Replies: the responder reads each one
+    # it sends back, the requester writes each one that returns.
+    rd_want += reqs * p["tx_pps"] + reps * p["rx_rep_pps"]
+    wr_want += reqs * p["rx_pps"] + reps * p["tx_rep_pps"]
+n = max(1, len(host))
+print("%.1f %.1f %.1f %.1f" % (rd / n, rd_want / n, wr / n, wr_want / n))
+EOF
+}
+
+# assert_io ACTUAL EXPECTED MSG -- one disk op per payload: both zero, or
+# a real rate that matches to within 5%.
+assert_io() {
+    if python3 -c "import sys; a, e = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if (a == e == 0) or (e >= 50 and abs(a / e - 1) <= 0.05) else 1)" "$1" "$2"; then
+        return 0
+    fi
+    printf 'ASSERT_IO FAILED: %s (%s disk ops/s against %s payloads/s)\n' \
+        "$3" "$1" "$2" >&2
+    return 1
+}
+
 two_hosts() {
     local p; p=$(pick_port)
     write_servers "$p" alpha beta > /dev/null
@@ -174,6 +220,32 @@ EOF
     assert_contains "$RUN_OUT" "wrote 2.0 MiB" "a sparse file is rewritten" || return 1
 }
 
+test_a_small_filesystem_takes_a_file_that_fits() {
+    # The refusal keeps headroom in proportion to the filesystem, not a flat
+    # amount: a 64 MiB tmpfs (/dev/shm in a container) takes a 1 MiB file,
+    # and refuses one that would leave it all but full.
+    python3 - <<'EOF'
+import collections, contextlib, io, os, sys
+sys.path.insert(0, os.environ["REPO_ROOT"] + "/matrix_orchestrator")
+import mx
+vfs = collections.namedtuple("vfs", "f_bavail f_frsize")
+os.statvfs = lambda p: vfs(64 << 20 >> 12, 4096)
+with contextlib.redirect_stdout(io.StringIO()):
+    assert mx.disk_prepare("small.dat", 1 << 20), "a 1 MiB file was refused"
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err):
+        mx.disk_prepare("big.dat", 63 << 20)
+    raise AssertionError("a file filling the filesystem was accepted")
+except SystemExit as exc:
+    assert exc.code == 2, exc.code
+msg = err.getvalue()
+assert "63.0 MiB" in msg and "64.0 MiB free" in msg, msg
+assert not os.path.exists("big.dat"), "nothing is written when refused"
+EOF
+    assert_status 0 $? "headroom scales with the filesystem" || return 1
+}
+
 test_disk_size_is_validated() {
     run_mx agent --prepare-disk --disk-file d.dat --disk-size banana
     assert_status 2 "$RUN_RC" || return 1
@@ -262,7 +334,7 @@ test_replies_are_read_by_the_responder_and_written_by_the_requester() {
     # reply). An 8 KB reply is a two-block read and a two-block write.
     local p; p=$(pick_port)
     write_servers "$p" alpha beta > /dev/null
-    run_mx gen --servers servers.txt --pps 1000 --tx-size 128 --rx-size 8192 \
+    run_mx gen --servers servers.txt --pps 500 --tx-size 128 --rx-size 8192 \
         --disk replies
     awk -F, 'BEGIN{OFS=","} /^beta=/{$2=""} {print}' matrix.csv > m.new \
         && mv m.new matrix.csv
@@ -270,20 +342,19 @@ test_replies_are_read_by_the_responder_and_written_by_the_requester() {
     assert_contains "$(cat rep/alpha.log)" "disk=replies" "the banner says so" || return 1
     assert_contains "$(cat rep/alpha.log)" "disk: replies -- every reply's payload" || return 1
     assert_not_contains "$(cat rep/alpha.log rep/beta.log)" "failed" || return 1
-    assert_between 700 1300 "$(host_col rep/beta.csv disk_rd_iops)" \
-        "beta reads one reply per request it serves" || return 1
-    assert_between 0 0 "$(host_col rep/beta.csv disk_wr_iops)" \
-        "beta stores nothing: it sends no requests" || return 1
-    assert_between 700 1300 "$(host_col rep/alpha.csv disk_wr_iops)" \
-        "alpha writes every reply it gets back" || return 1
-    assert_between 0 0 "$(host_col rep/alpha.csv disk_rd_iops)" \
-        "alpha reads nothing: it serves no requests" || return 1
+    local rd rd_want wr wr_want
+    read -r rd rd_want wr wr_want < <(disk_io rep/beta.csv replies)
+    assert_io "$rd" "$rd_want" "beta reads one reply per request it serves" || return 1
+    assert_eq "0.0" "$wr" "beta writes nothing: it sends no requests" || return 1
+    read -r rd rd_want wr wr_want < <(disk_io rep/alpha.csv replies)
+    assert_io "$wr" "$wr_want" "alpha writes every reply it gets back" || return 1
+    assert_eq "0.0" "$rd" "alpha reads nothing: it serves no requests" || return 1
     # Two blocks per op, whether direct (exactly 8192) or buffered (8160).
     local per_op
     per_op=$(python3 -c "print($(host_col rep/beta.csv disk_rd_mb_s) * 1e6 / $(host_col rep/beta.csv disk_rd_iops))")
     assert_between 8000 8300 "$per_op" "bytes per read" || return 1
     # And the network test still runs: the requests are still answered.
-    assert_between 700 1300 "$(host_col rep/alpha.csv rep_pps)" \
+    assert_between 100 600 "$(host_col rep/alpha.csv rep_pps)" \
         "replies still come back" || return 1
     # Latency and busy are measured, not left blank.
     assert_between 1 10000000 "$(host_col rep/beta.csv disk_rd_avg_us)" "read latency" || return 1
@@ -293,27 +364,34 @@ test_replies_are_read_by_the_responder_and_written_by_the_requester() {
 test_requests_are_read_by_the_requester_and_written_by_the_responder() {
     local p; p=$(pick_port)
     write_servers "$p" alpha beta > /dev/null
-    run_mx gen --servers servers.txt --pps 1000 --tx-size 4096 --rx-size 64 \
+    run_mx gen --servers servers.txt --pps 500 --tx-size 4096 --rx-size 64 \
         --disk requests
     awk -F, 'BEGIN{OFS=","} /^beta=/{$2=""} {print}' matrix.csv > m.new \
         && mv m.new matrix.csv
     run_disk_agents 7 alpha beta
-    assert_between 700 1300 "$(host_col rep/alpha.csv disk_rd_iops)" \
-        "alpha reads every request it sends" || return 1
-    assert_between 700 1300 "$(host_col rep/beta.csv disk_wr_iops)" \
-        "beta writes every request before answering" || return 1
-    assert_between 0 0 "$(host_col rep/alpha.csv disk_wr_iops)" || return 1
-    assert_between 0 0 "$(host_col rep/beta.csv disk_rd_iops)" || return 1
+    local rd rd_want wr wr_want
+    read -r rd rd_want wr wr_want < <(disk_io rep/alpha.csv requests)
+    assert_io "$rd" "$rd_want" "alpha reads every request it sends" || return 1
+    assert_eq "0.0" "$wr" "alpha writes nothing: nothing is sent to it" || return 1
+    read -r rd rd_want wr wr_want < <(disk_io rep/beta.csv requests)
+    assert_io "$wr" "$wr_want" "beta writes every request before answering" || return 1
+    assert_eq "0.0" "$rd" "beta reads nothing: its replies are header-only" || return 1
 }
 
 test_both_puts_every_payload_on_disk_at_both_ends() {
-    # A full mesh of two: each host sends 1000 and serves 1000, so with both
-    # directions on disk it reads 2000 (its requests + its replies) and
-    # writes 2000 (requests arriving + replies coming back).
-    two_hosts --pps 1000 --tx-size 1024 --rx-size 1024 --disk both || return 1
+    # A full mesh of two: each host reads for its requests and for its
+    # replies, and writes for the requests arriving and the replies coming
+    # back -- four I/Os per round trip, two at each end.
+    two_hosts --pps 300 --tx-size 1024 --rx-size 1024 --disk both || return 1
     run_disk_agents 7 alpha beta --workers 2
-    assert_between 1500 2500 "$(host_col rep/alpha.csv disk_rd_iops)" || return 1
-    assert_between 1500 2500 "$(host_col rep/alpha.csv disk_wr_iops)" || return 1
+    local h rd rd_want wr wr_want
+    for h in alpha beta; do
+        read -r rd rd_want wr wr_want < <(disk_io "rep/$h.csv" both)
+        assert_io "$rd" "$rd_want" "$h reads every payload it sends" || return 1
+        assert_io "$wr" "$wr_want" "$h writes every payload it receives" || return 1
+        # Both halves really are there, not one counted twice.
+        assert_between 400 1400 "$rd_want" "$h sends requests and replies" || return 1
+    done
     # The per-host figures are merged across workers, not one worker's.
     assert_contains "$(grep -m1 'disk=rd' rep/alpha.log)" "busy=" || return 1
 }
@@ -486,6 +564,7 @@ run_test test_header_only_payloads_are_called_out
 run_test test_check_sizes_every_hosts_disk
 run_test test_fingerprint_is_unchanged_without_disk
 run_test test_prepare_disk_writes_real_data_once_and_reuses_it
+run_test test_a_small_filesystem_takes_a_file_that_fits
 run_test test_disk_size_is_validated
 run_test test_buffered_fallback_still_does_the_io
 run_test test_memory_filesystem_is_called_out

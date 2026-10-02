@@ -752,9 +752,13 @@ def disk_prepare(path, size):
     try:
         vfs = os.statvfs(where)
         free = vfs.f_bavail * vfs.f_frsize + (st.st_size if st else 0)
-        if size + (64 << 20) > free:
-            die("disk: %s needs %s but only %s is free on %s -- lower "
-                "--disk-size, or point --remote-dir at a bigger disk"
+        # Leave a twentieth of what was free, so a file that fits never
+        # fills the filesystem it lands on. In proportion, not a flat
+        # amount: a container's 64 MiB /dev/shm must still take a 1 MiB file.
+        if size > free * 0.95:
+            die("disk: %s needs %s, and leaving 5%% spare that is more than "
+                "the %s free on %s -- lower --disk-size, or point "
+                "--remote-dir at a bigger disk"
                 % (path, fmt_size(size), fmt_size(max(0, free)), where))
     except (OSError, AttributeError):
         pass
