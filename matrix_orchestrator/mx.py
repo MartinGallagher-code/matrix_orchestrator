@@ -33,6 +33,12 @@ Traffic is UDP, deliberately: "a request of X bytes gets a reply of Y
 bytes" is a statement about packets, and only a datagram protocol keeps
 that promise on the wire. For TCP throughput sweeps use iperf_orchestrator.
 
+`mx gen --disk replies` puts a disk at each end of the round trip: the
+responder reads every reply's payload from a real file on its disk, and
+the requester writes what comes back to its own. `--disk requests` turns
+it around and `--disk both` does both, so the run measures the network
+and the disks it feeds in the same packets.
+
 Python 3.6+, standard library only, on the orchestrator and on every host.
 """
 
@@ -40,6 +46,7 @@ import argparse
 import csv
 import hashlib
 import json
+import mmap
 import multiprocessing
 import os
 import random
@@ -56,7 +63,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -108,7 +115,42 @@ MATRIX_NAME = "matrix.csv"          # name the matrix always takes on a host
 ZEROS = b"\0" * MAX_SIZE
 
 CONFIG_KEYS = ("tx_size", "rx_size", "port", "peers", "seed", "layers",
-               "dwell", "fill")
+               "dwell", "fill", "disk")
+
+# ---------------------------------------------------------------------------
+# Disk in the loop (`mx gen --disk MODE`)
+# ---------------------------------------------------------------------------
+#
+# Which payloads travel disk to disk. "replies" is a storage read: the
+# responder reads the reply's payload from its disk and the requester writes
+# what arrives to its own. "requests" is a storage write: the requester reads
+# the request's payload from its disk and the responder writes it before it
+# answers. "both" does both. The 32-byte header is never on disk -- it is
+# made fresh per packet -- so a 32-byte packet carries no disk work at all.
+DISK_MODES = ("off", "requests", "replies", "both")
+DISK_SENTENCE = {
+    "requests": "every request's payload is read from the requester's disk "
+                "and written to the responder's",
+    "replies": "every reply's payload is read from the responder's disk "
+               "and written to the requester's",
+    "both": "every payload is read from its sender's disk and written to "
+            "its receiver's",
+}
+DISK_NAME = "disk.dat"              # the data file, in the agent's directory
+DEFAULT_DISK_SIZE = "1G"
+MIN_DISK_SIZE = 1 << 20
+# O_DIRECT moves whole, aligned blocks: 4 KiB satisfies every logical block
+# size in use (512e and 4Kn alike), so offsets, lengths and the memory they
+# land in are all multiples of it.
+DISK_BLOCK = 4096
+# How long one pass of a worker's event loop may spend blocked on the disk
+# before it goes back to its sockets and its report schedule. Without it, one
+# poll's batch of 512 reads on a slow disk is seconds the worker cannot see
+# its sockets or its report tick.
+DISK_SLICE = 0.05
+# A big file on a slow disk takes a while to write once; scale the ssh
+# timeout to that rather than to a shell one-liner.
+DISK_PREP_TIMEOUT = 3600
 
 _PADS = {}
 
@@ -159,7 +201,7 @@ class Matrix(object):
     """Host list, endpoints, per-pair target rates and the run config."""
 
     def __init__(self, path, hosts, addrs, ports, rates, tx_size, rx_size, port,
-                 layering=None):
+                 layering=None, disk="off"):
         self.path = path
         self.hosts = hosts                  # ordered names; index == matrix row
         self.addrs = addrs                  # name -> address
@@ -169,7 +211,20 @@ class Matrix(object):
         self.rx_size = rx_size
         self.port = port
         self.layering = layering            # None, or the rotation schedule
+        self.disk = disk                    # one of DISK_MODES
         self.index = {h: i for i, h in enumerate(hosts)}
+
+    @property
+    def disk_requests(self):
+        """Request payloads go disk to disk: read by the requester, written
+        by the responder before it answers."""
+        return self.disk in ("requests", "both")
+
+    @property
+    def disk_replies(self):
+        """Reply payloads go disk to disk: read by the responder, written by
+        the requester when they arrive."""
+        return self.disk in ("replies", "both")
 
     def peers_of(self, host):
         """[(peer, pps)] for every flow this host sends, in matrix order."""
@@ -263,6 +318,10 @@ def load_matrix(path):
     port = _int("port", DEFAULT_PORT)
     tx_size = check_size("tx_size", _int("tx_size", 64))
     rx_size = check_size("rx_size", _int("rx_size", 64))
+    disk = cfg.get("disk", "off").strip().lower()
+    if disk not in DISK_MODES:
+        die("%s: bad disk=%r in the config header (want one of: %s)"
+            % (path, cfg["disk"], ", ".join(DISK_MODES)))
 
     hosts, addrs, ports = [], {}, {}
     for tok in rows[0][1:]:
@@ -314,20 +373,28 @@ def load_matrix(path):
         layering = Layering(peers, layers, dwell, seed,
                             fill=bool(_int("fill", 0)))
     return Matrix(path, hosts, addrs, ports, rates, tx_size, rx_size, port,
-                  layering)
+                  layering, disk)
 
 
 def write_matrix(path, tokens, cell_for, tx_size, rx_size, port,
-                 extra_comment=""):
+                 extra_comment="", disk="off"):
     """Write a matrix CSV with the run config in its header comment."""
     names = [parse_token(t)[0] for t in tokens]
     out = sys.stdout if path == "-" else open(path, "w", newline="")
     try:
         out.write("# mx matrix v%s -- rows send, columns receive, cells are packets/sec\n"
                   % VERSION.split(".")[0])
-        out.write("# tx_size=%d rx_size=%d port=%d\n" % (tx_size, rx_size, port))
+        # disk= rides the same line as the sizes: it is the same kind of
+        # fact, about what every request and reply is, and editing it by
+        # hand is how a run is switched between the network alone and the
+        # network with a disk at each end.
+        out.write("# tx_size=%d rx_size=%d port=%d%s\n"
+                  % (tx_size, rx_size, port,
+                     "" if disk == "off" else " disk=%s" % disk))
         out.write("# every request of %d bytes is answered with a reply of %d bytes\n"
                   % (tx_size, rx_size))
+        if disk != "off":
+            out.write("# %s\n" % DISK_SENTENCE[disk])
         if extra_comment:
             out.write(extra_comment)
         w = csv.writer(out)
@@ -396,6 +463,87 @@ def fmt_us(us):
 
 def pct(part, whole):
     return (part / whole * 100.0) if whole else 0.0
+
+
+def fmt_bytes_rate(bps):
+    """Bytes/sec for humans, in the decimal units disks are quoted in."""
+    if bps >= 1e9:
+        return "%.2f GB/s" % (bps / 1e9)
+    if bps >= 1e6:
+        return "%.1f MB/s" % (bps / 1e6)
+    return "%.0f kB/s" % (bps / 1e3)
+
+
+def fmt_count(n):
+    """An operation rate: '850', '12.3k', '1.20M'."""
+    if n >= 1e6:
+        return "%.2fM" % (n / 1e6)
+    if n >= 1e3:
+        return "%.1fk" % (n / 1e3)
+    return "%.0f" % n
+
+
+def fmt_size(nbytes):
+    """A file size, in the binary units `--disk-size` takes."""
+    for unit, shift in (("TiB", 40), ("GiB", 30), ("MiB", 20), ("KiB", 10)):
+        if nbytes >= 1 << shift:
+            return "%.1f %s" % (nbytes / float(1 << shift), unit)
+    return "%d bytes" % nbytes
+
+
+def resolve_disk_size(spec):
+    """--disk-size: '1G', '512M', '4096K' or plain bytes, binary units.
+    Rounded down to whole blocks, because O_DIRECT reads whole blocks."""
+    text = str(spec).strip().upper()
+    for suffix in ("IB", "B"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[:-len(suffix)]
+            break
+    shift = {"K": 10, "M": 20, "G": 30, "T": 40}.get(text[-1:], 0)
+    if shift:
+        text = text[:-1]
+    try:
+        size = int(float(text) * (1 << shift))
+    except ValueError:
+        die("--disk-size wants a size like 1G, 512M or 4096K (got %r)" % spec)
+    size -= size % DISK_BLOCK
+    if size < MIN_DISK_SIZE:
+        die("--disk-size must be at least %s (got %r): reads and writes land "
+            "at random offsets, and a file that small is one the disk's own "
+            "cache holds whole" % (fmt_size(MIN_DISK_SIZE), spec))
+    return size
+
+
+def disk_span(size):
+    """Bytes the disk moves for a packet of `size`: the payload after the
+    header, rounded up to whole blocks -- O_DIRECT cannot move less. A
+    header-only packet carries nothing, so it costs no I/O at all."""
+    payload = size - HDR_SIZE
+    if payload <= 0:
+        return 0
+    return -(-payload // DISK_BLOCK) * DISK_BLOCK
+
+
+def disk_load(m, out_pps, in_pps):
+    """What one host's disk is asked for, from its request rates in each
+    direction: (read ops/s, read bytes/s, write ops/s, write bytes/s).
+
+    `out_pps` is requests this host sends (and replies it gets back);
+    `in_pps` is requests it receives (and replies it owes).
+    """
+    rd_ops = rd_b = wr_ops = wr_b = 0.0
+    req, rep = disk_span(m.tx_size), disk_span(m.rx_size)
+    if m.disk_requests and req:
+        rd_ops += out_pps               # requester reads what it sends
+        rd_b += out_pps * req
+        wr_ops += in_pps                # responder writes what arrives
+        wr_b += in_pps * req
+    if m.disk_replies and rep:
+        rd_ops += in_pps                # responder reads what it answers
+        rd_b += in_pps * rep
+        wr_ops += out_pps               # requester writes what comes back
+        wr_b += out_pps * rep
+    return rd_ops, rd_b, wr_ops, wr_b
 
 
 def wire_bps(pps, size):
@@ -550,6 +698,301 @@ def read_self_cpu():
 
 
 # ---------------------------------------------------------------------------
+# Disk: the file a --disk run reads its payloads from and writes them to
+#
+# One file per host, prepared once and reused by later runs: real bytes,
+# never a sparse file (a hole reads back as zeros without touching the
+# disk), and incompressible, so a compressing filesystem cannot shrink the
+# reads to nothing. Every 4 KiB block also carries its own index, so a
+# deduplicating one finds no two blocks alike.
+#
+# Reads and writes land at random block-aligned offsets with O_DIRECT, so
+# the page cache cannot absorb them: every one is a real request to the
+# device. Where a filesystem refuses O_DIRECT (older tmpfs, some FUSE and
+# network filesystems) the agent falls back to buffered I/O and drops each
+# block from the page cache once it is done with it -- and says so in its
+# log, as it does when the file is on a filesystem that is really memory.
+#
+# The data is not checked and not meant to be: what lands on disk is
+# whatever the packet carried. The point is that the disk did the work.
+# ---------------------------------------------------------------------------
+
+def _disk_cache_drop(fd, offset=0, length=0):
+    """Ask the kernel to forget these pages (and start writing back any that
+    are dirty). Silently a no-op where posix_fadvise does not exist."""
+    advise = getattr(os, "posix_fadvise", None)
+    if advise is None:
+        return False
+    try:
+        advise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+        return True
+    except OSError:
+        return False
+
+
+def disk_prepare(path, size):
+    """Make `path` a `size`-byte file of real, incompressible data, unless it
+    already is one. Returns True if it wrote the file, False if it reused it.
+
+    Written under a temporary name and renamed into place, so a run that is
+    interrupted never leaves behind a short file that a later one trusts.
+    """
+    try:
+        st = os.stat(path)
+        # Allocated, not merely sized: a truncated (sparse) file of the
+        # right length would read back holes, which cost the disk nothing.
+        blocks = getattr(st, "st_blocks", None)
+        if st.st_size == size and (blocks is None or blocks * 512 >= size // 2):
+            log("disk: reusing %s (%s, already prepared)" % (path, fmt_size(size)))
+            return False
+    except OSError:
+        st = None
+    where = os.path.dirname(os.path.abspath(path))
+    os.makedirs(where, exist_ok=True)
+    try:
+        vfs = os.statvfs(where)
+        free = vfs.f_bavail * vfs.f_frsize + (st.st_size if st else 0)
+        # Leave a twentieth of what was free, so a file that fits never
+        # fills the filesystem it lands on. In proportion, not a flat
+        # amount: a container's 64 MiB /dev/shm must still take a 1 MiB file.
+        if size > free * 0.95:
+            die("disk: %s needs %s, and leaving 5%% spare that is more than "
+                "the %s free on %s -- lower --disk-size, or point "
+                "--remote-dir at a bigger disk"
+                % (path, fmt_size(size), fmt_size(max(0, free)), where))
+    except (OSError, AttributeError):
+        pass
+
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    began = time.monotonic()
+    chunk = bytearray(os.urandom(1 << 20))
+    per_chunk = len(chunk) // DISK_BLOCK
+    view = memoryview(chunk)
+    try:
+        with open(tmp, "wb") as f:
+            written = block = 0
+            while written < size:
+                for i in range(per_chunk):
+                    struct.pack_into("!Q", chunk, i * DISK_BLOCK, block + i)
+                block += per_chunk
+                n = min(len(chunk), size - written)
+                f.write(view[:n])
+                written += n
+            f.flush()
+            os.fsync(f.fileno())
+            # Written through the page cache, so evict it: the run's first
+            # reads should find the disk, not the memory the prep left warm.
+            _disk_cache_drop(f.fileno())
+        os.rename(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    took = max(time.monotonic() - began, 1e-3)
+    log("disk: wrote %s to %s in %.1fs (%s sequential); later runs reuse it"
+        % (fmt_size(size), path, took, fmt_bytes_rate(size / took)))
+    return True
+
+
+# Filesystems that keep their files in memory: O_DIRECT may well work on
+# them (tmpfs takes it on recent kernels), and there is still no disk.
+MEMORY_FILESYSTEMS = ("tmpfs", "ramfs", "devtmpfs", "hugetlbfs")
+
+
+def disk_fs_type(path):
+    """The type of the filesystem holding `path` ('ext4', 'tmpfs', ...),
+    from the longest matching mount point, or None where /proc is absent."""
+    try:
+        with open("/proc/self/mounts") as f:
+            mounts = [line.split() for line in f]
+    except OSError:
+        return None
+    real = os.path.realpath(path)
+    best, kind = "", None
+    for fields in mounts:
+        if len(fields) < 3:
+            continue
+        point = fields[1].replace("\\040", " ")
+        inside = real == point or real.startswith(point.rstrip("/") + "/")
+        if inside and len(point) >= len(best):
+            best, kind = point, fields[2]
+    return kind
+
+
+def disk_probe(path):
+    """Can this file be read and written with O_DIRECT? Returns
+    (True, "") or (False, the reason in words).
+
+    Opening is not enough to know: some filesystems accept the flag and
+    refuse the first I/O, so one block is read and written back."""
+    flag = getattr(os, "O_DIRECT", 0)
+    if not flag:
+        return False, "O_DIRECT does not exist on this platform"
+    buf = mmap.mmap(-1, DISK_BLOCK)
+    try:
+        try:
+            fd = os.open(path, os.O_RDWR | flag)
+        except OSError as exc:
+            return False, "this filesystem refuses O_DIRECT (%s)" % exc.strerror
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.readv(fd, [buf])
+            os.pwrite(fd, buf, 0)
+        except OSError as exc:
+            return False, "O_DIRECT I/O failed here (%s)" % exc.strerror
+        finally:
+            os.close(fd)
+    finally:
+        buf.close()
+    return True, ""
+
+
+class DiskIO(object):
+    """One worker's handle on the disk file: payload-sized reads and writes
+    at random block-aligned offsets, every one of them timed.
+
+    Opened in the worker, after the fork, so no two workers share a file
+    offset (reads seek then read) or a buffer. Counters are plain integers
+    for the same reason the flows' are: one process owns them.
+    """
+
+    def __init__(self, path, size, direct):
+        self.path = path
+        self.size = size
+        self.blocks = size // DISK_BLOCK
+        self.direct = False
+        self.evict = False
+        self.fd = None
+        self.rd_ops = self.rd_bytes = 0
+        self.wr_ops = self.wr_bytes = 0
+        self.rd_time = self.wr_time = 0.0
+        self.rd_hist = [0] * RTT_NBUCKETS
+        self.wr_hist = [0] * RTT_NBUCKETS
+        self.errors = 0
+        self.first_error = None
+        self._rng = random.Random()
+        # Anonymous mappings are page-aligned, which is what O_DIRECT wants
+        # of the memory as well as of the offsets and lengths.
+        span = disk_span(MAX_SIZE)
+        self._rbuf = mmap.mmap(-1, span)
+        self._wbuf = mmap.mmap(-1, span)
+        self._rview = memoryview(self._rbuf)
+        self._wview = memoryview(self._wbuf)
+        self._open(direct)
+
+    def _open(self, direct):
+        if direct:
+            try:
+                self.fd = os.open(self.path, os.O_RDWR | os.O_DIRECT)
+                self.direct = True
+                return
+            except (OSError, AttributeError):
+                pass
+        self.fd = os.open(self.path, os.O_RDWR)
+        advise = getattr(os, "posix_fadvise", None)
+        if advise is not None:
+            try:
+                # No readahead: a random read should fetch its own block,
+                # not warm the cache for blocks nobody asked for.
+                advise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
+                self.evict = True
+            except OSError:
+                pass
+
+    def mode(self):
+        if self.direct:
+            return "O_DIRECT"
+        if self.evict:
+            return "buffered, each block dropped from the page cache after use"
+        return "buffered (the page cache may absorb some of it)"
+
+    def _offset(self, span):
+        return int(self._rng.random() * (self.blocks - span // DISK_BLOCK + 1)) \
+            * DISK_BLOCK
+
+    def _failed(self, exc):
+        self.errors += 1
+        if self.first_error is None:
+            self.first_error = str(exc)
+
+    def read(self, n):
+        """`n` bytes of payload from a random block, or None if the read
+        failed (the packet then goes out with zeros, and the error is
+        counted rather than stopping the network test)."""
+        span = -(-n // DISK_BLOCK) * DISK_BLOCK if self.direct else n
+        off = self._offset(-(-n // DISK_BLOCK) * DISK_BLOCK)
+        began = time.monotonic()
+        try:
+            if self.direct:
+                os.lseek(self.fd, off, os.SEEK_SET)
+                os.readv(self.fd, [self._rview[:span]])
+                data = self._rview[:n]
+            else:
+                data = os.pread(self.fd, n, off)
+                if self.evict:
+                    _disk_cache_drop(self.fd, off, n)
+        except OSError as exc:
+            self._failed(exc)
+            return None
+        took = time.monotonic() - began
+        self.rd_ops += 1
+        self.rd_bytes += span
+        self.rd_time += took
+        self.rd_hist[rtt_bucket(int(took * 1e6))] += 1
+        return data
+
+    def write(self, packet):
+        """Write a packet's payload (everything after the header) to a
+        random block. Returns False if the write failed."""
+        n = len(packet) - HDR_SIZE
+        if n <= 0:
+            return True
+        span = -(-n // DISK_BLOCK) * DISK_BLOCK
+        off = self._offset(span)
+        began = time.monotonic()
+        try:
+            if self.direct:
+                # Through the aligned buffer: a received packet's own memory
+                # is wherever the allocator put it. The block's tail past
+                # the payload is whatever the last write left there.
+                self._wview[:n] = memoryview(packet)[HDR_SIZE:]
+                os.pwrite(self.fd, self._wview[:span], off)
+            else:
+                span = n
+                os.pwrite(self.fd, memoryview(packet)[HDR_SIZE:], off)
+                if self.evict:
+                    # Dirty pages are not dropped, but this starts their
+                    # writeback now rather than whenever the kernel gets to it.
+                    _disk_cache_drop(self.fd, off, n)
+        except OSError as exc:
+            self._failed(exc)
+            return False
+        took = time.monotonic() - began
+        self.wr_ops += 1
+        self.wr_bytes += span
+        self.wr_time += took
+        self.wr_hist[rtt_bucket(int(took * 1e6))] += 1
+        return True
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        try:
+            for v in (self._rview, self._wview):
+                v.release()
+            for b in (self._rbuf, self._wbuf):
+                b.close()
+        except (BufferError, ValueError):
+            pass            # a view still alive; the process is ending anyway
+
+
+# ---------------------------------------------------------------------------
 # Agent: worker processes
 #
 # Packet rate here is CPU work, and CPU work in Python means one process
@@ -643,12 +1086,13 @@ class Flow(object):
 class WorkerStats(object):
     """What one worker hands the parent at the end of an interval."""
 
-    def __init__(self, wid, ts, flows, srv, cpu_pct):
+    def __init__(self, wid, ts, flows, srv, cpu_pct, disk=None):
         self.wid = wid
         self.ts = ts
         self.flows = flows      # list of per-flow dicts
         self.srv = srv          # list of per-peer server dicts
         self.cpu_pct = cpu_pct  # this worker's CPU, as a share of one core
+        self.disk = disk        # this worker's disk work, or None (no --disk)
 
 
 class WorkerView(object):
@@ -685,6 +1129,25 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
     pad = pad_for(tx_size)
     pack, unpack = HDR.pack, HDR.unpack_from
     monotonic = time.monotonic
+
+    # Disk in the loop. Four independent jobs, by which end of which payload
+    # this worker is on; a header-only packet has no payload and costs none.
+    disk = None
+    req_read = req_write = rep_read = rep_write = False
+    dcfg = cfg.get("disk")
+    if dcfg:
+        disk = DiskIO(dcfg["path"], dcfg["size"], dcfg["direct"])
+        if dcfg["direct"] and not disk.direct:
+            sys.stderr.write("mx agent: worker %d could not open %s with "
+                             "O_DIRECT; it is using %s\n"
+                             % (wid, dcfg["path"], disk.mode()))
+            sys.stderr.flush()
+        req_read = req_write = dcfg["requests"] and tx_size > HDR_SIZE
+        rep_read = rep_write = dcfg["replies"]
+    req_payload = tx_size - HDR_SIZE
+    disk_read = disk.read if disk else None
+    disk_write = disk.write if disk else None
+    slice_end = 0.0
 
     sel = selectors.DefaultSelector()
 
@@ -781,6 +1244,8 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
 
         # ---- send whatever the token buckets allow ----
         next_due = now + 0.05
+        if req_read:
+            slice_end = now + DISK_SLICE
         for fl in flows:
             if fl.paced:
                 fl.tokens = min(fl.tokens + (now - fl.last) * fl.target_pps,
@@ -801,16 +1266,33 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                 next_due = now
             sendto, dest = fl.sock.sendto, fl.dest
             seq, sent, sent_b = fl.seq, 0, 0
+            starved = False
             for _ in range(batch):
+                body = pad
+                if req_read:
+                    # Out of disk time for this pass: the rest of the batch
+                    # waits for the next one, and its tokens go back in the
+                    # bucket below -- a flow the disk cannot feed falls
+                    # behind its target, which is the honest reading.
+                    if monotonic() > slice_end:
+                        starved = True
+                        break
+                    got = disk_read(req_payload)
+                    if got is not None:
+                        body = got
                 seq += 1
+                # Stamped after the payload is read: the round trip starts
+                # when the request leaves, not while this host reads it.
                 try:
                     sendto(pack(MAGIC, KIND_REQ, 0, my_index, tx_size, rx_size,
-                                seq, int(monotonic() * 1e6)) + pad, dest)
+                                seq, int(monotonic() * 1e6)) + body, dest)
                 except OSError:
                     fl.errors += 1
                     break
                 sent += 1
                 sent_b += tx_size
+            if starved and fl.paced:
+                fl.tokens += batch - sent
             fl.seq = seq
             fl.tx_pkts += sent
             fl.tx_bytes += sent_b
@@ -828,13 +1310,20 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
         except OSError:
             events = []
 
+        if disk is not None:
+            slice_end = monotonic() + DISK_SLICE
         for key, _mask in events:
             fl = key.data
             if fl is None:
                 # Responder socket: answer every request with a reply of
                 # the size the request asked for.
                 recvfrom, sendto = key.fileobj.recvfrom, key.fileobj.sendto
+                srv_disk = req_write or rep_read
                 for _ in range(MAX_DRAIN):
+                    # Whatever is left waits in the socket buffer for the
+                    # next pass rather than holding up everything else.
+                    if srv_disk and monotonic() > slice_end:
+                        break
                     try:
                         data, peer = recvfrom(MAX_SIZE)
                     except OSError:
@@ -855,6 +1344,17 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                     rpad = pads.get(rsize)
                     if rpad is None:
                         rpad = pads[rsize] = pad_for(rsize)
+                    # A storage server's order: what was sent is on disk
+                    # before it is acknowledged, and what was asked for is
+                    # read before it is answered -- so the client's round
+                    # trip includes this host's disk time, as a real one
+                    # would.
+                    if req_write:
+                        disk_write(data)
+                    if rep_read and rsize > HDR_SIZE:
+                        got = disk_read(rsize - HDR_SIZE)
+                        if got is not None:
+                            rpad = got
                     # t_send is echoed untouched, so the client measures
                     # its own round trip with no clock sync between us.
                     try:
@@ -868,6 +1368,8 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                 recv = fl.sock.recv
                 hist = fl.rtt_hist
                 for _ in range(MAX_DRAIN):
+                    if rep_write and monotonic() > slice_end:
+                        break
                     try:
                         data = recv(MAX_SIZE)
                     except OSError:
@@ -886,6 +1388,10 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                         if rtt > fl.rtt_max:
                             fl.rtt_max = rtt
                         hist[rtt_bucket(rtt)] += 1
+                    # After the clock is read: the round trip ends when the
+                    # reply lands, and storing it is this host's own work.
+                    if rep_write:
+                        disk_write(data)
 
         # ---- report ----
         now = monotonic()
@@ -900,7 +1406,7 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
             # to the layer that just ended, and this is where they land.
             drains = [fl for _dl, fls in draining for fl in fls]
             stats = _collect(wid, flows + drains, srv_counts, view, me, prev,
-                             elapsed, cpu_pct)
+                             elapsed, cpu_pct, disk)
             try:
                 queue.put(stats, block=False)
             except Exception:                     # noqa: BLE001 - full queue
@@ -951,6 +1457,13 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
         except OSError:
             pass
     sel.close()
+    if disk is not None:
+        if disk.errors:
+            sys.stderr.write("mx agent: worker %d: %d disk operation(s) failed "
+                             "on %s, the first with: %s\n"
+                             % (wid, disk.errors, disk.path, disk.first_error))
+            sys.stderr.flush()
+        disk.close()
 
 
 def _forget_flow(prev, key):
@@ -963,7 +1476,34 @@ def _forget_flow(prev, key):
         prev.pop(("h", key, i), None)
 
 
-def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct):
+def _collect_disk(disk, prev, elapsed):
+    """This worker's disk work over the interval, as raw deltas: the parent
+    sums the counts across workers and needs each worker's own elapsed time
+    to say how much of it that worker spent blocked on the disk."""
+    if disk is None:
+        return None
+    out = {"elapsed": elapsed}
+    for side in ("rd", "wr"):
+        now = {"ops": getattr(disk, side + "_ops"),
+               "bytes": getattr(disk, side + "_bytes"),
+               "time": getattr(disk, side + "_time")}
+        d = {}
+        for k, v in now.items():
+            d[k] = v - prev.get(("disk", side, k), 0)
+            prev[("disk", side, k)] = v
+        hist = getattr(disk, side + "_hist")
+        d["hist"] = [n - prev.get(("disk", side, i), 0)
+                     for i, n in enumerate(hist)]
+        for i, n in enumerate(hist):
+            prev[("disk", side, i)] = n
+        out[side] = d
+    out["errors"] = disk.errors - prev.get(("disk", "errors"), 0)
+    prev[("disk", "errors")] = disk.errors
+    return out
+
+
+def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct,
+             disk=None):
     """Turn this worker's raw counters into one interval's finished rates."""
     def delta(key, value):
         was = prev.get(key, 0)
@@ -1027,17 +1567,28 @@ def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct):
             "rep_pps": d_rep / elapsed,
             "rep_mbps": d_repb * 8.0 / elapsed / 1e6,
         })
-    return WorkerStats(wid, int(time.time()), frows, srows, cpu_pct)
+    return WorkerStats(wid, int(time.time()), frows, srows, cpu_pct,
+                       _collect_disk(disk, prev, elapsed))
 
 
 # ---------------------------------------------------------------------------
 # Agent: reporting (the parent process)
 # ---------------------------------------------------------------------------
 
+# The disk columns ride the host row only, and stay blank without --disk:
+# what a host's disk did is a property of the host, not of any one flow.
+# MB/s here is megaBYTES -- the unit disks are quoted in -- where the
+# network columns' mbps are megabits, the unit links are.
+DISK_FIELDS = ["disk_rd_iops", "disk_rd_mb_s", "disk_rd_avg_us",
+               "disk_rd_p99_us", "disk_wr_iops", "disk_wr_mb_s",
+               "disk_wr_avg_us", "disk_wr_p99_us", "disk_busy_pct"]
+
 REPORT_FIELDS = ["ts", "host", "dir", "peer", "size", "rep_size", "target_pps",
                  "pps", "mbps", "rep_pps", "rep_mbps", "loss_pct",
                  "rtt_avg_us", "rtt_p50_us", "rtt_p99_us", "rtt_max_us",
-                 "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers", "layer"]
+                 "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers",
+                 "layer"] + DISK_FIELDS
+NO_DISK = [""] * len(DISK_FIELDS)
 
 
 def _num(v, fmt="%.1f"):
@@ -1080,6 +1631,52 @@ def _merge_srv(a, b):
             "mbps": a["mbps"] + b["mbps"],
             "rep_pps": a["rep_pps"] + b["rep_pps"],
             "rep_mbps": a["rep_mbps"] + b["rep_mbps"]}
+
+
+def _merge_disk(parts):
+    """Every worker's disk deltas for one interval -> the host's figures.
+
+    Rates add across workers; the averages are weighted by operations and
+    the p99 comes from the combined histogram, never a mean of the workers'.
+    Busy is the busiest worker's share of its time spent blocked on the
+    disk, not the average, for the same reason the agent CPU is: one worker
+    stuck on its disk is a ceiling even while its siblings are not.
+    """
+    if not parts:
+        return None
+    out = {"busy": 0.0, "errors": 0}
+    for side in ("rd", "wr"):
+        ops = rate = byte_rate = took = 0.0
+        hist = [0] * RTT_NBUCKETS
+        for p in parts:
+            d, el = p[side], max(p["elapsed"], 1e-3)
+            ops += d["ops"]
+            rate += d["ops"] / el
+            byte_rate += d["bytes"] / el
+            took += d["time"]
+            for i, n in enumerate(d["hist"]):
+                hist[i] += n
+        out[side] = {"iops": rate, "bytes_s": byte_rate,
+                     "avg_us": (took / ops * 1e6) if ops else None,
+                     "p99_us": rtt_percentile(hist, 0.99) if ops else None}
+    for p in parts:
+        el = max(p["elapsed"], 1e-3)
+        out["busy"] = max(out["busy"],
+                          (p["rd"]["time"] + p["wr"]["time"]) / el * 100.0)
+        out["errors"] += p.get("errors", 0)
+    return out
+
+
+def _disk_cells(d):
+    """A host row's disk columns, in DISK_FIELDS order."""
+    if d is None:
+        return NO_DISK
+    cells = []
+    for side in ("rd", "wr"):
+        x = d[side]
+        cells += [_num(x["iops"]), _num(x["bytes_s"] / 1e6, "%.3f"),
+                  _num(x["avg_us"], "%.0f"), _num(x["p99_us"], "%.0f")]
+    return cells + [_num(d["busy"])]
 
 
 class Reporter(object):
@@ -1129,6 +1726,8 @@ class Reporter(object):
             return
 
         flows, srv, cpus = {}, {}, []
+        disk = _merge_disk([b.disk for b in latest.values()
+                            if getattr(b, "disk", None) is not None])
         for b in latest.values():
             if b.cpu_pct is not None:
                 cpus.append(b.cpu_pct)
@@ -1178,7 +1777,7 @@ class Reporter(object):
                     "", "", "", _num(f["rep_pps"]), _num(f["rep_mbps"], "%.3f"),
                     "", _num(f["rtt_avg"], "%.0f"), _num(f["rtt_p50"], "%.0f"),
                     _num(f["rtt_p99"], "%.0f"), _num(f["rtt_max"], "%.0f"),
-                    "", "", "", "", _num(layer, "%d")])
+                    "", "", "", "", _num(layer, "%d")] + NO_DISK)
                 continue
             self.csv.writerow([
                 now, self.host, "tx", peer, self.tx_size, self.rx_size,
@@ -1187,7 +1786,7 @@ class Reporter(object):
                 _num(f["loss"], "%.3f"), _num(f["rtt_avg"], "%.0f"),
                 _num(f["rtt_p50"], "%.0f"), _num(f["rtt_p99"], "%.0f"),
                 _num(f["rtt_max"], "%.0f"), "", "", "", "",
-                _num(layer, "%d")])
+                _num(layer, "%d")] + NO_DISK)
 
         srv_pps = 0.0
         for peer in sorted(srv):
@@ -1197,7 +1796,7 @@ class Reporter(object):
                 now, self.host, "rx", peer, self.tx_size, self.rx_size,
                 "", _num(s["pps"]), _num(s["mbps"], "%.3f"),
                 _num(s["rep_pps"]), _num(s["rep_mbps"], "%.3f"),
-                "", "", "", "", "", "", "", "", "", ""])
+                "", "", "", "", "", "", "", "", "", ""] + NO_DISK)
 
         # The busiest worker, not the average: one pegged worker is the
         # ceiling even when its siblings are idle, and averaging hides it.
@@ -1226,7 +1825,7 @@ class Reporter(object):
             "", _num(rtt_percentile(hist, 0.50), "%.0f"),
             _num(rtt_percentile(hist, 0.99), "%.0f"), "",
             _num(cpu), _num(cpu_max), _num(agent_cpu), self.nworkers,
-            _num(cur_layer, "%d")])
+            _num(cur_layer, "%d")] + _disk_cells(disk))
         self.fh.flush()
         npeers = len(set(p for p, _l, drain in flows if not drain))
 
@@ -1242,7 +1841,14 @@ class Reporter(object):
                self.nworkers, npeers)
             + (" layer=%d" % cur_layer if cur_layer is not None else "")
             + (" busiest_worker=%.0f%% of a core" % agent_cpu
-               if agent_cpu is not None else ""))
+               if agent_cpu is not None else "")
+            + (" disk=rd %s (%s iops) wr %s (%s iops) busy=%.0f%%%s"
+               % (fmt_bytes_rate(disk["rd"]["bytes_s"]),
+                  fmt_count(disk["rd"]["iops"]),
+                  fmt_bytes_rate(disk["wr"]["bytes_s"]),
+                  fmt_count(disk["wr"]["iops"]), disk["busy"],
+                  " errors=%d" % disk["errors"] if disk["errors"] else "")
+               if disk else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +2007,13 @@ def resolve_streams(spec):
 
 
 def cmd_agent(args):
+    if args.prepare_disk:
+        # `mx start` runs this on every host before it starts any agent, so
+        # no host is still writing its file while its peers are already
+        # sending to it. It needs nothing from the matrix.
+        disk_prepare(args.disk_file, resolve_disk_size(args.disk_size))
+        return 0
+
     matrix = load_matrix(args.matrix)
     me = resolve_self(matrix, args.host)
 
@@ -1474,6 +2087,37 @@ def cmd_agent(args):
            "nlayers": lay.layers if lay else 1,
            "dwell": lay.dwell if lay else 0.0}
 
+    # The disk file is made ready here, in the parent, before any worker
+    # forks: every worker then opens its own handle on a file that is
+    # already whole. Whether O_DIRECT works is decided once, here, so the
+    # log says it once rather than once per worker.
+    disk_note = None
+    if matrix.disk != "off":
+        size = resolve_disk_size(args.disk_size)
+        path = os.path.abspath(args.disk_file)
+        disk_prepare(args.disk_file, size)
+        direct, why = disk_probe(path)
+        cfg["disk"] = {"path": path, "size": size, "direct": direct,
+                       "requests": matrix.disk_requests,
+                       "replies": matrix.disk_replies}
+        fstype = disk_fs_type(path)
+        if fstype in MEMORY_FILESYSTEMS:
+            how = ("but %s is on %s, which is memory, not a disk: these "
+                   "\"disk\" numbers are RAM's. Point --remote-dir at a "
+                   "real disk" % (args.disk_file, fstype))
+        elif direct:
+            how = "O_DIRECT, so every read and write reaches the device"
+        elif hasattr(os, "posix_fadvise"):
+            how = ("buffered: %s, so each block is dropped from the page "
+                   "cache after use" % why)
+        else:
+            how = ("buffered: %s, and the page cache may absorb some of "
+                   "it" % why)
+        disk_note = ("disk: %s -- %s at random %d-byte-aligned offsets in "
+                     "%s (%s); %s"
+                     % (matrix.disk, DISK_SENTENCE[matrix.disk],
+                        DISK_BLOCK, args.disk_file, fmt_size(size), how))
+
     # Round-robin so that when the flow count does not divide evenly the
     # remainder is spread, not piled on worker 0. Striding by stream means
     # one peer's streams land on different workers, which is the point.
@@ -1513,10 +2157,13 @@ def cmd_agent(args):
                         nworkers)
 
     log("mx agent %s: host=%s port=%d peers=%d streams=%d flows=%d "
-        "tx_size=%d rx_size=%d workers=%d report=%s"
+        "tx_size=%d rx_size=%d workers=%d report=%s%s"
         % (VERSION, me, matrix.ports[me], len(peers), streams,
            maxflows if lay else len(specs),
-           matrix.tx_size, matrix.rx_size, nworkers, args.report))
+           matrix.tx_size, matrix.rx_size, nworkers, args.report,
+           "" if matrix.disk == "off" else " disk=%s" % matrix.disk))
+    if disk_note:
+        log(disk_note)
     if lay:
         log("mx agent: layered -- %d layers of %d peers%s, dwell %gs, cycle "
             "%s; starting in layer %d"
@@ -1687,6 +2334,8 @@ def _agent_flags(args):
         flags += ["--sndbuf", str(args.sndbuf)]
     if args.rcvbuf:
         flags += ["--rcvbuf", str(args.rcvbuf)]
+    if args.disk_size and args.disk_size != DEFAULT_DISK_SIZE:
+        flags += ["--disk-size", str(args.disk_size)]
     return flags
 
 
@@ -1955,7 +2604,7 @@ def cmd_gen(args):
                      "with repeats, so every layer carries exactly the "
                      "same load)" if args.equal_layers else "exactly once"))
     write_matrix(args.output, tokens, cell_for, tx_size, rx_size, args.port,
-                 extra_comment=extra)
+                 extra_comment=extra, disk=args.disk)
     if args.output == "-":
         return 0
 
@@ -2004,6 +2653,23 @@ def cmd_gen(args):
         log("             %s back on the wire (%s payload)"
             % (fmt_gbps(wire_bps(eg, rx_size)), fmt_gbps(payload_bps(eg, rx_size))))
         log("  fleet    : %s offered" % fmt_pps(cell * nflows))
+    if args.disk != "off":
+        log("  disk     : %s" % DISK_SENTENCE[args.disk])
+        probe = Matrix(None, [], {}, {}, {}, tx_size, rx_size, args.port,
+                       disk=args.disk)
+        if not any(disk_load(probe, 1.0, 1.0)):
+            log("             ...but those payloads are header-only (%d "
+                "bytes), so there is nothing to put on disk: raise %s"
+                % (HDR_SIZE, {"requests": "--tx-size", "replies": "--rx-size"}
+                   .get(args.disk, "--tx-size or --rx-size")))
+        elif cell != float("inf"):
+            rd_ops, rd_b, wr_ops, wr_b = disk_load(probe, cell * peers,
+                                                   cell * peers)
+            log("             per host %s IOPS / %s read, %s IOPS / %s "
+                "written" % (fmt_count(rd_ops), fmt_bytes_rate(rd_b),
+                             fmt_count(wr_ops), fmt_bytes_rate(wr_b)))
+            log("             (whole %d-byte blocks, random offsets; "
+                "`mx check` has it per host)" % DISK_BLOCK)
     log("")
     log("next: mx check --nic-gbps 25     # will the NICs take it?")
     log("      mx start                   # deploy and run it")
@@ -2058,6 +2724,34 @@ def cmd_check(args):
             % (h, fmt_pps(pps), fmt_gbps(out_bps), fmt_gbps(in_bps)))
     if len(rows) > args.top:
         log("  ... %d more (raise --top)" % (len(rows) - args.top))
+
+    if m.disk != "off":
+        # The disk's share of the same arithmetic: every payload that goes
+        # disk to disk is one read where it leaves and one write where it
+        # lands, in whole blocks.
+        log("")
+        log("  disk=%s: %s, in whole %d-byte blocks at random offsets"
+            % (m.disk, DISK_SENTENCE[m.disk], DISK_BLOCK))
+        drows = []
+        for h in m.hosts:
+            rd_ops, rd_b, wr_ops, wr_b = disk_load(m, egress_pps[h],
+                                                   ingress_pps[h])
+            drows.append((h, rd_ops, rd_b, wr_ops, wr_b))
+        drows.sort(key=lambda r: -(r[1] + r[3]))
+        if not any(disk_load(m, 1.0, 1.0)):
+            log("  ...but those payloads are header-only (%d bytes): no "
+                "disk work at all" % HDR_SIZE)
+        else:
+            log("  %-24s %12s %12s %12s %12s"
+                % ("host", "read IOPS", "read", "write IOPS", "write"))
+            for h, rd_ops, rd_b, wr_ops, wr_b in drows[:args.top]:
+                log("  %-24s %12s %12s %12s %12s"
+                    % (h, fmt_count(rd_ops), fmt_bytes_rate(rd_b),
+                       fmt_count(wr_ops), fmt_bytes_rate(wr_b)))
+            if len(drows) > args.top:
+                log("  ... %d more (raise --top)" % (len(drows) - args.top))
+            log("  each agent worker is one I/O in flight at a time, so a "
+                "host's queue depth is its --workers")
 
     if args.nic_gbps or args.nic_mpps:
         log("")
@@ -2147,7 +2841,7 @@ def _write_retargeted_matrix(m, addr_of, path):
                  % (lay.peers, lay.seed, lay.layers, lay.dwell,
                     " fill=1" if lay.fill else ""))
     write_matrix(path, tokens, cell, m.tx_size, m.rx_size, m.port,
-                 extra_comment=extra)
+                 extra_comment=extra, disk=m.disk)
 
 
 # ---- Is this host still running the matrix on disk? --------------------------
@@ -2171,6 +2865,10 @@ def _write_retargeted_matrix(m, addr_of, path):
 def _fleet_terms(m):
     terms = ["mx-stamp-v1", "tx=%d" % m.tx_size, "rx=%d" % m.rx_size,
              "port=%d" % m.port]
+    # Only when set, so a matrix without --disk fingerprints exactly as it
+    # did before the option existed and a fleet's stamps stay valid.
+    if m.disk != "off":
+        terms.append("disk=%s" % m.disk)
     if m.layering:
         lay = m.layering
         terms.append("rotation=%d,%d,%g,%d,%d"
@@ -2268,9 +2966,42 @@ def _stage_matrix(fleet, args, m):
     return path, staged, tmpdir
 
 
+def _flag_value(flags, name, default=None):
+    """The value given to `name` in an agent flag list, or `default`."""
+    for i, flag in enumerate(flags):
+        if flag == name and i + 1 < len(flags):
+            return flags[i + 1]
+    return default
+
+
+def _disk_prep_script(fleet, flags):
+    """Shell that has the agent write its data file, or find it written,
+    with the --disk-size the agent itself will be started with."""
+    size = _flag_value(flags, "--disk-size")
+    return ("cd %s && %s %s agent --prepare-disk%s"
+            % (shlex.quote(fleet.dir), shlex.quote(fleet.python),
+               os.path.basename(_agent_source()),
+               " --disk-size %s" % shlex.quote(size) if size else ""))
+
+
+def _prepare_disks(fleet, flags):
+    """Write every host's data file before any agent starts. Done as its own
+    step, and waited for, because a host still writing a gigabyte while its
+    peers are already sending to it would open the run with loss that is
+    nothing to do with the network. Returns the number of failures."""
+    size = resolve_disk_size(_flag_value(flags, "--disk-size",
+                                         DEFAULT_DISK_SIZE))
+    script = _disk_prep_script(fleet, flags)
+    return fleet.each(lambda h: fleet.sh(h, script, timeout=DISK_PREP_TIMEOUT),
+                      "disk: preparing a %s data file (written once, reused "
+                      "by later runs)" % fmt_size(size))
+
+
 def cmd_start(args):
     m = load_matrix(args.matrix)
     _check_dwell_interval(m, args.interval)
+    # Refused here, before anything is copied, rather than by every agent.
+    resolve_disk_size(args.disk_size)
     fleet = Fleet(m, args)
     agent_src = _agent_source()
     flags = _agent_flags(args)
@@ -2296,6 +3027,10 @@ def cmd_start(args):
         finally:
             if tmpdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if staged.disk != "off" and _prepare_disks(fleet, flags):
+        log("[mx] no agent was started: every host needs its data file first")
+        return 1
 
     def start(host):
         # The agent is backgrounded as a *simple* command with all three
@@ -2336,10 +3071,11 @@ fi
     if failed:
         log("[mx] some hosts did not start; `mx logs` will tell you why")
         return 1
-    log("[mx] running: %d hosts, %d flows, %d -> %d bytes, %s"
+    log("[mx] running: %d hosts, %d flows, %d -> %d bytes, %s%s"
         % (len(m.hosts), len(m.rates), m.tx_size, m.rx_size,
            "unpaced" if any(v == float("inf") for v in m.rates.values())
-           else fmt_pps(sum(m.rates.values()))))
+           else fmt_pps(sum(m.rates.values())),
+           "" if m.disk == "off" else ", disk=%s" % m.disk))
     if m.layering:
         lay = m.layering
         log("[mx] layered: %d layers of %d peers, dwell %gs -- every "
@@ -2479,6 +3215,14 @@ def cmd_reload(args):
             rc, out = fleet.push(host, [agent_src, matrix_src])
             if rc != 0:
                 return rc, "copy failed: %s" % out
+            if staged.disk != "off":
+                # While the old agent still runs: an edit that turns --disk
+                # on should not leave this host writing its file after the
+                # restart, with its peers already sending to it.
+                rc, out = fleet.sh(host, _disk_prep_script(fleet, flags),
+                                   timeout=DISK_PREP_TIMEOUT)
+                if rc != 0:
+                    return rc, "disk preparation failed: %s" % out
             cmd = ("nohup %s %s agent --matrix %s --host %s --report %s %s "
                    "< /dev/null >> %s 2>&1 &"
                    % (shlex.quote(fleet.python), os.path.basename(agent_src),
@@ -2561,6 +3305,9 @@ def cmd_stop(args):
     log("[mx]   mx summarize   # collect + analyze")
     log("[mx]   mx logs        # collect agent logs")
     log("[mx]   mx clean       # delete every trace")
+    if m.disk != "off":
+        log("[mx] so is each host's %s data file, which the next start "
+            "reuses; mx clean removes it too" % DISK_NAME)
     return 1 if failed else 0
 
 
@@ -2670,7 +3417,41 @@ class Agg(object):
 TX_KEYS = ["target_pps", "pps", "mbps", "rep_pps", "rep_mbps",
            "rtt_avg_us", "rtt_p50_us", "rtt_p99_us", "rtt_max_us"]
 HOST_KEYS = ["target_pps", "pps", "mbps", "rep_pps", "rep_mbps",
-             "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"]
+             "cpu_pct", "cpu_max_pct", "agent_cpu_pct", "workers"] + DISK_FIELDS
+
+# The share of its time the busiest worker spends blocked on the disk, past
+# which the disk -- not the fabric, not the CPU -- is setting the pace; and
+# the share past which it is at least the likeliest reason a run fell short.
+DISK_BUSY_HOT = 75.0
+DISK_BUSY_NOTICED = 20.0
+
+
+def _disk_summary(hostagg):
+    """The fleet's disk figures over the window, from the host rows, or None
+    when no host reported any (a run without --disk, or reports written
+    before it existed)."""
+    hosts = [(h, a) for h, a in hostagg.items()
+             if a.counts.get("disk_busy_pct")]
+    if not hosts:
+        return None
+    out = {"hosts": len(hosts)}
+    for side in ("rd", "wr"):
+        iops = sum(a.mean("disk_%s_iops" % side) for _h, a in hosts)
+        # Latency: the operation-weighted mean across hosts, and the worst
+        # host's p99 -- never a percentile of percentiles.
+        lat = [(a.mean("disk_%s_avg_us" % side), a.mean("disk_%s_iops" % side))
+               for _h, a in hosts if a.counts.get("disk_%s_avg_us" % side)]
+        weight = sum(w for _v, w in lat)
+        out[side] = {
+            "iops": iops,
+            "bytes_s": sum(a.mean("disk_%s_mb_s" % side) for _h, a in hosts) * 1e6,
+            "avg_us": sum(v * w for v, w in lat) / weight if weight else None,
+            "p99_us": max([a.mean("disk_%s_p99_us" % side) for _h, a in hosts
+                           if a.counts.get("disk_%s_p99_us" % side)] or [0])
+                      or None,
+        }
+    out["busy"] = dict((h, a.mean("disk_busy_pct")) for h, a in hosts)
+    return out
 
 
 def _aggregate(recent):
@@ -2906,6 +3687,23 @@ def cmd_summarize(args):
     log("  RTT       avg %s over all flows; worst flow p50 %s  p99 %s  max %s"
         % (fmt_us(rtt_avg), fmt_us(rtt_p50), fmt_us(rtt_p99), fmt_us(rtt_max)))
 
+    disk = _disk_summary(hostagg)
+    if disk:
+        for side, label in (("rd", "DISK READ "), ("wr", "DISK WRITE")):
+            d = disk[side]
+            log("  %s %13s   %8s IOPS   avg %s, worst host p99 %s"
+                % (label, fmt_bytes_rate(d["bytes_s"]), fmt_count(d["iops"]),
+                   fmt_us(d["avg_us"]), fmt_us(d["p99_us"])))
+        worst = max(disk["busy"].items(), key=lambda kv: kv[1])
+        log("  DISK BUSY %13s   of the busiest worker's time, on %s"
+            % ("%.0f%%" % worst[1], worst[0]))
+        if m.disk_requests or m.disk_replies:
+            # Said once, because it changes what the RTT line means.
+            log("            RTT includes the responder's disk %s: the "
+                "round trip a storage client would see"
+                % {"requests": "write", "replies": "read"}.get(m.disk,
+                                                               "write and read"))
+
     # Per host, worst delivery first.
     stats = _per_host(tx, srv, hostagg, nticks, layered)
 
@@ -2913,10 +3711,11 @@ def cmd_summarize(args):
     # "agent" is the agent process's own CPU as a share of ONE core --
     # near 100% means the agent is the ceiling, whatever the box shows.
     # "egress" is everything the host puts on the wire: its own requests
-    # plus the replies it owes the hosts that call it.
-    log("  %-20s %11s %11s %11s %10s %8s %9s %6s %7s %6s"
+    # plus the replies it owes the hosts that call it. "disk" (with --disk)
+    # is the busiest worker's share of its time blocked on the disk.
+    log("  %-20s %11s %11s %11s %10s %8s %9s %6s %7s %6s%s"
         % ("host", "sent", "back", "serving", "egress", "loss", "rtt p99",
-           "cpu", "1 core", "agent"))
+           "cpu", "1 core", "agent", " %5s" % "disk" if disk else ""))
     ranked = sorted(stats.items(),
                     key=lambda kv: (pct(kv[1]["back"], kv[1]["sent"])
                                     if kv[1]["sent"] else 100.0))
@@ -2924,14 +3723,18 @@ def cmd_summarize(args):
         ha = hostagg.get(host)
         egress = wire_bps(h["sent"], tx_size) + wire_bps(h["served_rep"],
                                                          rx_size)
-        log("  %-20s %11s %11s %11s %10s %7.2f%% %9s %5s %6s %5s"
+        busy = ""
+        if disk:
+            busy = " %5s" % ("%.0f%%" % disk["busy"][host]
+                             if host in disk["busy"] else "-")
+        log("  %-20s %11s %11s %11s %10s %7.2f%% %9s %5s %6s %5s%s"
             % (host, fmt_pps(h["sent"]), fmt_pps(h["back"]),
                fmt_pps(h["served"]), fmt_gbps(egress),
                max(0.0, 100.0 - pct(h["back"], h["sent"])) if h["sent"] else 0.0,
                fmt_us(h["rtt_p99"]),
                "%.0f%%" % ha.mean("cpu_pct") if ha else "-",
                "%.0f%%" % ha.mean("cpu_max_pct") if ha else "-",
-               "%.0f%%" % ha.mean("agent_cpu_pct") if ha else "-"))
+               "%.0f%%" % ha.mean("agent_cpu_pct") if ha else "-", busy))
     if len(ranked) > args.top_hosts:
         log("  ... %d more hosts (raise --top-hosts)" % (len(ranked) - args.top_hosts))
 
@@ -3071,7 +3874,7 @@ def cmd_summarize(args):
     # workers it can ever put to work.
     flowcount = dict((host, h["peers"]) for host, h in stats.items())
     _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
-                   fwd_pps, rtt_p50, rtt_p99, coverage)
+                   fwd_pps, rtt_p50, rtt_p99, coverage, disk)
     return 0
 
 
@@ -3103,9 +3906,31 @@ def _write_grids(gdir, m, tx, srv):
 
 
 def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
-                   fwd_pps, rtt_p50, rtt_p99, coverage=None):
+                   fwd_pps, rtt_p50, rtt_p99, coverage=None, disk=None):
     """Turn what the numbers say into what to do next."""
     hints = []
+    # A worker blocked on its disk is not reading its sockets: requests
+    # queue in the receive buffer and overflow it, replies wait to be
+    # drained, and the flows it feeds fall behind their target. Every one of
+    # those reads like the network unless the disk is named first.
+    disk_busy = sorted((disk or {}).get("busy", {}).items(),
+                       key=lambda kv: -kv[1])
+    disk_bound = [(h, b) for h, b in disk_busy if b >= DISK_BUSY_HOT]
+    if disk_bound:
+        worst = disk_bound[0]
+        workers = int(hostagg[worst[0]].mean("workers") or 1) \
+            if worst[0] in hostagg else 1
+        hints.append("%d host(s) spend most of their time waiting on the disk "
+                     "-- the busiest worker on %s is blocked on it %.0f%% of "
+                     "the time. The disk, not the fabric, is setting the pace "
+                     "of this run, and while a worker waits on its disk it is "
+                     "not draining its sockets, so the loss and RTT here "
+                     "include disk time. Each worker is one I/O in flight "
+                     "(%s has %d): raise `mx start --workers` to deepen the "
+                     "queue, point --remote-dir at a faster disk, or lower "
+                     "--pps to the rate the disks sustain."
+                     % (len(disk_bound), worst[0], worst[1], worst[0],
+                        workers))
     if coverage:
         measured, total, cycle = coverage
         if measured < total:
@@ -3160,13 +3985,37 @@ def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
                      "over more hosts."
                      % (pct(tx_pps, target), len(hot),
                         ", ".join(h for h, _ in hot[:3])))
-    elif short:
+    elif short and not disk_bound and disk_busy \
+            and disk_busy[0][1] >= DISK_BUSY_NOTICED:
+        # Below the disk-bound line, but enough to explain a shortfall: a
+        # pacer that stalls on a disk write loses the tokens that overflow
+        # its small bucket meanwhile, rather than bursting to catch up.
+        hints.append("sending %.0f%% of the target rate, with CPU to spare "
+                     "but the busiest worker (on %s) blocked on its disk "
+                     "%.0f%% of the time: a worker waiting on its disk is not "
+                     "sending, so the shortfall is the disk's. Raise `mx "
+                     "start --workers` to spread the I/O, or lower --pps."
+                     % (pct(tx_pps, target), disk_busy[0][0], disk_busy[0][1]))
+    elif short and not disk_bound:
         hints.append("sending only %.0f%% of the target rate with CPU to "
                      "spare: a flow may have failed to open (check `mx logs`), "
                      "or the run was too short for the first interval's "
                      "startup cost to average out -- try a longer `--for`."
                      % pct(tx_pps, target))
-    if fwd_loss > 1.0 and not (hot or busy_agents):
+    # The disk is a suspect for loss well before it is the bottleneck: one
+    # slow I/O stalls the worker for its whole duration, and the socket
+    # buffers behind it only hold so many packets.
+    disk_suspect = disk_busy[0] if disk_busy and \
+        disk_busy[0][1] >= DISK_BUSY_NOTICED else None
+    if fwd_loss > 1.0 and disk_suspect:
+        hints.append("%.1f%% of requests never arrive, and the receivers are "
+                     "busy on their disks (up to %.0f%% of a worker's time, on "
+                     "%s): a request that lands while a worker is mid-I/O "
+                     "waits in the socket buffer, and is dropped when that "
+                     "fills. Rule the disk out before the fabric -- the same "
+                     "matrix without --disk tells you which."
+                     % (fwd_loss, disk_suspect[1], disk_suspect[0]))
+    elif fwd_loss > 1.0 and not (hot or busy_agents):
         hints.append("%.1f%% of requests never arrive and nothing is CPU bound: "
                      "that is the fabric dropping. Re-run with a lower --pps to "
                      "find the knee, or `mx summarize --grid g` and look for a "
@@ -3176,14 +4025,35 @@ def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
                      "receiver is dropping them in software before the fabric "
                      "gets the blame. Try `mx start --workers 4` (or more) and "
                      "`--rcvbuf 16777216`." % fwd_loss)
-    if ret_loss > 1.0:
+    if ret_loss > 1.0 and disk_suspect:
+        hints.append("%.1f%% of the loss is on the reply path only, while "
+                     "workers spend up to %.0f%% of their time on disk I/O "
+                     "(%s). A requester that is mid-write when its replies "
+                     "land leaves them in its flow socket's buffer -- the "
+                     "kernel default, a few dozen large replies -- and drops "
+                     "the rest. Compare a run without --disk before blaming "
+                     "the return path; more --workers spreads the stalls."
+                     % (ret_loss, disk_suspect[1], disk_suspect[0]))
+    elif ret_loss > 1.0 and not disk_bound:
         hints.append("%.1f%% of the loss is on the reply path only. With "
                      "rx_size=%d that direction carries %s -- if that is more "
                      "than the forward direction, the return leg is the "
                      "bottleneck; shrink --rx-size."
                      % (ret_loss, rx_size,
                         fmt_gbps(wire_bps(rep_pps, rx_size))))
-    if rtt_p50 and rtt_p99 > rtt_p50 * 5 and rtt_p99 > 1000:
+    disk_p99 = max([(disk or {}).get(side, {}).get("p99_us") or 0
+                    for side in ("rd", "wr")] or [0])
+    if rtt_p50 and rtt_p99 > rtt_p50 * 5 and rtt_p99 > 1000 and disk_p99:
+        # With a disk in the loop the round trip carries the disk's own
+        # tail, which is long by nature: say so before the fabric is blamed.
+        hints.append("p99 (%s) is far above p50 (%s), and the round trip "
+                     "includes the disks, whose own worst-host p99 is %s -- "
+                     "and a worker stuck on a slow I/O delays every packet "
+                     "queued behind it. Run the same matrix without --disk: "
+                     "if the tail collapses, it was the disks; if it stays, "
+                     "lower the rate until it does."
+                     % (fmt_us(rtt_p99), fmt_us(rtt_p50), fmt_us(disk_p99)))
+    elif rtt_p50 and rtt_p99 > rtt_p50 * 5 and rtt_p99 > 1000:
         hints.append("p99 (%s) is far above p50 (%s): queues are building "
                      "somewhere. Lower the rate until the tail collapses -- that "
                      "point is the fabric's usable packet rate."
@@ -3278,6 +4148,17 @@ EXPORT_HOST_TESTS = [
     # report above 100%. agg=max -- one pegged worker is the ceiling for its
     # whole rack, and a mean would bury it.
     ("agent_cpu", 'unit=% higher=bad agg=max decimals=0 short=ACPU label="Busiest mx worker, share of a core"'),
+    # --disk runs only, from the host rows; a run without a disk has none of
+    # these rather than a floor of zeros. Throughput sums when a rack is
+    # collapsed -- a rack's disks do add up -- while latency and busy keep
+    # the worst host, for the same reason rtt_p99 and agent_cpu do.
+    ("disk_read_mbs", 'unit=MB/s higher=good agg=sum decimals=1 short=DRD label="Disk read"'),
+    ("disk_write_mbs", 'unit=MB/s higher=good agg=sum decimals=1 short=DWR label="Disk write"'),
+    ("disk_read_iops", 'unit=IOPS higher=good agg=sum decimals=0 short=RIOP label="Disk read operations"'),
+    ("disk_write_iops", 'unit=IOPS higher=good agg=sum decimals=0 short=WIOP label="Disk write operations"'),
+    ("disk_read_p99", 'unit=us higher=bad agg=max decimals=0 short=DRP99 label="Disk read p99"'),
+    ("disk_write_p99", 'unit=us higher=bad agg=max decimals=0 short=DWP99 label="Disk write p99"'),
+    ("disk_busy", 'unit=% higher=bad min=0 max=100 agg=max decimals=0 short=DISK label="Busiest mx worker, time blocked on disk"'),
     ("peers", 'higher=good agg=min decimals=0 short=PEER label="Flows this host sends"'),
     ("workers", 'higher=good agg=min decimals=0 short=WRK label="Agent worker processes"'),
     ("intervals", 'higher=good agg=min decimals=0 short=IVL label="Report intervals in the window"'),
@@ -3307,6 +4188,19 @@ EXPORT_RAW_COLUMNS = [
     ("cpu_core", "cpu_max_pct"),
     ("agent_cpu", "agent_cpu_pct"),
 ]
+
+# The overlays a host row's disk columns become, each already in its
+# overlay's unit. Shared by the windowed export and --raw.
+EXPORT_DISK_COLUMNS = [
+    ("disk_read_mbs", "disk_rd_mb_s"),
+    ("disk_write_mbs", "disk_wr_mb_s"),
+    ("disk_read_iops", "disk_rd_iops"),
+    ("disk_write_iops", "disk_wr_iops"),
+    ("disk_read_p99", "disk_rd_p99_us"),
+    ("disk_write_p99", "disk_wr_p99_us"),
+    ("disk_busy", "disk_busy_pct"),
+]
+EXPORT_RAW_COLUMNS += EXPORT_DISK_COLUMNS
 
 EXPORT_META = dict(EXPORT_HOST_TESTS + EXPORT_PEER_TESTS)
 
@@ -3618,9 +4512,10 @@ def cmd_export(args):
                 if h[test] > 0:
                     out.add(test, host, h[test])
             if agg:
-                for test, column in (("cpu", "cpu_pct"),
+                for test, column in [("cpu", "cpu_pct"),
                                      ("cpu_core", "cpu_max_pct"),
-                                     ("agent_cpu", "agent_cpu_pct")):
+                                     ("agent_cpu", "agent_cpu_pct")] \
+                        + EXPORT_DISK_COLUMNS:
                     if agg.counts.get(column):
                         out.add(test, host, agg.mean(column))
 
@@ -3728,10 +4623,11 @@ def cmd_export(args):
         % (VERSION, len(stats),
            "whole history" if args.window <= 0 else "last %ds" % args.window,
            len(out.samples)),
-        "# run shape: %d bytes out -> %d bytes back%s"
+        "# run shape: %d bytes out -> %d bytes back%s%s"
         % (tx_size, rx_size,
            ", %d layers x %gs dwell" % (m.layering.layers, m.layering.dwell)
-           if (m and m.layering) else ""),
+           if (m and m.layering) else "",
+           ", disk=%s" % m.disk if (m and m.disk != "off") else ""),
         "# window covers %s .. %s" % (stamp(earliest), stamp(latest)),
     ]
     if args.nic_gbps:
@@ -3838,7 +4734,23 @@ def cmd_doctor(args):
     # startup (no privilege needed), so the only real constraint is the
     # HARD limit -- checked on the hosts, where the sockets open.
     need_fds = len(m.hosts) - 1 + 64      # flows + listeners/report/headroom
+    # With --disk, the data file lives in --remote-dir: report the space on
+    # the filesystem that will hold it (the directory itself, or the
+    # nearest parent that exists yet).
+    disk_check = ""
+    if m.disk != "off":
+        disk_check = """
+dd={d}
+while [ ! -d "$dd" ] && [ "$dd" != / ]; do dd=$(dirname "$dd"); done
+kb=$(df -Pk "$dd" 2>/dev/null | awk 'NR==2 {{print $4}}')
+low=""
+[ -n "$kb" ] && [ "$kb" -lt {need_kb} ] 2>/dev/null \
+    && low=" DISK-SPACE-LOW(need>{size})"
+extra="; disk_free=$((${{kb:-0}} / 1048576))G$low"
+""".format(d=shlex.quote(fleet.dir), size=DEFAULT_DISK_SIZE,
+           need_kb=resolve_disk_size(DEFAULT_DISK_SIZE) // 1024)
     script = """
+extra=""{disk}
 py=$({py} -V 2>&1 || echo 'MISSING python')
 running=no
 {pgrep} >/dev/null 2>&1 && running=yes
@@ -3846,8 +4758,9 @@ fds=$(ulimit -Hn 2>/dev/null || echo ?)
 low=""
 [ "$fds" != unlimited ] && [ "$fds" -lt {need} ] 2>/dev/null \
     && low=" FDS-TOO-LOW(need>{need})"
-echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile_hard=$fds$low; agent_running=$running"
-""".format(py=shlex.quote(fleet.python), pgrep=PGREP, need=need_fds)
+echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile_hard=$fds$low; agent_running=$running$extra"
+""".format(py=shlex.quote(fleet.python), pgrep=PGREP, need=need_fds,
+           disk=disk_check)
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
                         "checking hosts (ssh + python + fd limit)")
@@ -3890,6 +4803,20 @@ mx hints -- what you want, and the command that gets it
     mx gen --servers servers.txt --pps 5000 --tx-size 128 --rx-size 8192
       Emulates an RPC/read workload: every 128-byte request comes back as
       8 KB. Watch the reply direction saturate first.
+
+  PUT THE DISKS IN THE LOOP (storage-shaped request/response)
+    mx gen --servers servers.txt --pps 2000 --tx-size 128 --rx-size 8192 \\
+        --disk replies
+    mx run --for 60
+      Every 128-byte request makes its target read 8 KB from a real file
+      on its disk and send that back, and the requester writes what
+      arrives to its own disk. `--disk requests` is the write-shaped
+      opposite (the requester reads, the target writes before it
+      answers), `--disk both` does both. Reads and writes are O_DIRECT at
+      random offsets, so the page cache cannot absorb them; `mx summarize`
+      reports the disks beside the network and says which one is the
+      ceiling. The data file lives in --remote-dir (--disk-size, default
+      1G), is written once and reused, and `mx clean` removes it.
 
   A FIXED BANDWIDTH INSTEAD OF A FIXED PACKET RATE
     mx gen --servers servers.txt --gbps 10 --tx-size 1400
@@ -4069,6 +4996,11 @@ def _add_run_flags(p):
                    help="SO_SNDBUF per flow (default: kernel default)")
     p.add_argument("--rcvbuf", type=int, default=0, metavar="BYTES",
                    help="SO_RCVBUF on the responder (default: 8 MB)")
+    p.add_argument("--disk-size", default=DEFAULT_DISK_SIZE, metavar="SIZE",
+                   help="with a --disk matrix: the data file each host "
+                        "reads and writes, in --remote-dir. Written once and "
+                        "reused by later runs; bigger spreads the random "
+                        "I/O over more of the disk (default: %(default)s)")
     p.add_argument("--no-deploy", action="store_true",
                    help="do not copy the agent/matrix, just start what is there")
 
@@ -4143,6 +5075,15 @@ def build_parser():
                    help="reply size sent back for each request (default: %(default)s)")
     g.add_argument("--port", type=int, default=DEFAULT_PORT,
                    help="UDP port the agents listen on (default: %(default)s)")
+    g.add_argument("--disk", choices=DISK_MODES, default="off",
+                   help="put a disk at each end of the round trip: "
+                        "'replies' has the responder read every reply's "
+                        "payload from disk and the requester write it to "
+                        "its own (a storage read); 'requests' has the "
+                        "requester read and the responder write before it "
+                        "answers (a storage write); 'both' does both. Real "
+                        "I/O at random offsets, O_DIRECT where the "
+                        "filesystem allows (default: %(default)s)")
     g.add_argument("--output", "-o", default=DEFAULT_MATRIX,
                    help="output file, '-' for stdout (default: %(default)s)")
 
@@ -4291,6 +5232,16 @@ def build_parser():
                    help="SO_SNDBUF per flow (default: kernel default)")
     a.add_argument("--rcvbuf", type=int, default=0,
                    help="SO_RCVBUF per responder (default: 8 MB)")
+    a.add_argument("--disk-file", default=DISK_NAME, metavar="PATH",
+                   help="with a --disk matrix: the data file to read and "
+                        "write (default: %(default)s)")
+    a.add_argument("--disk-size", default=DEFAULT_DISK_SIZE, metavar="SIZE",
+                   help="its size; an existing file of this size is reused "
+                        "(default: %(default)s)")
+    a.add_argument("--prepare-disk", action="store_true",
+                   help="write the data file (or find it already written) "
+                        "and exit. `mx start` does this on every host before "
+                        "any agent starts")
 
     sub.add_parser("help", help="every switch of every command, one page")
     return ap

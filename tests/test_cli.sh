@@ -123,7 +123,8 @@ test_full_help_lists_every_switch_of_every_command() {
                 --rcvbuf --no-deploy --watch --reports --window --top \
                 --top-hosts --grid --no-collect --for --keep --yes --host \
                 --report --append --json --raw --peers --names \
-                --target-prefix --test-prefix --run; do
+                --target-prefix --test-prefix --run --disk --disk-size \
+                --disk-file --prepare-disk; do
         assert_contains "$RUN_OUT" "$flag" "mx help must document $flag" || return 1
     done
     # Every command appears as a usage line.

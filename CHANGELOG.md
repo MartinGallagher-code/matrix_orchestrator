@@ -9,7 +9,57 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.10.0] - 2026-10-02
+
+Put a disk at each end of the round trip.
+
+### Added
+
+- **`mx gen --disk replies|requests|both`: real disk reads and writes inside
+  the request/response test.** With `replies`, every request makes the host
+  that receives it read the reply's payload from a file on its disk before
+  answering, and the requester writes the reply it gets back to its own
+  disk -- a storage read. `requests` is the write-shaped opposite: the
+  requester reads each request's payload from disk and the responder writes
+  it before it acknowledges. `both` does both. The setting is one more key
+  on the matrix's `tx_size`/`rx_size` line (`disk=replies`), because it is
+  the same kind of fact: what every request and reply *is*.
+
+  The I/O is real and goes to the device. Each host's data file is real,
+  incompressible data (never a sparse file, which reads back free), every
+  4 KiB block different, written once and reused by later runs. Reads and
+  writes land at random block-aligned offsets with `O_DIRECT`, so the page
+  cache cannot absorb them; where a filesystem refuses `O_DIRECT` the agent
+  falls back to buffered I/O that drops each block from the cache after
+  use, and says so in its log -- as it does when the file is on `tmpfs`,
+  which takes `O_DIRECT` on recent kernels and is still memory.
+
+  The order is a storage server's: a request is on disk before it is
+  acknowledged, and a reply is read before it is sent, so the RTT `mx`
+  measures now includes the responder's disk time -- the round trip a
+  storage client would see. The requester stamps a request after reading
+  its payload and stores a reply after timing it, so its own disk work is
+  never counted as the network's.
+
+- **`mx start` prepares every host's data file before it starts any
+  agent**, and waits for it, so no host is still writing a gigabyte while
+  its peers are already sending to it. `--disk-size` (default `1G`) sets
+  the file's size; it lives in `--remote-dir` with everything else, `mx
+  stop` leaves it for the next run, and `mx clean` removes it. `mx reload`
+  prepares the file on each host it restarts, so an edit that turns
+  `--disk` on brings the fleet over cleanly.
+
+- **The disks are reported beside the network.** The report's host rows
+  carry read and write IOPS, MB/s, average and p99 latency, and the share
+  of its time the busiest worker spent blocked on the disk
+  (`disk_busy_pct`); the `mx status` line shows them live. `mx summarize`
+  adds `DISK READ`, `DISK WRITE` and `DISK BUSY` lines and a per-host
+  `disk` column, and its advice names the disk -- not the fabric -- when a
+  run that is waiting on its disks falls short of target, loses packets or
+  grows a long RTT tail. `mx check` and `mx gen` print the IOPS and MB/s
+  each host's disk will be asked for; `mx export` adds `mx_disk_*` overlays
+  for the floor plan; `mx doctor` reports the free space where the file
+  will go.
 
 ### Changed
 
