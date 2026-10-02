@@ -192,16 +192,44 @@ per-host `disk` column:
 asked for. `mx export` adds `mx_disk_*` overlays, so a slow rack of disks
 shows on the floor plan.
 
-**Each worker is one I/O in flight.** A worker does its disk I/O inline,
-between packets, so a host's queue depth is its `--workers`. A worker
-waiting on its disk is not reading its sockets, which has two effects.
-First, a slow disk slows the whole host down, the way it would slow a
-real storage server. Second, loss and RTT on a disk-bound run include the
-disk's time. `mx summarize` watches for this. When workers spend most of
-their time blocked on the disk, its advice names the disk rather than the
-fabric, and tells you which lever to pull: more `--workers`, a faster disk,
-or a lower `--pps`. Running the same matrix without `--disk` separates the
-two.
+**Queue depth: `--disk-depth`.** By default each worker does its disk
+I/O inline, between packets, one at a time, so a host's queue depth is
+its `--workers`. A worker waiting on its disk is not reading its sockets,
+so a slow disk slows the whole host down, the way it would slow a real
+storage server.
+
+`mx start --disk-depth N` lets each worker keep N I/Os in flight instead,
+for a host queue depth of `--workers × N`:
+
+```bash
+mx start --disk-depth 8          # 8 I/Os in flight per worker
+```
+
+Each worker gets N I/O threads, each with its own file handle. Disk calls
+release Python's GIL, so the threads' waits overlap on the device. The
+worker's event loop still owns every socket and does what each I/O was
+for, in the same order a round trip measures. The queue is bounded:
+when it is full, requests wait in their socket buffers and paced flows
+fall behind target, so a disk that cannot keep up still shows as one.
+
+Depth is the lever for a disk whose *latency*, not the worker's CPU, is the
+limit:
+
+| Each I/O takes 2 ms more (simulated) | Depth 1 | Depth 4 | Depth 8 | Depth 32 |
+|---|---|---|---|---|
+| Reads per second, one worker | 400 | 1,643 | 3,173 | 8,882 |
+
+On a fast local disk, where an I/O takes tens of microseconds, the
+hand-off to a thread costs about as much as the I/O itself. There one
+I/O at a time between packets is the most efficient, and if the worker's
+CPU is the ceiling, more `--workers` is the lever, not more depth.
+
+**What the advice says.** On a run held up by its disks, loss and RTT
+include disk time. `mx summarize` watches for this, and when workers keep
+most of their I/O capacity busy, its advice names the disk rather than
+the fabric. It also names the lever to pull: a deeper `--disk-depth`, more
+`--workers`, a faster disk, or a lower `--pps`. Running the same matrix
+without `--disk` separates the two.
 
 ---
 
@@ -678,7 +706,7 @@ ts,host,dir,peer,size,rep_size,target_pps,pps,mbps,rep_pps,rep_mbps,
 loss_pct,rtt_avg_us,rtt_p50_us,rtt_p99_us,rtt_max_us,cpu_pct,cpu_max_pct,
 agent_cpu_pct,workers,layer,disk_rd_iops,disk_rd_mb_s,disk_rd_avg_us,
 disk_rd_p99_us,disk_wr_iops,disk_wr_mb_s,disk_wr_avg_us,disk_wr_p99_us,
-disk_busy_pct
+disk_busy_pct,disk_depth
 ```
 
 `dir=tx` rows are this host as a client (requests it sent, replies it got
@@ -695,8 +723,9 @@ The `disk_*` columns are filled on `dir=host` rows of a `--disk` run and
 blank everywhere else. Unlike the network columns' `mbps` (megabits),
 `disk_*_mb_s` is megabytes per second — the unit disks are quoted in — and
 counts what the device moved, in whole 4 KiB blocks under `O_DIRECT`.
-`disk_busy_pct` is the busiest worker's share of the interval spent
-blocked on the disk.
+`disk_busy_pct` is the busiest worker's share of its I/O capacity in use:
+time spent in disk calls over the interval times its `disk_depth`. At depth
+1 that is simply the share of the interval it spent blocked on the disk.
 
 On a layered run (`--dwell`) each `tx` row also carries its `layer`, and
 a switch leaves one *drain* row per finished flow: the replies that were
@@ -756,7 +785,7 @@ One sample per host per overlay, reduced over `--window` seconds:
 | `mx_rtt_p50` `mx_rtt_p99` `mx_rtt_max` | latency, worst peer, µs |
 | `mx_cpu` `mx_cpu_core` `mx_agent_cpu` | the box, its busiest core, and the busiest agent worker as a share of one core |
 | `mx_disk_read_mbs` `mx_disk_write_mbs` `mx_disk_read_iops` `mx_disk_write_iops` | `--disk` runs: what this host's disk read and wrote |
-| `mx_disk_read_p99` `mx_disk_write_p99` `mx_disk_busy` | `--disk` runs: its disk latency, µs, and the busiest worker's share of time blocked on the disk |
+| `mx_disk_read_p99` `mx_disk_write_p99` `mx_disk_busy` | `--disk` runs: its disk latency, µs, and the busiest worker's share of its disk I/O capacity in use |
 | `mx_peers` `mx_workers` `mx_intervals` | flows this host sends; agent workers; intervals it reported in the window |
 | `mx_state` | `REPORTING`; `SILENT` for a host that reported earlier but not inside the window; `NO-DATA` for one in the matrix that never reported at all |
 

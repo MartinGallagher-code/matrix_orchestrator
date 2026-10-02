@@ -9,6 +9,47 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.0] - 2026-10-02
+
+Let a worker keep more than one disk I/O in flight.
+
+### Added
+
+- **`mx start --disk-depth N`: each worker keeps N disk I/Os in flight,**
+  for a host queue depth of `--workers x N`. Until now each worker did its
+  `--disk` I/O inline, between packets, one at a time, so on a
+  high-latency disk -- a cloud volume, an HDD, network storage -- the only
+  way to more I/O was more workers, and workers are capped by the number
+  of flows. Simulated at 2 ms per I/O, one worker moves 400 reads a second
+  at depth 1 and 3,173 at depth 8.
+
+  Each worker gets N I/O threads, each with its own file handle and
+  buffers; disk calls release the GIL, so their waits overlap on the
+  device. Only the disk work leaves the event loop: it still owns every
+  socket and network counter, and does what each I/O was for when it
+  completes -- sends the request whose payload is now read, answers the
+  request now on disk -- so a round trip measures the same sequence as
+  before. The queue is bounded at twice the depth; when it is full,
+  requests wait in their socket buffers and paced flows fall behind
+  target, so a disk that cannot keep up still reads as one.
+
+  Depth 1 stays the default and is unchanged: on a fast local disk the
+  hand-off to a thread costs about as much as the I/O, so one at a time
+  between packets is the most efficient there.
+
+- The report's host rows gain `disk_depth`, and `disk_busy_pct` becomes
+  the busiest worker's share of its I/O capacity in use (time in disk
+  calls over the interval times the depth) -- at depth 1, the same number
+  as before. `mx summarize`'s advice on a disk-bound run names
+  `--disk-depth` as the first lever, and `mx check` gives a host's queue
+  depth as `--workers x --disk-depth`.
+
+### Changed
+
+- Direct reads use one `preadv` call instead of a seek and a read where
+  Python has it (3.7+), and the I/O threads use the C `SimpleQueue` where
+  it exists; both fall back cleanly on 3.6.
+
 ## [1.10.0] - 2026-10-02
 
 Put a disk at each end of the round trip.

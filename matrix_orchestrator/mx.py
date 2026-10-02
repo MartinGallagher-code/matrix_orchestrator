@@ -43,12 +43,14 @@ Python 3.6+, standard library only, on the orchestrator and on every host.
 """
 
 import argparse
+import collections
 import csv
 import hashlib
 import json
 import mmap
 import multiprocessing
 import os
+import queue as _queue_module
 import random
 import shlex
 import shutil
@@ -59,11 +61,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from queue import Empty
+from queue import Empty, Queue
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -151,6 +154,10 @@ DISK_SLICE = 0.05
 # A big file on a slow disk takes a while to write once; scale the ssh
 # timeout to that rather than to a shell one-liner.
 DISK_PREP_TIMEOUT = 3600
+# --disk-depth: I/Os each worker keeps in flight. Each is a thread with its
+# own file handle and buffers, so the ceiling is a sanity check on threads
+# and descriptors per worker, not a tuned limit.
+MAX_DISK_DEPTH = 256
 
 _PADS = {}
 
@@ -873,6 +880,10 @@ class DiskIO(object):
         self.errors = 0
         self.first_error = None
         self._rng = random.Random()
+        # Test hook, like MX_SSH: a fixed latency added to every operation,
+        # so the suite can stand in for a slow disk on any runner. Slept,
+        # which releases the GIL exactly as a blocking disk call does.
+        self._delay = float(os.environ.get("MX_TEST_DISK_DELAY") or 0)
         # Anonymous mappings are page-aligned, which is what O_DIRECT wants
         # of the memory as well as of the offsets and lengths.
         span = disk_span(MAX_SIZE)
@@ -926,8 +937,11 @@ class DiskIO(object):
         began = time.monotonic()
         try:
             if self.direct:
-                os.lseek(self.fd, off, os.SEEK_SET)
-                os.readv(self.fd, [self._rview[:span]])
+                if _preadv is not None:
+                    _preadv(self.fd, [self._rview[:span]], off)
+                else:
+                    os.lseek(self.fd, off, os.SEEK_SET)
+                    os.readv(self.fd, [self._rview[:span]])
                 data = self._rview[:n]
             else:
                 data = os.pread(self.fd, n, off)
@@ -936,6 +950,8 @@ class DiskIO(object):
         except OSError as exc:
             self._failed(exc)
             return None
+        if self._delay:
+            time.sleep(self._delay)
         took = time.monotonic() - began
         self.rd_ops += 1
         self.rd_bytes += span
@@ -969,6 +985,8 @@ class DiskIO(object):
         except OSError as exc:
             self._failed(exc)
             return False
+        if self._delay:
+            time.sleep(self._delay)
         took = time.monotonic() - began
         self.wr_ops += 1
         self.wr_bytes += span
@@ -990,6 +1008,131 @@ class DiskIO(object):
                 b.close()
         except (BufferError, ValueError):
             pass            # a view still alive; the process is ending anyway
+
+
+_JobQueue = getattr(_queue_module, "SimpleQueue", Queue)
+# One syscall where there are two otherwise (3.7+): a direct read is a seek
+# then a read, and each syscall is a GIL round trip for an I/O thread.
+_preadv = getattr(os, "preadv", None)
+
+
+def _owned(data):
+    """A payload the I/O thread can let go of: a direct read returns a view
+    of the thread's own buffer, which its next read overwrites."""
+    return bytes(data) if isinstance(data, memoryview) else data
+
+
+class DiskPool(object):
+    """--disk-depth N: N I/O threads per worker, so one worker keeps N disk
+    operations in flight instead of one.
+
+    Only the disk work leaves the event loop. A thread takes a job, does its
+    I/O with its own DiskIO -- its own file handle, buffers and counters, so
+    nothing is shared between threads but the two queues -- and hands the
+    result back. The loop then does whatever the job was for, exactly as it
+    would have inline: sends a request whose payload is now read, answers a
+    request that is now on disk. So every socket and every network counter
+    stays the loop's alone, and the order of events a round trip measures
+    is unchanged.
+
+    A byte down a pipe the loop's selector watches wakes it the moment a job
+    completes, so a reply is never held back by an idle wait. Disk syscalls
+    release the GIL, which is what lets the threads' waits overlap; the
+    Python around each one is a few microseconds.
+
+    The queue is bounded: past `limit` jobs outstanding the loop stops
+    taking on disk work, so requests wait in their socket buffers and paced
+    flows fall behind -- the same honest backpressure as the inline path,
+    never an unbounded backlog in memory.
+    """
+
+    def __init__(self, path, size, direct, depth):
+        self.depth = depth
+        self.ios = [DiskIO(path, size, direct) for _ in range(depth)]
+        # Every thread busy and one more round waiting: enough that a
+        # thread never idles between jobs, short enough that what waits is
+        # in the kernel's socket buffers, where it is visible as loss.
+        self.limit = 2 * depth
+        self.pending = 0            # submitted, not yet collected (loop only)
+        # The C queue where there is one (3.7+): the pure-Python Queue's
+        # locking is a measurable share of what each hand-off costs.
+        self._jobs = _JobQueue()
+        self._done = collections.deque()
+        self.wake_fd, self._wake_w = os.pipe()
+        os.set_blocking(self.wake_fd, False)
+        os.set_blocking(self._wake_w, False)
+        self._threads = [threading.Thread(target=self._run, args=(io,),
+                                          name="mx-disk-%d" % i, daemon=True)
+                         for i, io in enumerate(self.ios)]
+        for t in self._threads:
+            t.start()
+
+    def room(self):
+        return self.pending < self.limit
+
+    def submit(self, job):
+        """Queue one job. Jobs are tuples:
+        ("req", flow, n)              read a request's n-byte payload
+        ("srv", data, n, ctx)         write `data` if given, then read n bytes
+                                      if n, for the reply described by ctx
+        ("wr", data)                  write a packet's payload
+        """
+        self.pending += 1
+        self._jobs.put(job)
+
+    def _run(self, io):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            kind = job[0]
+            if kind == "req":
+                done = (kind, job[1], _owned(io.read(job[2])))
+            elif kind == "srv":
+                if job[1] is not None:
+                    io.write(job[1])
+                done = (kind, _owned(io.read(job[2])) if job[2] else None,
+                        job[3])
+            else:
+                io.write(job[1])
+                done = (kind,)
+            self._done.append(done)
+            try:
+                os.write(self._wake_w, b"\0")
+            except OSError:
+                pass            # pipe full: the loop has wake-ups waiting
+
+    def completions(self):
+        """Every job finished since the last call. The pipe is drained
+        before the deque, so a job finished after this returns has written
+        its own wake-up byte."""
+        try:
+            while os.read(self.wake_fd, 4096):
+                pass
+        except OSError:
+            pass
+        out = []
+        pop = self._done.popleft
+        while True:
+            try:
+                out.append(pop())
+            except IndexError:
+                break
+        self.pending -= len(out)
+        return out
+
+    def close(self):
+        for _ in self._threads:
+            self._jobs.put(None)
+        for t in self._threads:
+            t.join(timeout=2)
+        for fd in (self.wake_fd, self._wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        for io in self.ios:
+            io.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1132,15 +1275,25 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
 
     # Disk in the loop. Four independent jobs, by which end of which payload
     # this worker is on; a header-only packet has no payload and costs none.
-    disk = None
+    # At --disk-depth 1 the I/O is done inline, between packets; deeper, a
+    # pool of I/O threads keeps that many in flight and the loop picks up
+    # the results as they finish.
+    disk = pool = None
+    disk_ios, depth = [], 1
     req_read = req_write = rep_read = rep_write = False
     dcfg = cfg.get("disk")
     if dcfg:
-        disk = DiskIO(dcfg["path"], dcfg["size"], dcfg["direct"])
-        if dcfg["direct"] and not disk.direct:
+        depth = dcfg.get("depth", 1)
+        if depth > 1:
+            pool = DiskPool(dcfg["path"], dcfg["size"], dcfg["direct"], depth)
+            disk_ios = pool.ios
+        else:
+            disk = DiskIO(dcfg["path"], dcfg["size"], dcfg["direct"])
+            disk_ios = [disk]
+        if dcfg["direct"] and not disk_ios[0].direct:
             sys.stderr.write("mx agent: worker %d could not open %s with "
                              "O_DIRECT; it is using %s\n"
-                             % (wid, dcfg["path"], disk.mode()))
+                             % (wid, dcfg["path"], disk_ios[0].mode()))
             sys.stderr.flush()
         req_read = req_write = dcfg["requests"] and tx_size > HDR_SIZE
         rep_read = rep_write = dcfg["replies"]
@@ -1150,6 +1303,8 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
     slice_end = 0.0
 
     sel = selectors.DefaultSelector()
+    if pool is not None:
+        sel.register(pool.wake_fd, selectors.EVENT_READ, pool)
 
     def build_flows(specs, layer):
         built = []
@@ -1221,6 +1376,43 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
     prev_cpu = read_self_cpu()
     interval = cfg["interval"]
 
+    def finish_disk_jobs():
+        """--disk-depth > 1: do what each finished disk job was for, as the
+        inline path would have done it the moment its I/O returned."""
+        for done in pool.completions():
+            kind = done[0]
+            if kind == "req":
+                fl, body = done[1], done[2]
+                # A flow whose layer ended while its payload was being read
+                # sends nothing more; the read still counts as disk work.
+                if fl.draining or fl.sock.fileno() < 0:
+                    continue
+                fl.seq += 1
+                # Stamped as it leaves, after its payload was read.
+                try:
+                    fl.sock.sendto(pack(MAGIC, KIND_REQ, 0, my_index, tx_size,
+                                        rx_size, fl.seq,
+                                        int(monotonic() * 1e6))
+                                   + (pad if body is None else body), fl.dest)
+                except OSError:
+                    fl.errors += 1
+                    continue
+                fl.tx_pkts += 1
+                fl.tx_bytes += tx_size
+            elif kind == "srv":
+                body, (sock, peer, row, rsize, sq, ts) = done[1], done[2]
+                if body is None:
+                    body = pads.get(rsize)
+                    if body is None:
+                        body = pads[rsize] = pad_for(rsize)
+                try:
+                    sock.sendto(pack(MAGIC, KIND_REP, 0, my_index, rsize, 0,
+                                     sq, ts) + body, peer)
+                except OSError:
+                    continue
+                row[2] += 1
+                row[3] += rsize
+
     def next_tick(now):
         """When to report next. Layered runs align ticks to wall-clock
         multiples of the interval: the dwell is a multiple of the interval,
@@ -1267,13 +1459,23 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
             sendto, dest = fl.sock.sendto, fl.dest
             seq, sent, sent_b = fl.seq, 0, 0
             starved = False
+            queued = 0
             for _ in range(batch):
                 body = pad
                 if req_read:
-                    # Out of disk time for this pass: the rest of the batch
-                    # waits for the next one, and its tokens go back in the
-                    # bucket below -- a flow the disk cannot feed falls
-                    # behind its target, which is the honest reading.
+                    # Out of disk for this pass -- out of time inline, out
+                    # of queue room with a pool: the rest of the batch waits
+                    # for the next one, and its tokens go back in the bucket
+                    # below. A flow the disk cannot feed falls behind its
+                    # target, which is the honest reading.
+                    if pool is not None:
+                        if not pool.room():
+                            starved = True
+                            break
+                        # Sent when its payload has been read.
+                        pool.submit(("req", fl, req_payload))
+                        queued += 1
+                        continue
                     if monotonic() > slice_end:
                         starved = True
                         break
@@ -1292,7 +1494,7 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                 sent += 1
                 sent_b += tx_size
             if starved and fl.paced:
-                fl.tokens += batch - sent
+                fl.tokens += batch - sent - queued
             fl.seq = seq
             fl.tx_pkts += sent
             fl.tx_bytes += sent_b
@@ -1314,7 +1516,9 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
             slice_end = monotonic() + DISK_SLICE
         for key, _mask in events:
             fl = key.data
-            if fl is None:
+            if fl is not None and fl is pool:
+                finish_disk_jobs()
+            elif fl is None:
                 # Responder socket: answer every request with a reply of
                 # the size the request asked for.
                 recvfrom, sendto = key.fileobj.recvfrom, key.fileobj.sendto
@@ -1322,8 +1526,12 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                 for _ in range(MAX_DRAIN):
                     # Whatever is left waits in the socket buffer for the
                     # next pass rather than holding up everything else.
-                    if srv_disk and monotonic() > slice_end:
-                        break
+                    if srv_disk:
+                        if pool is not None:
+                            if not pool.room():
+                                break
+                        elif monotonic() > slice_end:
+                            break
                     try:
                         data, peer = recvfrom(MAX_SIZE)
                     except OSError:
@@ -1349,6 +1557,13 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                     # read before it is answered -- so the client's round
                     # trip includes this host's disk time, as a real one
                     # would.
+                    if pool is not None and (req_write or (rep_read and
+                                                           rsize > HDR_SIZE)):
+                        # Answered when its I/O is done.
+                        pool.submit(("srv", data if req_write else None,
+                                     rsize - HDR_SIZE if rep_read else 0,
+                                     (key.fileobj, peer, row, rsize, sq, ts)))
+                        continue
                     if req_write:
                         disk_write(data)
                     if rep_read and rsize > HDR_SIZE:
@@ -1368,8 +1583,12 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                 recv = fl.sock.recv
                 hist = fl.rtt_hist
                 for _ in range(MAX_DRAIN):
-                    if rep_write and monotonic() > slice_end:
-                        break
+                    if rep_write:
+                        if pool is not None:
+                            if not pool.room():
+                                break
+                        elif monotonic() > slice_end:
+                            break
                     try:
                         data = recv(MAX_SIZE)
                     except OSError:
@@ -1391,7 +1610,10 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
                     # After the clock is read: the round trip ends when the
                     # reply lands, and storing it is this host's own work.
                     if rep_write:
-                        disk_write(data)
+                        if pool is not None:
+                            pool.submit(("wr", data))
+                        else:
+                            disk_write(data)
 
         # ---- report ----
         now = monotonic()
@@ -1406,7 +1628,7 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
             # to the layer that just ended, and this is where they land.
             drains = [fl for _dl, fls in draining for fl in fls]
             stats = _collect(wid, flows + drains, srv_counts, view, me, prev,
-                             elapsed, cpu_pct, disk)
+                             elapsed, cpu_pct, disk_ios, depth)
             try:
                 queue.put(stats, block=False)
             except Exception:                     # noqa: BLE001 - full queue
@@ -1457,12 +1679,16 @@ def _worker_loop(wid, view, me, cfg, flow_specs, stop, queue):
         except OSError:
             pass
     sel.close()
-    if disk is not None:
-        if disk.errors:
-            sys.stderr.write("mx agent: worker %d: %d disk operation(s) failed "
-                             "on %s, the first with: %s\n"
-                             % (wid, disk.errors, disk.path, disk.first_error))
-            sys.stderr.flush()
+    errors = sum(io.errors for io in disk_ios)
+    if errors:
+        first = next(io.first_error for io in disk_ios if io.first_error)
+        sys.stderr.write("mx agent: worker %d: %d disk operation(s) failed "
+                         "on %s, the first with: %s\n"
+                         % (wid, errors, disk_ios[0].path, first))
+        sys.stderr.flush()
+    if pool is not None:
+        pool.close()
+    elif disk is not None:
         disk.close()
 
 
@@ -1476,34 +1702,37 @@ def _forget_flow(prev, key):
         prev.pop(("h", key, i), None)
 
 
-def _collect_disk(disk, prev, elapsed):
-    """This worker's disk work over the interval, as raw deltas: the parent
-    sums the counts across workers and needs each worker's own elapsed time
-    to say how much of it that worker spent blocked on the disk."""
-    if disk is None:
+def _collect_disk(ios, depth, prev, elapsed):
+    """This worker's disk work over the interval, as raw deltas summed over
+    its I/O slots (one inline, or one per --disk-depth thread): the parent
+    sums the counts across workers, and needs each worker's own elapsed time
+    and depth to say how much of its I/O capacity that worker kept busy."""
+    if not ios:
         return None
-    out = {"elapsed": elapsed}
+    out = {"elapsed": elapsed, "depth": depth}
     for side in ("rd", "wr"):
-        now = {"ops": getattr(disk, side + "_ops"),
-               "bytes": getattr(disk, side + "_bytes"),
-               "time": getattr(disk, side + "_time")}
+        now = {"ops": sum(getattr(io, side + "_ops") for io in ios),
+               "bytes": sum(getattr(io, side + "_bytes") for io in ios),
+               "time": sum(getattr(io, side + "_time") for io in ios)}
         d = {}
         for k, v in now.items():
             d[k] = v - prev.get(("disk", side, k), 0)
             prev[("disk", side, k)] = v
-        hist = getattr(disk, side + "_hist")
+        hist = [sum(col) for col in zip(*(getattr(io, side + "_hist")
+                                          for io in ios))]
         d["hist"] = [n - prev.get(("disk", side, i), 0)
                      for i, n in enumerate(hist)]
         for i, n in enumerate(hist):
             prev[("disk", side, i)] = n
         out[side] = d
-    out["errors"] = disk.errors - prev.get(("disk", "errors"), 0)
-    prev[("disk", "errors")] = disk.errors
+    errors = sum(io.errors for io in ios)
+    out["errors"] = errors - prev.get(("disk", "errors"), 0)
+    prev[("disk", "errors")] = errors
     return out
 
 
 def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct,
-             disk=None):
+             disk_ios=None, depth=1):
     """Turn this worker's raw counters into one interval's finished rates."""
     def delta(key, value):
         was = prev.get(key, 0)
@@ -1568,7 +1797,7 @@ def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct,
             "rep_mbps": d_repb * 8.0 / elapsed / 1e6,
         })
     return WorkerStats(wid, int(time.time()), frows, srows, cpu_pct,
-                       _collect_disk(disk, prev, elapsed))
+                       _collect_disk(disk_ios, depth, prev, elapsed))
 
 
 # ---------------------------------------------------------------------------
@@ -1581,7 +1810,8 @@ def _collect(wid, flows, srv_counts, view, me, prev, elapsed, cpu_pct,
 # network columns' mbps are megabits, the unit links are.
 DISK_FIELDS = ["disk_rd_iops", "disk_rd_mb_s", "disk_rd_avg_us",
                "disk_rd_p99_us", "disk_wr_iops", "disk_wr_mb_s",
-               "disk_wr_avg_us", "disk_wr_p99_us", "disk_busy_pct"]
+               "disk_wr_avg_us", "disk_wr_p99_us", "disk_busy_pct",
+               "disk_depth"]
 
 REPORT_FIELDS = ["ts", "host", "dir", "peer", "size", "rep_size", "target_pps",
                  "pps", "mbps", "rep_pps", "rep_mbps", "loss_pct",
@@ -1638,13 +1868,17 @@ def _merge_disk(parts):
 
     Rates add across workers; the averages are weighted by operations and
     the p99 comes from the combined histogram, never a mean of the workers'.
-    Busy is the busiest worker's share of its time spent blocked on the
-    disk, not the average, for the same reason the agent CPU is: one worker
-    stuck on its disk is a ceiling even while its siblings are not.
+    Busy is the busiest worker's share of its I/O capacity in use -- time
+    spent in disk calls over elapsed time times --disk-depth, which at depth
+    1 is simply the share of its time it spent blocked on the disk. The
+    busiest, not the average, for the same reason the agent CPU is: one
+    worker whose every I/O slot is full is a ceiling even while its
+    siblings are not.
     """
     if not parts:
         return None
-    out = {"busy": 0.0, "errors": 0}
+    out = {"busy": 0.0, "errors": 0,
+           "depth": max(p.get("depth", 1) for p in parts)}
     for side in ("rd", "wr"):
         ops = rate = byte_rate = took = 0.0
         hist = [0] * RTT_NBUCKETS
@@ -1660,7 +1894,7 @@ def _merge_disk(parts):
                      "avg_us": (took / ops * 1e6) if ops else None,
                      "p99_us": rtt_percentile(hist, 0.99) if ops else None}
     for p in parts:
-        el = max(p["elapsed"], 1e-3)
+        el = max(p["elapsed"], 1e-3) * p.get("depth", 1)
         out["busy"] = max(out["busy"],
                           (p["rd"]["time"] + p["wr"]["time"]) / el * 100.0)
         out["errors"] += p.get("errors", 0)
@@ -1676,7 +1910,7 @@ def _disk_cells(d):
         x = d[side]
         cells += [_num(x["iops"]), _num(x["bytes_s"] / 1e6, "%.3f"),
                   _num(x["avg_us"], "%.0f"), _num(x["p99_us"], "%.0f")]
-    return cells + [_num(d["busy"])]
+    return cells + [_num(d["busy"]), d["depth"]]
 
 
 class Reporter(object):
@@ -1842,11 +2076,12 @@ class Reporter(object):
             + (" layer=%d" % cur_layer if cur_layer is not None else "")
             + (" busiest_worker=%.0f%% of a core" % agent_cpu
                if agent_cpu is not None else "")
-            + (" disk=rd %s (%s iops) wr %s (%s iops) busy=%.0f%%%s"
+            + (" disk=rd %s (%s iops) wr %s (%s iops) busy=%.0f%%%s%s"
                % (fmt_bytes_rate(disk["rd"]["bytes_s"]),
                   fmt_count(disk["rd"]["iops"]),
                   fmt_bytes_rate(disk["wr"]["bytes_s"]),
                   fmt_count(disk["wr"]["iops"]), disk["busy"],
+                  " depth=%d" % disk["depth"] if disk["depth"] > 1 else "",
                   " errors=%d" % disk["errors"] if disk["errors"] else "")
                if disk else ""))
 
@@ -1942,7 +2177,7 @@ def resolve_grace(interval, nworkers):
     return min(interval * 0.5, 1.0 + 0.01 * nworkers)
 
 
-def raise_fd_limit(nflows):
+def raise_fd_limit(nflows, extra=0):
     """Every flow is a socket, so make sure this process may open enough.
 
     Raising the SOFT limit up to the hard limit needs no privilege and
@@ -1957,8 +2192,9 @@ def raise_fd_limit(nflows):
     """
     # Flows + per-worker listener/report/queue plumbing + interpreter
     # headroom. Workers inherit the parent's limit, and no worker holds
-    # more than the whole agent would.
-    need = nflows + 64
+    # more than the whole agent would. `extra` is anything else a worker
+    # holds open: one disk file handle per --disk-depth thread, and a pipe.
+    need = nflows + extra + 64
     try:
         import resource
     except ImportError:
@@ -1970,12 +2206,13 @@ def raise_fd_limit(nflows):
     if soft >= need:
         return
     if hard != resource.RLIM_INFINITY and hard < need:
-        die("this run needs ~%d file descriptors (%d flows; each is a "
-            "socket) but the hard limit is %d, which only an administrator "
+        die("this run needs ~%d file descriptors (%d flows, each a socket%s) "
+            "but the hard limit is %d, which only an administrator "
             "can raise. Either raise it (limits.conf / systemd "
             "LimitNOFILE), lower --streams, use fewer peers (`mx gen "
             "--peers K`), or split the load across more hosts."
-            % (need, nflows, hard))
+            % (need, nflows,
+               ", plus %d disk handles" % extra if extra else "", hard))
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
         log("fd limit: soft %d -> %d (hard %s; raising the soft limit "
@@ -1988,6 +2225,22 @@ def raise_fd_limit(nflows):
         # guess wrongly here.
         log("fd limit: could not raise soft limit %d -> %d (%s); "
             "continuing, but flows may fail to open" % (soft, need, exc))
+
+
+def resolve_disk_depth(spec):
+    """--disk-depth N: disk I/Os each worker keeps in flight."""
+    try:
+        n = int(spec)
+    except (TypeError, ValueError):
+        die("--disk-depth wants a number (got %r)" % spec)
+    if n < 1:
+        die("--disk-depth must be at least 1")
+    if n > MAX_DISK_DEPTH:
+        die("--disk-depth above %d is almost certainly a mistake (got %d): "
+            "each one is a thread and a file handle in every worker; for "
+            "more I/O in flight, raise --workers as well"
+            % (MAX_DISK_DEPTH, n))
+    return n
 
 
 def resolve_streams(spec):
@@ -2025,6 +2278,9 @@ def cmd_agent(args):
 
     peers = matrix.peers_of(me)
     streams = resolve_streams(args.streams)
+    depth = resolve_disk_depth(args.disk_depth)
+    # A disk handle per I/O slot, and the pool's wake-up pipe.
+    disk_fds = depth + 2 if matrix.disk != "off" else 0
     lay = matrix.layering
 
     # Resolve every peer address ONCE, here in the parent, before any
@@ -2070,7 +2326,7 @@ def cmd_agent(args):
         nworkers = resolve_workers(args.workers, maxflows)
         # x2: at every switch the old layer's sockets stay open one
         # interval to catch in-flight replies while the new layer sends.
-        raise_fd_limit(2 * maxflows)
+        raise_fd_limit(2 * maxflows, disk_fds)
     else:
         specs = []
         for peer, pps in peers:
@@ -2080,7 +2336,7 @@ def cmd_agent(args):
                 specs.append((peer, resolved(addr), port, per_stream, s))
         nworkers = resolve_workers(args.workers, len(specs))
         # Before any worker forks, so they all inherit the raised limit.
-        raise_fd_limit(len(specs))
+        raise_fd_limit(len(specs), disk_fds)
 
     cfg = {"sndbuf": args.sndbuf, "rcvbuf": args.rcvbuf, "bind_ip": bind_ip,
            "interval": args.interval, "duration": args.duration,
@@ -2099,7 +2355,7 @@ def cmd_agent(args):
         direct, why = disk_probe(path)
         cfg["disk"] = {"path": path, "size": size, "direct": direct,
                        "requests": matrix.disk_requests,
-                       "replies": matrix.disk_replies}
+                       "replies": matrix.disk_replies, "depth": depth}
         fstype = disk_fs_type(path)
         if fstype in MEMORY_FILESYSTEMS:
             how = ("but %s is on %s, which is memory, not a disk: these "
@@ -2114,9 +2370,13 @@ def cmd_agent(args):
             how = ("buffered: %s, and the page cache may absorb some of "
                    "it" % why)
         disk_note = ("disk: %s -- %s at random %d-byte-aligned offsets in "
-                     "%s (%s); %s"
+                     "%s (%s); %s; %s"
                      % (matrix.disk, DISK_SENTENCE[matrix.disk],
-                        DISK_BLOCK, args.disk_file, fmt_size(size), how))
+                        DISK_BLOCK, args.disk_file, fmt_size(size), how,
+                        "one I/O in flight per worker, done between packets"
+                        if depth == 1 else
+                        "%d I/Os in flight per worker (--disk-depth), %d "
+                        "across the host" % (depth, depth * nworkers)))
 
     # Round-robin so that when the flow count does not divide evenly the
     # remainder is spread, not piled on worker 0. Striding by stream means
@@ -2336,6 +2596,8 @@ def _agent_flags(args):
         flags += ["--rcvbuf", str(args.rcvbuf)]
     if args.disk_size and args.disk_size != DEFAULT_DISK_SIZE:
         flags += ["--disk-size", str(args.disk_size)]
+    if getattr(args, "disk_depth", 1) != 1:
+        flags += ["--disk-depth", str(args.disk_depth)]
     return flags
 
 
@@ -2750,8 +3012,9 @@ def cmd_check(args):
                        fmt_count(wr_ops), fmt_bytes_rate(wr_b)))
             if len(drows) > args.top:
                 log("  ... %d more (raise --top)" % (len(drows) - args.top))
-            log("  each agent worker is one I/O in flight at a time, so a "
-                "host's queue depth is its --workers")
+            log("  each agent worker keeps --disk-depth I/Os in flight (1 "
+                "unless raised), so a host's queue depth is --workers x "
+                "--disk-depth; a high-latency disk needs it deep")
 
     if args.nic_gbps or args.nic_mpps:
         log("")
@@ -3002,6 +3265,7 @@ def cmd_start(args):
     _check_dwell_interval(m, args.interval)
     # Refused here, before anything is copied, rather than by every agent.
     resolve_disk_size(args.disk_size)
+    resolve_disk_depth(args.disk_depth)
     fleet = Fleet(m, args)
     agent_src = _agent_source()
     flags = _agent_flags(args)
@@ -3451,6 +3715,9 @@ def _disk_summary(hostagg):
                       or None,
         }
     out["busy"] = dict((h, a.mean("disk_busy_pct")) for h, a in hosts)
+    # Reports from before --disk-depth existed carry no depth: they ran one.
+    out["depth"] = dict((h, int(a.mean("disk_depth")) if a.counts.get(
+        "disk_depth") else 1) for h, a in hosts)
     return out
 
 
@@ -3695,8 +3962,10 @@ def cmd_summarize(args):
                 % (label, fmt_bytes_rate(d["bytes_s"]), fmt_count(d["iops"]),
                    fmt_us(d["avg_us"]), fmt_us(d["p99_us"])))
         worst = max(disk["busy"].items(), key=lambda kv: kv[1])
-        log("  DISK BUSY %13s   of the busiest worker's time, on %s"
-            % ("%.0f%%" % worst[1], worst[0]))
+        depth = disk["depth"].get(worst[0], 1)
+        log("  DISK BUSY %13s   of the busiest worker's I/O capacity, on %s%s"
+            % ("%.0f%%" % worst[1], worst[0],
+               " (%d I/Os in flight per worker)" % depth if depth > 1 else ""))
         if m.disk_requests or m.disk_replies:
             # Said once, because it changes what the RTT line means.
             log("            RTT includes the responder's disk %s: the "
@@ -3920,17 +4189,25 @@ def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
         worst = disk_bound[0]
         workers = int(hostagg[worst[0]].mean("workers") or 1) \
             if worst[0] in hostagg else 1
-        hints.append("%d host(s) spend most of their time waiting on the disk "
-                     "-- the busiest worker on %s is blocked on it %.0f%% of "
-                     "the time. The disk, not the fabric, is setting the pace "
-                     "of this run, and while a worker waits on its disk it is "
-                     "not draining its sockets, so the loss and RTT here "
-                     "include disk time. Each worker is one I/O in flight "
-                     "(%s has %d): raise `mx start --workers` to deepen the "
-                     "queue, point --remote-dir at a faster disk, or lower "
-                     "--pps to the rate the disks sustain."
-                     % (len(disk_bound), worst[0], worst[1], worst[0],
-                        workers))
+        depth = disk["depth"].get(worst[0], 1)
+        if depth == 1:
+            lever = ("Each worker does one I/O at a time (%s has %d): `mx "
+                     "start --disk-depth 8` keeps 8 in flight per worker, "
+                     "which is what a high-latency disk needs" % (worst[0],
+                                                                 workers))
+        else:
+            lever = ("%s's %d worker(s) each keep %d I/Os in flight and "
+                     "fill them: raise --disk-depth further" % (worst[0],
+                                                               workers, depth))
+        hints.append("%d host(s) are held up by the disk -- the busiest worker "
+                     "on %s keeps %.0f%% of its I/O capacity busy. The disk, "
+                     "not the fabric, is setting the pace of this run, and a "
+                     "worker whose disk cannot keep up leaves packets waiting "
+                     "in its socket buffers, so the loss and RTT here include "
+                     "disk time. %s, or raise --workers, point --remote-dir at "
+                     "a faster disk, or lower --pps to the rate the disks "
+                     "sustain."
+                     % (len(disk_bound), worst[0], worst[1], lever))
     if coverage:
         measured, total, cycle = coverage
         if measured < total:
@@ -3991,10 +4268,11 @@ def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
         # pacer that stalls on a disk write loses the tokens that overflow
         # its small bucket meanwhile, rather than bursting to catch up.
         hints.append("sending %.0f%% of the target rate, with CPU to spare "
-                     "but the busiest worker (on %s) blocked on its disk "
-                     "%.0f%% of the time: a worker waiting on its disk is not "
-                     "sending, so the shortfall is the disk's. Raise `mx "
-                     "start --workers` to spread the I/O, or lower --pps."
+                     "but the busiest worker (on %s) keeping %.0f%% of its "
+                     "disk I/O capacity busy: a worker waiting on its disk is "
+                     "not sending, so the shortfall is the disk's. Raise `mx "
+                     "start --disk-depth` (more I/O in flight per worker) or "
+                     "--workers, or lower --pps."
                      % (pct(tx_pps, target), disk_busy[0][0], disk_busy[0][1]))
     elif short and not disk_bound:
         hints.append("sending only %.0f%% of the target rate with CPU to "
@@ -4032,7 +4310,8 @@ def _summary_hints(rx_size, hostagg, flowcount, target, tx_pps, rep_pps,
                      "land leaves them in its flow socket's buffer -- the "
                      "kernel default, a few dozen large replies -- and drops "
                      "the rest. Compare a run without --disk before blaming "
-                     "the return path; more --workers spreads the stalls."
+                     "the return path; a deeper --disk-depth, or more "
+                     "--workers, spreads the stalls."
                      % (ret_loss, disk_suspect[1], disk_suspect[0]))
     elif ret_loss > 1.0 and not disk_bound:
         hints.append("%.1f%% of the loss is on the reply path only. With "
@@ -4158,7 +4437,7 @@ EXPORT_HOST_TESTS = [
     ("disk_write_iops", 'unit=IOPS higher=good agg=sum decimals=0 short=WIOP label="Disk write operations"'),
     ("disk_read_p99", 'unit=us higher=bad agg=max decimals=0 short=DRP99 label="Disk read p99"'),
     ("disk_write_p99", 'unit=us higher=bad agg=max decimals=0 short=DWP99 label="Disk write p99"'),
-    ("disk_busy", 'unit=% higher=bad min=0 max=100 agg=max decimals=0 short=DISK label="Busiest mx worker, time blocked on disk"'),
+    ("disk_busy", 'unit=% higher=bad min=0 max=100 agg=max decimals=0 short=DISK label="Busiest mx worker, disk I/O capacity in use"'),
     ("peers", 'higher=good agg=min decimals=0 short=PEER label="Flows this host sends"'),
     ("workers", 'higher=good agg=min decimals=0 short=WRK label="Agent worker processes"'),
     ("intervals", 'higher=good agg=min decimals=0 short=IVL label="Report intervals in the window"'),
@@ -4816,7 +5095,9 @@ mx hints -- what you want, and the command that gets it
       random offsets, so the page cache cannot absorb them; `mx summarize`
       reports the disks beside the network and says which one is the
       ceiling. The data file lives in --remote-dir (--disk-size, default
-      1G), is written once and reused, and `mx clean` removes it.
+      1G), is written once and reused, and `mx clean` removes it. On a
+      high-latency disk add `mx start --disk-depth 8`: each worker then
+      keeps 8 I/Os in flight instead of one.
 
   A FIXED BANDWIDTH INSTEAD OF A FIXED PACKET RATE
     mx gen --servers servers.txt --gbps 10 --tx-size 1400
@@ -5001,6 +5282,14 @@ def _add_run_flags(p):
                         "reads and writes, in --remote-dir. Written once and "
                         "reused by later runs; bigger spreads the random "
                         "I/O over more of the disk (default: %(default)s)")
+    p.add_argument("--disk-depth", type=int, default=1, metavar="N",
+                   help="with a --disk matrix: disk I/Os each worker keeps in "
+                        "flight, so a host's queue depth is --workers x N. "
+                        "1 does each I/O between packets; more runs N I/O "
+                        "threads per worker, which is what a high-latency "
+                        "disk (cloud volume, HDD, network storage) needs. On "
+                        "a fast local disk 1 is the most efficient "
+                        "(default: %(default)s)")
     p.add_argument("--no-deploy", action="store_true",
                    help="do not copy the agent/matrix, just start what is there")
 
@@ -5237,6 +5526,9 @@ def build_parser():
                         "write (default: %(default)s)")
     a.add_argument("--disk-size", default=DEFAULT_DISK_SIZE, metavar="SIZE",
                    help="its size; an existing file of this size is reused "
+                        "(default: %(default)s)")
+    a.add_argument("--disk-depth", type=int, default=1, metavar="N",
+                   help="disk I/Os each worker keeps in flight "
                         "(default: %(default)s)")
     a.add_argument("--prepare-disk", action="store_true",
                    help="write the data file (or find it already written) "
