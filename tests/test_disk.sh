@@ -479,11 +479,175 @@ test_a_disk_bound_run_names_the_disk_not_the_fabric() {
     two_hosts --pps 2000 --tx-size 128 --rx-size 8192 --disk replies || return 1
     run_mx summarize --reports rep --no-collect --window 30
     assert_status 0 "$RUN_RC" || return 1
-    assert_contains "$RUN_OUT" "waiting on the disk" || return 1
-    assert_contains "$RUN_OUT" "--workers" "the lever is named" || return 1
+    assert_contains "$RUN_OUT" "held up by the disk" || return 1
+    # At depth 1 the first lever is a deeper queue per worker.
+    assert_contains "$RUN_OUT" "--disk-depth 8" "the lever is named" || return 1
     assert_not_contains "$RUN_OUT" "that is the fabric dropping" \
         "loss on a disk-bound run is not blamed on the fabric" || return 1
     assert_not_contains "$RUN_OUT" "a flow may have failed to open" || return 1
+}
+
+# ---- --disk-depth: more than one I/O in flight per worker -----------------
+
+test_disk_pool_runs_every_kind_of_job() {
+    # The pool on its own: every job kind comes back, in the shape the
+    # event loop expects, with its payload copied out of the thread's buffer
+    # and every operation counted -- and never more outstanding than its
+    # bound. Then every thread stops.
+    run_mx agent --prepare-disk --disk-file d.dat --disk-size 2M
+    python3 - <<'EOF'
+import collections, os, selectors, sys
+sys.path.insert(0, os.environ["REPO_ROOT"] + "/matrix_orchestrator")
+import mx
+direct, _why = mx.disk_probe("d.dat")
+pool = mx.DiskPool("d.dat", 2 << 20, direct, 4)
+assert len(pool.ios) == 4 and all(t.is_alive() for t in pool._threads)
+pkt = b"\0" * mx.HDR_SIZE + b"x" * 1000
+jobs = ([("req", "flow", 4064)] * 30 + [("srv", pkt, 8160, "ctx")] * 20
+        + [("srv", None, 100, "c2")] * 10 + [("wr", pkt)] * 15)
+sel = selectors.DefaultSelector()
+sel.register(pool.wake_fd, selectors.EVENT_READ)
+done, sent = [], 0
+while len(done) < len(jobs):
+    while sent < len(jobs) and pool.room():
+        pool.submit(jobs[sent])
+        sent += 1
+    assert pool.pending <= pool.limit, "the queue outgrew its bound"
+    assert sel.select(5.0), "no completion woke the loop"
+    done += pool.completions()
+kinds = collections.Counter(d[0] for d in done)
+assert kinds == {"req": 30, "srv": 30, "wr": 15}, kinds
+for d in done:
+    if d[0] == "req":
+        assert d[1] == "flow" and type(d[2]) is bytes and len(d[2]) == 4064, d
+    elif d[0] == "srv":
+        assert type(d[1]) is bytes and len(d[1]) in (8160, 100), d
+        assert d[2] in ("ctx", "c2")
+assert pool.pending == 0
+assert sum(io.rd_ops for io in pool.ios) == 60, "30 requests + 30 replies read"
+assert sum(io.wr_ops for io in pool.ios) == 35, "20 requests + 15 replies written"
+assert sum(1 for io in pool.ios if io.rd_ops + io.wr_ops) > 1, \
+    "the work was not shared between the threads"
+pool.close()
+assert not any(t.is_alive() for t in pool._threads), "a thread outlived close"
+EOF
+    assert_status 0 $? "every job kind, counted and bounded" || return 1
+}
+
+test_disk_depth_is_validated() {
+    two_hosts --pps 100 --rx-size 4096 --disk replies || return 1
+    run_mx agent --matrix matrix.csv --host alpha --duration 1 --disk-depth 0 \
+        --disk-file d.dat --disk-size 1M
+    assert_status 2 "$RUN_RC" || return 1
+    assert_contains "$RUN_OUT" "at least 1" || return 1
+    run_mx agent --matrix matrix.csv --host alpha --duration 1 --disk-depth 1000 \
+        --disk-file d.dat --disk-size 1M
+    assert_status 2 "$RUN_RC" "an absurd depth is refused" || return 1
+    # Every I/O slot is a file handle: a too-low hard limit names them.
+    python3 - <<'EOF'
+import contextlib, io, os, sys
+sys.path.insert(0, os.environ["REPO_ROOT"] + "/matrix_orchestrator")
+import mx, resource
+resource.getrlimit = lambda what: (100, 100)
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err):
+        mx.raise_fd_limit(50, 40)
+    raise AssertionError("over the hard limit and not refused")
+except SystemExit:
+    pass
+assert "plus 40 disk handles" in err.getvalue(), err.getvalue()
+EOF
+    assert_status 0 $? "the descriptor budget counts the disk handles" || return 1
+}
+
+test_a_deeper_queue_keeps_a_slow_disk_busy() {
+    # The point of --disk-depth. With 2 ms added to every I/O, one I/O at a
+    # time caps a worker near 500 a second, short of a 1000/s target; eight
+    # in flight carry it. Only beta serves, on one worker, so its disk reads
+    # are exactly its replies.
+    local p; p=$(pick_port)
+    write_servers "$p" alpha beta > /dev/null
+    run_mx gen --servers servers.txt --pps 1000 --tx-size 128 --rx-size 4096 \
+        --disk replies
+    awk -F, 'BEGIN{OFS=","} /^beta=/{$2=""} {print}' matrix.csv > m.new \
+        && mv m.new matrix.csv
+    local depth rd want _ shallow deep
+    for depth in 1 8; do
+        rm -rf rep
+        MX_TEST_DISK_DELAY=0.002 run_disk_agents 7 alpha beta --workers 1 \
+            --disk-depth "$depth"
+        assert_not_contains "$(cat rep/alpha.log rep/beta.log)" "Traceback" || return 1
+        read -r rd want _ _ < <(disk_io rep/beta.csv replies)
+        assert_io "$rd" "$want" "depth $depth: one read per reply" || return 1
+        if [ "$depth" = 1 ]; then shallow=$rd; else deep=$rd; fi
+    done
+    assert_contains "$(cat rep/beta.log)" "8 I/Os in flight per worker" || return 1
+    assert_contains "$(grep -m1 'disk=rd' rep/beta.log)" "depth=8" \
+        "the status line shows the depth" || return 1
+    assert_eq "8" "$(host_col rep/beta.csv disk_depth | cut -d. -f1)" \
+        "the report records it" || return 1
+    assert_between 1.5 100 "$(python3 -c "print($deep / max($shallow, 1))")" \
+        "8 in flight move more I/O than 1 on a slow disk ($shallow -> $deep/s)" || return 1
+}
+
+test_disk_depth_runs_every_path_through_the_pool() {
+    # Both directions on disk at depth 4: requests read before they go,
+    # written before they are answered, replies read before they go and
+    # written when they land -- all four through the I/O threads, and the
+    # accounting is the same as inline.
+    two_hosts --pps 200 --tx-size 1024 --rx-size 1024 --disk both || return 1
+    run_disk_agents 7 alpha beta --workers 2 --disk-depth 4
+    assert_not_contains "$(cat rep/alpha.log rep/beta.log)" "Traceback" || return 1
+    assert_contains "$(cat rep/alpha.log)" "4 I/Os in flight per worker (--disk-depth), 8 across the host" || return 1
+    local h rd rd_want wr wr_want req_rd rep_rd _
+    for h in alpha beta; do
+        read -r rd rd_want wr wr_want < <(disk_io "rep/$h.csv" both)
+        assert_io "$rd" "$rd_want" "$h reads every payload it sends" || return 1
+        assert_io "$wr" "$wr_want" "$h writes every payload it receives" || return 1
+        read -r _ req_rd _ _ < <(disk_io "rep/$h.csv" requests)
+        read -r _ rep_rd _ _ < <(disk_io "rep/$h.csv" replies)
+        assert_between 0.3 0.7 "$(python3 -c "print($req_rd / $rd_want)")" \
+            "$h's request reads are a real share" || return 1
+        assert_between 0.3 0.7 "$(python3 -c "print($rep_rd / $rd_want)")" \
+            "$h's reply reads are a real share" || return 1
+    done
+    # And the network half is answered as it always was.
+    assert_between 20 300 "$(host_col rep/alpha.csv rep_pps)" "replies come back" || return 1
+}
+
+test_a_layered_rotation_with_a_deep_disk_queue() {
+    # Layer switches close flows while their payloads may still be being
+    # read: those reads finish, are counted, and send nothing on a flow that
+    # has ended -- no crash, and the rotation still covers every peer.
+    local p; p=$(pick_port)
+    write_servers "$p" a b c d > /dev/null
+    run_mx gen --servers servers.txt --pps 300 --peers 1 --dwell 4 --seed 7 \
+        --tx-size 1024 --disk requests
+    assert_status 0 "$RUN_RC" || return 1
+    mkdir -p rep
+    local h pids=()
+    for h in a b c d; do
+        python3 "$MX" agent --matrix matrix.csv --host "$h" \
+            --report "rep/$h.csv" --interval 2 --duration 14 --workers 1 \
+            --disk-depth 4 --disk-file "rep/$h.disk" --disk-size 4M \
+            > "rep/$h.log" 2>&1 &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    assert_not_contains "$(cat rep/*.log)" "Traceback" || return 1
+    assert_not_contains "$(cat rep/*.log)" "died" || return 1
+    python3 - <<'EOF'
+import csv
+for h in "abcd":
+    peers = set()
+    for r in csv.DictReader(open("rep/%s.csv" % h, newline="")):
+        if r["dir"] == "tx" and r.get("pps"):
+            assert float(r["pps"]) >= 0, r
+            peers.add(r["peer"])
+    assert peers == set("abcd") - {h}, "%s covered %r" % (h, peers)
+EOF
+    assert_status 0 $? "the rotation completes with a deep disk queue" || return 1
 }
 
 # ---- the fleet -------------------------------------------------------------
@@ -501,7 +665,7 @@ host_dir() { echo "$FAKE_ROOT/$1$MX_REMOTE_DIR"; }
 
 test_start_prepares_every_disk_before_any_agent_starts() {
     setup_disk_fleet "$(pick_port)" --pps 500 --rx-size 4096 --disk replies || return 1
-    run_mx start --interval 2 --duration 30 --disk-size 2M
+    run_mx start --interval 2 --duration 30 --disk-size 2M --disk-depth 3
     assert_status 0 "$RUN_RC" "start" || return 1
     assert_contains "$RUN_OUT" "disk: preparing a 2.0 MiB data file" || return 1
     assert_contains "$RUN_OUT" "disk=replies" "start says the run is on disk" || return 1
@@ -519,11 +683,14 @@ launch = [i for i, l in enumerate(lines) if "nohup" in l]
 assert len(prep) == 2 and launch, (prep, launch)
 assert max(prep) < min(launch), "an agent started before every disk was ready"
 assert all("--disk-size 2M" in lines[i] for i in prep + launch)
+assert all("--disk-depth 3" in lines[i] for i in launch), "depth not passed on"
 EOF
     assert_status 0 $? "prepare, then start" || return 1
     sleep 3
     # The agent found the file ready rather than writing it under load.
     assert_contains "$(cat "$(host_dir 127.0.0.1)/agent.log")" "reusing disk.dat" || return 1
+    assert_contains "$(cat "$(host_dir 127.0.0.1)/agent.log")" "3 I/Os in flight per worker" \
+        "the agent runs the depth it was started with" || return 1
     run_mx stop
     assert_contains "$RUN_OUT" "disk.dat data file" "stop says the file stays" || return 1
     assert_file_exists "$(host_dir 127.0.0.1)/disk.dat" "stop keeps it for the next run" || return 1
@@ -536,6 +703,9 @@ test_start_with_a_bad_disk_size_touches_nothing() {
     setup_disk_fleet "$(pick_port)" --pps 500 --disk replies || return 1
     run_mx start --disk-size lots
     assert_status 2 "$RUN_RC" || return 1
+    assert_no_file "$(host_dir 127.0.0.1)/mx.py" "refused before deploying" || return 1
+    run_mx start --disk-depth 0
+    assert_status 2 "$RUN_RC" "a bad depth is refused the same way" || return 1
     assert_no_file "$(host_dir 127.0.0.1)/mx.py" "refused before deploying" || return 1
 }
 
@@ -587,6 +757,11 @@ run_test test_disk_columns_stay_blank_without_disk
 run_test test_summarize_and_export_report_the_disks
 run_test test_summarize_without_disk_says_nothing_about_disks
 run_test test_a_disk_bound_run_names_the_disk_not_the_fabric
+run_test test_disk_pool_runs_every_kind_of_job
+run_test test_disk_depth_is_validated
+run_test test_a_deeper_queue_keeps_a_slow_disk_busy
+run_test test_disk_depth_runs_every_path_through_the_pool
+run_test test_a_layered_rotation_with_a_deep_disk_queue
 run_test test_start_prepares_every_disk_before_any_agent_starts
 run_test test_start_with_a_bad_disk_size_touches_nothing
 run_test test_reload_brings_the_disk_in_on_a_running_fleet
