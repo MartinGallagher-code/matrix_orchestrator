@@ -66,7 +66,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -3854,6 +3854,107 @@ def _report_sizes(rows, tx_size, rx_size):
     return tx_size, rx_size
 
 
+# The agents start and stop host by host -- `mx start` and `mx stop` reach
+# them over ssh, a --jobs batch at a time -- so the first and last seconds of
+# a run are not a mesh: a peer not yet up, or already gone, answers nothing.
+# Its requests then count as sent by their sender and never as arrived by a
+# receiver that wrote no row, and the gap reads as replies lost on the way
+# back on cables nowhere near full. A run is measured over the span every
+# agent was running. Hosts start (and stop) within seconds of each other; one
+# further apart than this from the rest is not part of the fleet's start or
+# stop -- a host that died, or came late -- and its loss stays in.
+EDGE_GAP_MIN = 15
+
+
+def _report_interval(rows):
+    """The agents' report interval, read off the reports: the typical step
+    between one host's consecutive host rows."""
+    seen = {}
+    for r in rows:
+        if r.get("dir") == "host":
+            seen.setdefault(r["host"], set()).add(int(float(r["ts"])))
+    steps = []
+    for times in seen.values():
+        ts = sorted(times)
+        steps.extend(b - a for a, b in zip(ts, ts[1:]) if b > a)
+    return _median(steps) or DEFAULT_INTERVAL
+
+
+def _steady_span(rows):
+    """(start, end): the span of report timestamps over which every agent was
+    running, or None when there is no fleet to wait for.
+
+    A row stamped t covers the interval before t. The last host of the
+    fleet's start wrote its first row at `start`, having been up for the
+    interval before it, so every row stamped `start` or later was measured
+    against it; likewise every row stamped `end` or earlier, `end` being the
+    last row of the first host of the fleet's stop.
+    """
+    first, last = {}, {}
+    for r in rows:
+        host = r.get("host")
+        if not host:
+            continue
+        t = int(float(r["ts"]))
+        if host not in first or t < first[host]:
+            first[host] = t
+        if host not in last or t > last[host]:
+            last[host] = t
+    if len(first) < 2:
+        return None
+    gap = max(EDGE_GAP_MIN, 3 * _report_interval(rows))
+
+    def edge(times):
+        # Along the times from the fleet's end of the run inwards, as far
+        # as they come close together: a host further off is not the fleet.
+        at = times[0]
+        for t in times[1:]:
+            if abs(t - at) > gap:
+                break
+            at = t
+        return at
+    start = edge(sorted(first.values()))
+    end = edge(sorted(last.values(), reverse=True))
+    return (start, end) if start <= end else None
+
+
+def _window_rows(rows, window):
+    """The rows a summary is made of: the last `window` seconds (all of them
+    at 0) of the span every agent was running, and what was left out.
+
+    Returns (recent, span) -- span is None when nothing needed trimming or
+    trimming would have left nothing, in which case `recent` is the plain
+    window back from the newest row, as before.
+    """
+    stamp = lambda r: int(float(r["ts"]))
+    latest = max(stamp(r) for r in rows)
+    earliest = min(stamp(r) for r in rows)
+    span = _steady_span(rows)
+    if span and (span[0] > earliest or span[1] < latest):
+        lo, hi = span
+        cutoff = hi - window if window > 0 else lo
+        recent = [r for r in rows if max(lo, cutoff) <= stamp(r) <= hi]
+        if recent:
+            return recent, {"start": lo, "end": hi, "earliest": earliest,
+                            "latest": latest}
+    if window > 0:
+        return [r for r in rows if stamp(r) >= latest - window], None
+    return list(rows), None
+
+
+def _trim_note(trim):
+    """What a trimmed window left out, in words, or ''."""
+    if not trim:
+        return ""
+    parts = []
+    if trim["start"] > trim["earliest"]:
+        parts.append("the %ds the agents took to start" % (trim["start"] - trim["earliest"]))
+    if trim["end"] < trim["latest"]:
+        parts.append("the %ds they took to stop" % (trim["latest"] - trim["end"]))
+    return ("measured while every agent was running: %s left out"
+            % " and ".join(parts)) if parts else ""
+
+
 def _read_reports(paths):
     rows = []
     for p in paths:
@@ -3880,9 +3981,7 @@ def cmd_summarize(args):
     rows = _read_reports(paths)
     if not rows:
         die("reports are empty -- give the agents an interval or two, then retry")
-    latest = max(int(float(r["ts"])) for r in rows)
-    cutoff = latest - args.window
-    recent = [r for r in rows if int(float(r["ts"])) >= cutoff]
+    recent, trim = _window_rows(rows, args.window)
 
     tx_size, rx_size = _report_sizes(recent, m.tx_size, m.rx_size)
 
@@ -3931,6 +4030,8 @@ def cmd_summarize(args):
     log("")
     log("mx summarize -- last %ds, %d hosts, %d flows, %d bytes out -> %d bytes back"
         % (args.window, len(m.hosts), len(tx), tx_size, rx_size))
+    if _trim_note(trim):
+        log("(%s)" % _trim_note(trim))
     if layered:
         log("layered -- %d layers of %d peers rotating every %gs; rates are "
             "time averages over the window"
@@ -4696,11 +4797,8 @@ def cmd_export(args):
     if not rows:
         die("reports are empty -- give the agents an interval or two, then retry")
 
-    latest = max(int(float(r["ts"])) for r in rows)
-    if args.window > 0:
-        recent = [r for r in rows if int(float(r["ts"])) >= latest - args.window]
-    else:
-        recent = rows          # --window 0: the whole history
+    # --window 0: the whole history -- of the span every agent was running.
+    recent, trim = _window_rows(rows, args.window)
     if not recent:
         die("no rows in the last %ds -- widen --window, or --window 0 for "
             "everything the reports hold" % args.window)
@@ -4897,6 +4995,7 @@ def cmd_export(args):
     # thirty runs: what the numbers are of, and what was missing from them.
     stamp = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
     earliest = min(int(float(r["ts"])) for r in recent)
+    latest = max(int(float(r["ts"])) for r in recent)
     header = [
         "# mx %s export -- %d host(s), %s, %d sample(s)"
         % (VERSION, len(stats),
@@ -4909,6 +5008,8 @@ def cmd_export(args):
            ", disk=%s" % m.disk if (m and m.disk != "off") else ""),
         "# window covers %s .. %s" % (stamp(earliest), stamp(latest)),
     ]
+    if _trim_note(trim):
+        header.append("# %s" % _trim_note(trim))
     if args.nic_gbps:
         header.append("# NIC line rate %g Gb/s: mx_line_util included"
                       % args.nic_gbps)

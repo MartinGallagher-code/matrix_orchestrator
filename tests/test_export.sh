@@ -33,6 +33,36 @@ write_reports() {
         echo "1000,beta,tx,alpha,64,64,1000.0,1000.0,0.520,1000.0,0.520,0.000,50,40,80,120,,,,,"
         echo "1000,beta,rx,alpha,64,64,,1950.0,1.014,1950.0,1.014,,,,,,,,,,"
         echo "1000,beta,host,*,64,64,1000.0,1000.0,0.520,1000.0,0.520,0.000,,40,80,,5.0,9.0,12.0,1,"
+        echo "1002,beta,tx,alpha,64,64,1000.0,1000.0,0.520,1000.0,0.520,0.000,50,40,80,120,,,,,"
+        echo "1002,beta,rx,alpha,64,64,,1950.0,1.014,1950.0,1.014,,,,,,,,,,"
+        echo "1002,beta,host,*,64,64,1000.0,1000.0,0.520,1000.0,0.520,0.000,,40,80,,5.0,9.0,12.0,1,"
+    } > rep/beta.csv
+}
+
+# A clean minute between two hosts, as `mx start` and `mx stop` deliver it:
+# beta comes up one interval after alpha and goes down one interval before.
+# alpha's requests in those two intervals go to nobody -- no reply, and no
+# row of beta's to count them arriving.
+write_skewed_reports() {
+    mkdir -p rep
+    local t
+    {
+        echo "$REPORT_HEAD"
+        for t in 1000 1005 1010 1015 1020 1025 1030; do
+            local back=2000.0
+            if [ "$t" = 1000 ] || [ "$t" = 1030 ]; then back=0.0; fi
+            echo "$t,alpha,tx,beta,64,64,2000.0,2000.0,1.040,$back,1.040,,100,90,400,900,,,,,"
+            echo "$t,alpha,rx,beta,64,64,,2000.0,1.040,2000.0,1.040,,,,,,,,,,"
+            echo "$t,alpha,host,*,64,64,2000.0,2000.0,1.040,$back,1.040,,,90,400,,10.0,20.0,30.0,1,"
+        done
+    } > rep/alpha.csv
+    {
+        echo "$REPORT_HEAD"
+        for t in 1005 1010 1015 1020 1025; do
+            echo "$t,beta,tx,alpha,64,64,2000.0,2000.0,1.040,2000.0,1.040,,100,90,400,900,,,,,"
+            echo "$t,beta,rx,alpha,64,64,,2000.0,1.040,2000.0,1.040,,,,,,,,,,"
+            echo "$t,beta,host,*,64,64,2000.0,2000.0,1.040,2000.0,1.040,,,90,400,,10.0,20.0,30.0,1,"
+        done
     } > rep/beta.csv
 }
 
@@ -181,6 +211,39 @@ test_export_splits_loss_into_the_leg_that_lost_it() {
     assert_eq "5" "$(sample "$RUN_OUT" mx_loss alpha)" "round trip" || return 1
     assert_eq "2.5" "$(sample "$RUN_OUT" mx_forward_loss alpha)" "outbound leg" || return 1
     assert_eq "2.5" "$(sample "$RUN_OUT" mx_return_loss alpha)" "return leg" || return 1
+}
+
+test_export_measures_only_while_every_agent_ran() {
+    write_skewed_reports
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    # Counted over the whole minute, alpha's first and last intervals --
+    # beta not yet up, then already gone -- read as 2 in 7 replies lost on
+    # the way back, on a mesh that lost nothing.
+    assert_eq "0" "$(sample "$RUN_OUT" mx_loss alpha)" "no loss while both ran" || return 1
+    assert_eq "0" "$(sample "$RUN_OUT" mx_return_loss alpha)" "none on the way back" || return 1
+    assert_eq "5" "$(sample "$RUN_OUT" mx_intervals alpha)" "the five intervals beta was up for" || return 1
+    assert_contains "$RUN_OUT" "measured while every agent was running: the 5s the agents took to start and the 5s they took to stop left out" \
+        "and the header says what was left out" || return 1
+}
+
+test_export_keeps_the_loss_of_a_host_that_died_early() {
+    write_skewed_reports
+    # beta's last row 30s before alpha's: not the fleet stopping, a host
+    # going down mid-run. Its peers' loss after it is real, and stays.
+    sed -i '/^10[23][05],beta,/d' rep/beta.csv
+    {
+        local t
+        for t in 1035 1040 1045 1050; do
+            echo "$t,alpha,tx,beta,64,64,2000.0,2000.0,1.040,0.0,1.040,,100,90,400,900,,,,,"
+            echo "$t,alpha,host,*,64,64,2000.0,2000.0,1.040,0.0,1.040,,,90,400,,10.0,20.0,30.0,1,"
+        done
+    } >> rep/alpha.csv
+    run_mx export --no-collect --reports rep --window 0
+    assert_status 0 "$RUN_RC" || return 1
+    local loss; loss=$(sample "$RUN_OUT" mx_loss alpha)
+    # Four of its eight intervals were to nobody.
+    assert_eq "50" "$loss" "alpha's loss to a dead beta stays in" || return 1
 }
 
 test_export_invents_no_zero_for_a_receive_side_nobody_measured() {
@@ -400,6 +463,8 @@ run_test test_export_raw_gives_one_sample_per_interval
 run_test test_export_window_keeps_only_recent_intervals
 run_test test_export_maps_host_names_onto_the_layout
 run_test test_export_splits_loss_into_the_leg_that_lost_it
+run_test test_export_measures_only_while_every_agent_ran
+run_test test_export_keeps_the_loss_of_a_host_that_died_early
 run_test test_export_invents_no_zero_for_a_receive_side_nobody_measured
 run_test test_export_reports_a_rotation_that_has_not_come_round_yet
 run_test test_export_raw_still_carries_the_derived_overlays

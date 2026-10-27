@@ -812,6 +812,20 @@ cannot see — so it appears only when every peer of that host reported an
 `mx_return_loss` is a rack whose requests are being dropped on the way in;
 the reverse is a rack whose replies cannot get out.
 
+**Only while every agent was running.** `mx start` and `mx stop` reach the
+hosts over ssh a batch at a time, so the first and last seconds of a run
+are not a mesh: a peer not yet up, or already gone, answers nothing, and
+writes no row to say the requests never arrived. Counted, those seconds
+read as replies lost on the way back -- two intervals in seven, on a
+minute that lost nothing. `mx summarize` and `mx export` measure from the
+moment the last agent of the fleet's start was up to the moment the first
+agent of its stop went down, `--window` back from there, and say what they
+left out (`# measured while every agent was running: the 5s the agents
+took to start and the 5s they took to stop left out`). A host that starts
+or stops 15 s or more (three report intervals, if longer) apart from the
+rest is not the fleet starting or stopping -- it came late, or died -- and
+the loss to it stays in.
+
 The numbers are the ones `mx summarize` prints, computed here by the
 report's own rules: a blank cell is *not measured* and never zero, a
 layered run's rates come from the host rows because most pairs are idle
