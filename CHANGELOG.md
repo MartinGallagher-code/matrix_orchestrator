@@ -9,6 +9,26 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.1] - 2026-10-27
+
+Measure a run only while every agent was running.
+
+### Fixed
+
+- **Replies lost on the way back, on cables nowhere near full.** `mx
+  start` and `mx stop` reach the hosts over ssh a batch at a time, so the
+  agents start and stop seconds apart. A request to a peer not yet up,
+  or already gone, counted as sent by its sender but never as arrived --
+  the peer wrote no row -- and with no reply either, the gap read as
+  return loss: two intervals in seven, 28.6%, on a test minute that lost
+  nothing. `mx summarize` and `mx export` now measure from the moment the
+  last agent of the fleet's start was up to the moment the first agent
+  of its stop went down, read off the reports, and `--window` counts back
+  from there. Both say what they left out. A host that starts or stops 15 s
+  (three report intervals, if longer) or more apart from the rest -- one
+  that came late, or died mid-run -- is not part of the fleet's start or
+  stop, and the loss to it stays in.
+
 ## [1.11.0] - 2026-10-02
 
 Let a worker keep more than one disk I/O in flight.
