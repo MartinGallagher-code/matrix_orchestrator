@@ -121,11 +121,10 @@ test_stop_leaves_the_data_behind() {
 }
 
 # Whether a process is running: not gone, and not a zombie left for a
-# parent that has not reaped it yet -- kill -0 succeeds on those.
+# parent that has not reaped it yet -- kill -0 succeeds on those. Read from
+# /proc, not ps: a slim container has no procps.
 running() {
-    local st
-    st=$(ps -o stat= -p "$1" 2>/dev/null)
-    [ -n "$st" ] && [ "${st#Z}" = "$st" ]
+    [ -r "/proc/$1/status" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
 }
 
 test_stopping_one_matrix_leaves_another_on_the_same_hosts_running() {
