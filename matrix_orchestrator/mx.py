@@ -66,7 +66,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -2613,10 +2613,11 @@ def _kill_block(rdir):
     every case -- `clean` appends the removal to it, so it must never
     exit early.
 
-    The pid file is the primary handle; the pgrep/pkill fallback matches
-    any mx agent on the box, so a host running two matrices out of
-    different --remote-dirs at once should be stopped by pid (which it
-    will be, unless the pid file was lost).
+    The pid file is the handle: this run's agent is told to stop, waited
+    for, and only it -- and the workers it forked -- killed if it will not
+    go. A host running two matrices out of different --remote-dirs at once
+    keeps the other one running. The pgrep/pkill fallback matches any mx
+    agent on the box, so it is used only when the pid file is lost.
     """
     return """
 d={d}
@@ -2624,15 +2625,30 @@ status=not-deployed
 if [ -d "$d" ]; then
     status=not-running
     pid=""
+    how=""
     [ -f "$d/{pid}" ] && pid=$(cat "$d/{pid}" 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         kill -TERM "$pid" 2>/dev/null
         status=stopped
+        how=pid
     elif {pgrep} >/dev/null 2>&1; then
         {term} 2>/dev/null
         status=stopped
+        how=any
     fi
-    if [ "$status" = stopped ]; then
+    if [ "$how" = pid ]; then
+        i=0
+        while [ $i -lt 20 ]; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+            i=$((i+1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            pkill -KILL -P "$pid" 2>/dev/null
+            kill -KILL "$pid" 2>/dev/null
+            status=killed
+        fi
+    elif [ "$how" = any ]; then
         i=0
         while [ $i -lt 20 ]; do
             {pgrep} >/dev/null 2>&1 || break
