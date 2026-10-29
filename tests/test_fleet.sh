@@ -120,6 +120,54 @@ test_stop_leaves_the_data_behind() {
     assert_no_file "$(host_dir 127.0.0.1)/agent.pid" "the pid file is tidied up" || return 1
 }
 
+# Whether a process is running: not gone, and not a zombie left for a
+# parent that has not reaped it yet -- kill -0 succeeds on those. Read from
+# /proc, not ps: a slim container has no procps.
+running() {
+    [ -r "/proc/$1/status" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+}
+
+test_stopping_one_matrix_leaves_another_on_the_same_hosts_running() {
+    # Two matrices on the same hosts, out of different --remote-dirs and on
+    # different ports: two loads at once. Stopping one must not touch the
+    # other -- its agents are told to stop by their own pid, and only they
+    # are killed if they will not go.
+    local port
+    port=$(pick_port)
+    setup_fleet "$port" --pps 300 || return 1
+    printf 'alpha=127.0.0.1:%d\nbeta=127.0.0.2:%d\n' "$((port + 10))" "$((port + 11))" > servers-b.txt
+    run_mx gen --servers servers-b.txt --pps 300 -o matrix-b.csv
+    assert_status 0 "$RUN_RC" "gen b" || return 1
+    local b="$MX_REMOTE_DIR-b"
+    run_mx start --interval 2 --duration 40
+    assert_status 0 "$RUN_RC" "start a" || return 1
+    run_mx start --matrix matrix-b.csv --remote-dir "$b" --interval 2 --duration 40
+    assert_status 0 "$RUN_RC" "start b" || return 1
+    sleep 2
+    local h pid pids=""
+    for h in 127.0.0.1 127.0.0.2; do
+        pids="$pids $(cat "$FAKE_ROOT/$h$b/agent.pid" 2>/dev/null)"
+    done
+    run_mx stop
+    assert_status 0 "$RUN_RC" "stop a" || return 1
+    for pid in $pids; do
+        if ! running "$pid"; then
+            echo "stopping matrix.csv killed matrix-b.csv's agent ($pid)" >&2
+            run_mx stop --matrix matrix-b.csv --remote-dir "$b"
+            return 1
+        fi
+    done
+    run_mx stop --matrix matrix-b.csv --remote-dir "$b"
+    assert_status 0 "$RUN_RC" "stop b" || return 1
+    for pid in $pids; do
+        if running "$pid"; then
+            echo "matrix-b.csv's agent ($pid) outlived its own stop" >&2
+            return 1
+        fi
+    done
+    assert_no_file "$(host_dir 127.0.0.1)/agent.pid" "a's pid file is tidied up" || return 1
+}
+
 test_clean_removes_every_trace() {
     setup_fleet "$(pick_port)" --pps 500 || return 1
     run_mx start --interval 2 --duration 30
@@ -359,6 +407,7 @@ run_test test_start_refuses_to_double_start
 run_test test_summarize_collects_from_the_hosts
 run_test test_logs_are_collected
 run_test test_stop_leaves_the_data_behind
+run_test test_stopping_one_matrix_leaves_another_on_the_same_hosts_running
 run_test test_clean_removes_every_trace
 run_test test_clean_works_when_nothing_is_running
 run_test test_clean_on_a_never_deployed_fleet_is_harmless

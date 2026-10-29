@@ -9,6 +9,25 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.2] - 2026-10-29
+
+Stop only this run's agents.
+
+### Fixed
+
+- **`mx stop` on one matrix killed another matrix's agents on the same
+  host.** Two matrices can run on one host at once out of different
+  `--remote-dir`s and ports -- two loads at the same time -- and the
+  docstring said the pid file kept them apart. It sent the TERM by pid,
+  but then waited on any `mx.py agent` on the box and, if one was still
+  there after ten seconds, `pkill -KILL`ed every one of them: the other
+  run's included, its agents dead mid-measurement. It now waits on its
+  own agent's pid and, if that will not go, kills only it and the workers
+  it forked (`pkill -KILL -P`). The match on the name is left for a lost
+  pid file, as before. `stop`, `clean` and `run` all go through it.
+  `tests/test_fleet.sh` runs two matrices on the same hosts, stops one,
+  and checks the other's agents are still running.
+
 ## [1.11.1] - 2026-10-27
 
 Measure a run only while every agent was running.
