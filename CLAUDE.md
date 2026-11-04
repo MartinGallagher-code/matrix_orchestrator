@@ -9,7 +9,7 @@ SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 
 Everything done here goes through a ticket in `MartinGallagher-code/shared_tools`,
 which keeps every project's tickets as files and moves each one Backlog → In Progress
-→ Adversarial Test → Review → Done. Before any change:
+→ Review → Done (Adversarial Test only when the owner asks). Before any change:
 
 1. Attach `MartinGallagher-code/shared_tools` with `add_repo` and push access, and
    clone it. If a clone is already here, pull it instead
