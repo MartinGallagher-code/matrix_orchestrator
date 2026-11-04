@@ -63,31 +63,63 @@ as a release gate.
 
 4. **Smoke-test the built wheel** in a throwaway virtualenv:
    ```bash
+   rm -rf /tmp/mx-check
    python -m venv /tmp/mx-check
    /tmp/mx-check/bin/pip install dist/*.whl
    /tmp/mx-check/bin/mx --version
    /tmp/mx-check/bin/mx help >/dev/null
    ```
 
-5. **Publish** — either path:
-   - **Via GitHub (preferred):** push a tag and publish a Release; the
-     `publish.yml` workflow builds, checks, smoke-tests and uploads via
-     trusted publishing:
+5. **Publish** — either path. A version number can never be reused on
+   PyPI, so tag the commit that is on `main` after the bump's pull
+   request merged, not a branch:
+   - **Via GitHub (preferred):** tag that commit, push **that one tag**,
+     and publish a Release for it; the `publish.yml` workflow builds,
+     checks, smoke-tests and uploads via trusted publishing:
      ```bash
-     git tag v$(python3 -c "import matrix_orchestrator; print(matrix_orchestrator.__version__)")
-     git push origin --tags
-     # then: GitHub → Releases → Draft a new release → publish
+     git fetch origin main && git checkout --detach origin/main
+     v=$(python3 -c "import matrix_orchestrator; print(matrix_orchestrator.__version__)")
+     git tag -a "v$v" -m "matrix-orchestrator $v"
+     git push origin "v$v"
+     # then: GitHub → Releases → Draft a new release → tag v$v → publish
      ```
+     Push the tag by name: `git push origin --tags` sends every tag in
+     the clone, including any made locally by mistake. The workflow
+     refuses a Release whose tag is not `v` plus the version in
+     `mx.py`, so a mistyped tag fails before anything is uploaded.
+     The Release notes are the `CHANGELOG.md` entries for every version
+     since the last one on PyPI, not only the newest, since those are
+     the changes a `pip install` user has not seen.
    - **By hand:**
      ```bash
      python -m twine upload dist/*
      ```
      (Optionally rehearse on TestPyPI first:
      `python -m twine upload --repository testpypi dist/*`.)
+     Tag the commit as above all the same, so the version on PyPI can be
+     traced to the commit it was built from.
 
-6. **Verify**: `pip install matrix-orchestrator` in a clean venv, run
-   `mx --version`, and check the project page renders the README:
-   <https://pypi.org/project/matrix-orchestrator/>.
+6. **Verify**: `pip install matrix-orchestrator==<version>` in a clean
+   venv, run `mx --version`, and check the project page renders the
+   README: <https://pypi.org/project/matrix-orchestrator/>.
+
+## Is every version published?
+
+**Not so far.** PyPI holds 1.2.0, 1.4.2 and 1.9.0 only, each uploaded
+without a git tag, while `main` went through every version in
+`CHANGELOG.md`, and no version had a git tag before 1.11.2. Whether every
+version bump is published from now on, or only some, is the owner's
+decision, and this section records it once it is made.
+
+Either way the gap is visible: on every push to `main`, CI's wheel job
+warns when the version in `mx.py` has no `v<version>` tag on origin.
+To see where things stand by hand:
+
+```bash
+curl -s https://pypi.org/pypi/matrix-orchestrator/json \
+    | python3 -c "import json,sys; print(sorted(json.load(sys.stdin)['releases']))"
+git ls-remote --tags origin
+```
 
 ## What the sdist and wheel contain
 
