@@ -22,6 +22,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A PyPI version can never be reused, so a Release whose tag names a
+      # different version from the code would publish the wrong thing for
+      # good. Refuse it before building.
+      - name: Check the Release tag matches the version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          v=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' matrix_orchestrator/mx.py)
+          if [ "$TAG" != "v$v" ]; then
+            echo "::error::Release tag '$TAG' does not match mx.py's version $v (expected v$v)"
+            exit 1
+          fi
+          echo "tag $TAG matches version $v"
+
       - name: Build sdist and wheel
         run: |
           python -m pip install --upgrade build

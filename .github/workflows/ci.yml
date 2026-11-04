@@ -136,3 +136,16 @@ jobs:
           mx gen --servers servers.txt --pps 1000
           mx check --nic-gbps 25
           mx hints > /dev/null
+
+      # Not a failure: a version can sit on main unreleased for a while.
+      # But PyPI once fell three releases behind with nothing saying so
+      # (MX-002), so say so on every push to main.
+      - name: Warn when main's version has no release tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          v=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' matrix_orchestrator/mx.py)
+          if git ls-remote --exit-code --tags origin "refs/tags/v$v" > /dev/null; then
+            echo "v$v is tagged"
+          else
+            echo "::warning::version $v on main has no v$v tag: it has not been released (see PUBLISHING.md)"
+          fi
