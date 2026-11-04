@@ -168,6 +168,139 @@ test_stopping_one_matrix_leaves_another_on_the_same_hosts_running() {
     assert_no_file "$(host_dir 127.0.0.1)/agent.pid" "a's pid file is tidied up" || return 1
 }
 
+# Two matrices on the same hosts, a (matrix.csv, $MX_REMOTE_DIR) and b
+# (matrix-b.csv, $B_DIR), both running. Sets A_PIDS and B_PIDS.
+start_two_matrices() {
+    local port h
+    port=$(pick_port)
+    setup_fleet "$port" --pps 300 || return 1
+    printf 'alpha=127.0.0.1:%d\nbeta=127.0.0.2:%d\n' "$((port + 10))" "$((port + 11))" > servers-b.txt
+    run_mx gen --servers servers-b.txt --pps 300 -o matrix-b.csv
+    assert_status 0 "$RUN_RC" "gen b" || return 1
+    B_DIR="$MX_REMOTE_DIR-b"
+    run_mx start --interval 2 --duration 40
+    assert_status 0 "$RUN_RC" "start a" || return 1
+    run_mx start --matrix matrix-b.csv --remote-dir "$B_DIR" --interval 2 --duration 40
+    assert_status 0 "$RUN_RC" "start b" || return 1
+    sleep 2
+    A_PIDS="" B_PIDS=""
+    for h in 127.0.0.1 127.0.0.2; do
+        A_PIDS="$A_PIDS $(cat "$FAKE_ROOT/$h$MX_REMOTE_DIR/agent.pid" 2>/dev/null)"
+        B_PIDS="$B_PIDS $(cat "$FAKE_ROOT/$h$B_DIR/agent.pid" 2>/dev/null)"
+    done
+}
+
+stop_b() { run_mx stop --matrix matrix-b.csv --remote-dir "$B_DIR" >/dev/null 2>&1; }
+
+# Fails, and stops b, unless every pid in $1 is still running.
+all_running() {
+    local pid
+    for pid in $1; do
+        if ! running "$pid"; then
+            echo "$2 ($pid)" >&2
+            stop_b
+            return 1
+        fi
+    done
+}
+
+all_gone() {
+    local pid
+    for pid in $1; do
+        if running "$pid"; then
+            echo "$2 ($pid)" >&2
+            stop_b
+            return 1
+        fi
+    done
+}
+
+test_clean_on_one_matrix_ignores_another_on_the_same_hosts() {
+    # clean's last check was for any mx agent on the box: b's, still
+    # running as it should be, read as a LEFTOVER of a's and failed it.
+    start_two_matrices || return 1
+    run_mx clean --yes
+    if [ "$RUN_RC" -ne 0 ]; then
+        printf '%s\n' "$RUN_OUT" >&2
+        stop_b
+        return 1
+    fi
+    assert_contains "$RUN_OUT" "clean (was: stopped)" || { stop_b; return 1; }
+    assert_not_contains "$RUN_OUT" "LEFTOVER" || { stop_b; return 1; }
+    all_gone "$A_PIDS" "a's agent outlived its own clean" || return 1
+    all_running "$B_PIDS" "cleaning matrix.csv killed matrix-b.csv's agent" || return 1
+    assert_no_file "$(host_dir 127.0.0.1)" "a's dir is gone" || { stop_b; return 1; }
+    stop_b
+}
+
+test_stop_with_a_lost_pid_file_stops_only_this_matrix() {
+    # Without agent.pid the agent is found by its working directory, which
+    # is --remote-dir: it is started with `cd "$d"`. Not by its name, which
+    # every matrix's agent shares.
+    start_two_matrices || return 1
+    rm -f "$FAKE_ROOT"/127.0.0.*"$MX_REMOTE_DIR"/agent.pid
+    run_mx stop
+    assert_status 0 "$RUN_RC" "stop a" || { stop_b; return 1; }
+    assert_contains "$RUN_OUT" "stopped" || { stop_b; return 1; }
+    all_running "$B_PIDS" "a lost pid file let stopping matrix.csv kill matrix-b.csv's agent" || return 1
+    all_gone "$A_PIDS" "a's agent outlived its stop with the pid file lost" || return 1
+    stop_b
+}
+
+test_clean_with_a_lost_pid_file_cleans_only_this_matrix() {
+    start_two_matrices || return 1
+    rm -f "$FAKE_ROOT"/127.0.0.*"$MX_REMOTE_DIR"/agent.pid
+    run_mx clean --yes
+    if [ "$RUN_RC" -ne 0 ]; then
+        printf '%s\n' "$RUN_OUT" >&2
+        stop_b
+        return 1
+    fi
+    all_running "$B_PIDS" "a lost pid file let cleaning matrix.csv kill matrix-b.csv's agent" || return 1
+    all_gone "$A_PIDS" "a's agent outlived its clean with the pid file lost" || return 1
+    stop_b
+}
+
+test_a_lost_pid_file_without_proc_refuses_to_guess() {
+    # No /proc (MX_PROC stands one in that is missing): nothing can say
+    # whose agent is whose, so nothing is killed and stop says why.
+    start_two_matrices || return 1
+    local h
+    for h in 127.0.0.1 127.0.0.2; do
+        mv "$FAKE_ROOT/$h$MX_REMOTE_DIR/agent.pid" "$TEST_TMPDIR/$h.pid"
+    done
+    MX_PROC="$TEST_TMPDIR/no-proc" run_mx stop
+    assert_status 1 "$RUN_RC" "stop must fail rather than guess" || { stop_b; return 1; }
+    assert_contains "$RUN_OUT" "kill it by hand" || { stop_b; return 1; }
+    all_running "$B_PIDS" "without /proc, stopping matrix.csv killed matrix-b.csv's agent" || return 1
+    all_running "$A_PIDS" "without /proc, stop guessed and killed" || return 1
+    MX_PROC="$TEST_TMPDIR/no-proc" run_mx clean --yes
+    assert_status 1 "$RUN_RC" "clean must fail rather than guess" || { stop_b; return 1; }
+    assert_contains "$RUN_OUT" "LEFTOVER" || { stop_b; return 1; }
+    assert_file_exists "$(host_dir 127.0.0.1)/matrix.csv" "clean keeps a's dir while an agent may be in it" || { stop_b; return 1; }
+    all_running "$B_PIDS" "without /proc, clean killed matrix-b.csv's agent" || return 1
+    MX_PROC="$TEST_TMPDIR/no-proc" run_mx doctor
+    assert_contains "$RUN_OUT" "agent_running=unknown(no-/proc)" "doctor cannot tell either" || { stop_b; return 1; }
+    # Put a's pid files back so its agents can be stopped properly.
+    for h in 127.0.0.1 127.0.0.2; do
+        mv "$TEST_TMPDIR/$h.pid" "$FAKE_ROOT/$h$MX_REMOTE_DIR/agent.pid"
+    done
+    run_mx stop
+    stop_b
+    all_gone "$A_PIDS" "a's agents outlived the tidy-up" || return 1
+}
+
+test_doctor_reports_only_this_matrix_agent() {
+    start_two_matrices || return 1
+    run_mx stop
+    run_mx doctor
+    assert_contains "$RUN_OUT" "agent_running=no" "b's agent is not a's" || { stop_b; return 1; }
+    assert_not_contains "$RUN_OUT" "agent_running=yes" || { stop_b; return 1; }
+    run_mx doctor --matrix matrix-b.csv --remote-dir "$B_DIR"
+    assert_contains "$RUN_OUT" "agent_running=yes" "b's own doctor sees it" || { stop_b; return 1; }
+    stop_b
+}
+
 test_clean_removes_every_trace() {
     setup_fleet "$(pick_port)" --pps 500 || return 1
     run_mx start --interval 2 --duration 30
@@ -408,6 +541,11 @@ run_test test_summarize_collects_from_the_hosts
 run_test test_logs_are_collected
 run_test test_stop_leaves_the_data_behind
 run_test test_stopping_one_matrix_leaves_another_on_the_same_hosts_running
+run_test test_clean_on_one_matrix_ignores_another_on_the_same_hosts
+run_test test_stop_with_a_lost_pid_file_stops_only_this_matrix
+run_test test_clean_with_a_lost_pid_file_cleans_only_this_matrix
+run_test test_a_lost_pid_file_without_proc_refuses_to_guess
+run_test test_doctor_reports_only_this_matrix_agent
 run_test test_clean_removes_every_trace
 run_test test_clean_works_when_nothing_is_running
 run_test test_clean_on_a_never_deployed_fleet_is_harmless

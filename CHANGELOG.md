@@ -9,6 +9,36 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.3] - 2026-11-04
+
+This run's agents only, everywhere -- the rest of what 1.11.2 started.
+
+### Fixed
+
+- **`mx clean` failed on one matrix while another ran on the same host.**
+  It stopped its own agent and removed its directory, then checked for
+  any `mx.py agent` on the box, found the other matrix's -- running, as
+  it should be -- and reported `LEFTOVER: an agent is still running`,
+  exit 1. It now checks only for an agent still running out of its own
+  `--remote-dir`.
+- **A lost pid file still killed every matrix on the host.** With
+  `agent.pid` gone, `mx stop` and `mx clean` fell back to a
+  `pkill -f 'mx.py agent'`: the 1.11.2 bug again, by another path. The
+  agent is started with `cd` into `--remote-dir`, so its working
+  directory says whose it is; the fallback now TERMs, waits on and, if it
+  must, KILLs only the agents whose `/proc/PID/cwd` is this run's
+  directory. On a host with no `/proc` that cannot be told, and nothing
+  is killed: `stop` and `clean` fail with `kill it by hand`, and `clean`
+  leaves the directory in place.
+- **`mx doctor` said `agent_running=yes` for another matrix's agent.** It
+  now goes by this `--remote-dir`'s pid file, and with that lost by
+  working directory; `agent_running=unknown(no-/proc)` on a host that
+  cannot tell.
+
+`tests/test_fleet.sh` runs two matrices on the same hosts for each:
+`clean` of one, `stop` and `clean` with the pid file deleted, the same
+with no `/proc`, and `doctor` with only the other matrix running.
+
 ## [1.11.2] - 2026-10-29
 
 Stop only this run's agents.
