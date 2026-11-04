@@ -27,9 +27,11 @@ This run's agents only, everywhere -- the rest of what 1.11.2 started.
   agent is started with `cd` into `--remote-dir`, so its working
   directory says whose it is; the fallback now TERMs, waits on and, if it
   must, KILLs only the agents whose `/proc/PID/cwd` is this run's
-  directory. On a host with no `/proc` that cannot be told, and nothing
-  is killed: `stop` and `clean` fail with `kill it by hand`, and `clean`
-  leaves the directory in place.
+  directory. It reads `/proc` itself, so it works on a host with no
+  procps, where the old `pkill` fallback silently matched nothing. On a
+  host with no `/proc` that cannot be told, and nothing is killed: `stop`
+  and `clean` fail with `kill it by hand`, and `clean` leaves the
+  directory in place.
 - **`mx doctor` said `agent_running=yes` for another matrix's agent.** It
   now goes by this `--remote-dir`'s pid file, and with that lost by
   working directory; `agent_running=unknown(no-/proc)` on a host that
@@ -37,7 +39,8 @@ This run's agents only, everywhere -- the rest of what 1.11.2 started.
 
 `tests/test_fleet.sh` runs two matrices on the same hosts for each:
 `clean` of one, `stop` and `clean` with the pid file deleted, the same
-with no `/proc`, and `doctor` with only the other matrix running.
+with no `/proc`, and `doctor` with only the other matrix running. CI's
+Python 3.6 job runs them in `python:3.6-slim`, which has no procps.
 
 ## [1.11.2] - 2026-10-29
 

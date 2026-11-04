@@ -265,6 +265,25 @@ test_a_lost_pid_file_without_proc_refuses_to_guess() {
     # No /proc (MX_PROC stands one in that is missing): nothing can say
     # whose agent is whose, so nothing is killed and stop says why.
     start_two_matrices || return 1
+    # The host stood in has procps, just no /proc, so pgrep still sees that
+    # some mx agent is running. Where the test machine has no pgrep itself
+    # (python:3.6-slim), give it one that reads the real /proc.
+    if ! command -v pgrep >/dev/null 2>&1; then
+        cat > "$FAKE_BIN/pgrep" <<'SHIM'
+#!/usr/bin/env bash
+# pgrep -f PATTERN, quiet or not: enough for mx's _mx_any.
+pat="${*: -1}" found=""
+for e in /proc/[0-9]*; do
+    [ "${e##*/}" = "$$" ] && continue
+    if tr '\0' ' ' < "$e/cmdline" 2>/dev/null | grep -Eq -- "$pat"; then
+        echo "${e##*/}"
+        found=1
+    fi
+done
+[ -n "$found" ]
+SHIM
+        chmod +x "$FAKE_BIN/pgrep"
+    fi
     local h
     for h in 127.0.0.1 127.0.0.2; do
         mv "$FAKE_ROOT/$h$MX_REMOTE_DIR/agent.pid" "$TEST_TMPDIR/$h.pid"

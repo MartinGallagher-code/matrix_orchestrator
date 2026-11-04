@@ -2617,25 +2617,38 @@ PGREP = "pgrep -f '[m]x[.]py agent'"
 # process's cwd needs the same user or root; the agents run as the ssh user,
 # so they are readable to the snippets that started them.
 #
+# It walks /proc itself rather than asking pgrep: a slim host or container
+# has no procps, and there `$(pgrep ...)` is quietly empty -- every lost pid
+# file would read as "not running" and nothing would be stopped. The name
+# is matched as `mx[.]py\ agent` for the same reason PGREP is bracketed: the
+# shell running this has the pattern in its own argv, and must not match it
+# (it skips $$ as well).
+#
 # $proc is /proc unless MX_PROC says otherwise, which the tests use to stand
 # in a host with no /proc. `_mx_scoped` says whether this host can tell
 # whose agent is whose at all: without /proc it cannot, and the callers
-# then refuse rather than guess.
+# then refuse rather than guess if `_mx_any` -- pgrep, the only thing left --
+# sees an mx agent at all.
 UNSCOPED = ("an mx agent is running but agent.pid is gone and there is no "
             "/proc to tell whether it is this run's -- kill it by hand")
 OURS_FN = """
-proc=${{MX_PROC:-/proc}}
-_mx_scoped() {{ readlink "$proc/$$/cwd" >/dev/null 2>&1; }}
-_mx_ours() {{
+proc=${MX_PROC:-/proc}
+_mx_scoped() { readlink "$proc/$$/cwd" >/dev/null 2>&1; }
+_mx_any() { """ + PGREP + """ >/dev/null 2>&1; }
+_mx_ours() {
     [ -n "$1" ] || return 0
-    for _p in $({pgrep} 2>/dev/null); do
-        _c=$(readlink "$proc/$_p/cwd" 2>/dev/null) || continue
-        if [ "$_c" = "$1" ] || [ "$_c" = "$1 (deleted)" ]; then
-            echo "$_p"
-        fi
+    for _e in "$proc"/[0-9]*; do
+        _p=${_e##*/}
+        [ "$_p" = "$$" ] && continue
+        _c=$(readlink "$_e/cwd" 2>/dev/null) || continue
+        [ "$_c" = "$1" ] || [ "$_c" = "$1 (deleted)" ] || continue
+        _a=$(tr '\\0' ' ' < "$_e/cmdline" 2>/dev/null)
+        case "$_a" in
+            *mx[.]py\\ agent*) echo "$_p" ;;
+        esac
     done
-}}
-""".format(pgrep=PGREP)
+}
+"""
 
 
 def _kill_block(rdir):
@@ -2666,7 +2679,7 @@ if [ -d "$d" ]; then
         status=stopped
         how=pid
     elif ! _mx_scoped; then
-        {pgrep} >/dev/null 2>&1 && status=unscoped
+        _mx_any && status=unscoped
     else
         ours=$(_mx_ours "$r")
         if [ -n "$ours" ]; then
@@ -2703,7 +2716,7 @@ if [ -d "$d" ]; then
     fi
     rm -f "$d/{pid}"
 fi
-""".format(d=shlex.quote(rdir), pid=PID_NAME, pgrep=PGREP)
+""".format(d=shlex.quote(rdir), pid=PID_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -5205,7 +5218,7 @@ if [ -n "$r" ]; then
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         running=yes
     elif ! _mx_scoped; then
-        {pgrep} >/dev/null 2>&1 && running="unknown(no-/proc)"
+        _mx_any && running="unknown(no-/proc)"
     elif [ -n "$(_mx_ours "$r")" ]; then
         running=yes
     fi
@@ -5215,7 +5228,7 @@ low=""
 [ "$fds" != unlimited ] && [ "$fds" -lt {need} ] 2>/dev/null \
     && low=" FDS-TOO-LOW(need>{need})"
 echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile_hard=$fds$low; agent_running=$running$extra"
-""".format(py=shlex.quote(fleet.python), pgrep=PGREP, need=need_fds,
+""".format(py=shlex.quote(fleet.python), need=need_fds,
            disk=disk_check, d=shlex.quote(fleet.dir), pid=PID_NAME)
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
