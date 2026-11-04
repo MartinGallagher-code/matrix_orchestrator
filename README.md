@@ -606,7 +606,14 @@ mx clean        # stop everything, remove the directory, verify it is gone
 ```
 
 `mx clean` refuses to report success unless the directory is actually
-gone and no agent is still running.
+gone and no agent is still running out of it.
+
+Two matrices can run on the same hosts at once from different
+`--remote-dir`s (and ports). `stop`, `clean` and `doctor` touch only the
+agent of their own `--remote-dir`: by its `agent.pid`, or with that lost,
+by the agent's working directory in `/proc`. On a host with no `/proc` a
+lost pid file cannot be told apart from the other matrix's agent, so
+`stop` and `clean` kill nothing and say to kill it by hand.
 
 ---
 
