@@ -44,11 +44,18 @@ as a release gate.
 
 ## Cut a release
 
-1. **Bump the version** in `matrix_orchestrator/mx.py` (`VERSION`) *and*
-   `pyproject.toml` (`[project].version`), and add a matching entry to
-   `CHANGELOG.md`. Follow [SemVer](https://semver.org/). CI enforces
-   that all three agree (`test_version_is_bumped_and_consistent_everywhere`),
-   so a mismatch cannot reach a release unnoticed.
+1. **Nothing to bump: publish the version `main` already has.** Every
+   pull request moves the version itself, however small the change
+   (shared_tools BN-002): `matrix_orchestrator/mx.py` (`VERSION`),
+   `pyproject.toml` (`[project].version`) and a matching
+   `## [X.Y.Z] - YYYY-MM-DD` entry in `CHANGELOG.md`, following
+   [SemVer](https://semver.org/). CI enforces that all three agree
+   (`tests/check_version.sh`, and
+   `test_version_is_bumped_and_consistent_everywhere`) and that the
+   version moved past the base branch's (the **version** job), so a
+   mismatch or a repeated number cannot reach a release unnoticed.
+   Releasing is a separate step, and a person's call; a version that is
+   never published is fine.
 
 2. **Build the distributions** (sdist + wheel) into `dist/`:
    ```bash
@@ -71,7 +78,7 @@ as a release gate.
    ```
 
 5. **Publish** — either path. A version number can never be reused on
-   PyPI, so tag the commit that is on `main` after the bump's pull
+   PyPI, so tag the commit that is on `main` after the version's pull
    request merged, not a branch:
    - **Via GitHub (preferred):** tag that commit, push **that one tag**,
      and publish a Release for it; the `publish.yml` workflow builds,

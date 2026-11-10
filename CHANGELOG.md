@@ -9,6 +9,33 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.4] - 2026-11-10
+
+Every change moves the version; and a release can be traced to its commit.
+Nothing about `mx` itself changed.
+
+### Changed
+
+- **Every pull request moves the version now, however small** (the
+  owner's rule, shared_tools BN-002): code, tests, docs or CI, never only
+  "release-worthy" changes. `tests/check_version.sh` checks that `mx.py`'s
+  `VERSION` and `pyproject.toml` agree and that this file opens with that
+  version, numbered and dated; CI's new **version** job also fails a pull
+  request whose version is not greater than `main`'s, and a push to
+  `main` whose version is not greater than what `main` had before it.
+  `CLAUDE.md` and `PUBLISHING.md` say so, and the ticket snippet in
+  `CLAUDE.md` is the current one.
+- **A release can be traced to its commit** (MX-002, merged after 1.11.3
+  without a number of its own). `publish.yml` refuses a Release whose tag
+  is not `v` plus `mx.py`'s version, before building anything; CI's wheel
+  job warns on every push to `main` when the version has no `v<version>`
+  tag on origin; and `PUBLISHING.md` tags `main`'s merged commit, pushes
+  that one tag, tags hand uploads too, and records what has been
+  published so far.
+- **CI's test job runs on `ubuntu-24.04`**: `ubuntu-latest` became 26.04
+  in November 2026, where setup-python has no Python 3.9, so the 3.9 leg
+  failed before a test ran.
+
 ## [1.11.3] - 2026-11-04
 
 This run's agents only, everywhere -- the rest of what 1.11.2 started.

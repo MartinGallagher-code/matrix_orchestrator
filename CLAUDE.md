@@ -24,7 +24,34 @@ which keeps every project's tickets as files and moves each one Backlog → In P
    <shared_tools clone>/scripts/ticket.py new matrix_orchestrator "Imperative title" --request "the request, in the user's own words"
    ~~~
 
+**Every change moves the version**, however small: a pull request into `main` raises
+it in every place it is written and opens `CHANGELOG.md` with that version's own
+dated section, never an "Unreleased" heading left for later. CI fails a pull request
+whose version is not greater than its base branch's. This file's own section on the
+version says where it is written.
+
 The board: https://claude.ai/artifact/HrB3RpVpqGGQS7UZgZsMJm
+
+## Every change moves the version
+
+The owner's rule (shared_tools BN-002): **whenever this project changes, its version
+changes with it**, however small the change: code, tests, docs or CI. A pull request
+into `main` carries its own bump and its own `CHANGELOG.md` section, never an
+"Unreleased" heading left for later.
+
+- Patch for fixes, docs, tests and CI; minor for anything new a user can use; major
+  only when something that worked stops working the way it did.
+- In the same pull request: `matrix_orchestrator/mx.py` (`VERSION`) and
+  `pyproject.toml` (`[project].version`), and a `## [X.Y.Z] - YYYY-MM-DD` section at
+  the top of `CHANGELOG.md`. `tests/check_version.sh` fails if any of them disagree
+  (and `test_version_is_bumped_and_consistent_everywhere` in `tests/test_cli.sh`
+  checks `mx --version` against them too).
+- The **version** job in CI fails a pull request whose version is not greater than its
+  base branch's, and a push to `main` whose version is not greater than what `main` had
+  before it. If `main` moves while a pull request is open, rebase and bump again.
+- Publishing is a separate step, and a person's call: a `v<version>` tag on `main` and
+  a GitHub Release, which `publish.yml` uploads to PyPI (`PUBLISHING.md`). A number
+  that is never published is fine; a change with no number is not.
 
 ## Bundling this repo
 

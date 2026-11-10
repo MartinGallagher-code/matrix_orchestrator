@@ -136,9 +136,11 @@ test_full_help_lists_every_switch_of_every_command() {
 }
 
 test_version_is_bumped_and_consistent_everywhere() {
-    # The check-in rule: every release-worthy change bumps the version,
-    # and the three places it lives must agree -- the tool itself, the
-    # package metadata, and the changelog.
+    # The check-in rule: every change bumps the version, however small
+    # (shared_tools BN-002), and the three places it lives must agree --
+    # the tool itself, the package metadata, and the changelog.
+    # tests/check_version.sh checks the same, and CI's version job that
+    # the number moved past the base branch's.
     run_mx --version
     assert_status 0 "$RUN_RC" || return 1
     local v; v=$(printf '%s' "$RUN_OUT" | sed -n 's/^mx \([0-9][0-9.]*\)$/\1/p')
