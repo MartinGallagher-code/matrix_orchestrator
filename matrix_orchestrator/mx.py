@@ -66,7 +66,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
-VERSION = "1.11.3"
+VERSION = "1.11.4"
 
 # ---------------------------------------------------------------------------
 # Wire format
