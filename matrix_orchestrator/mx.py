@@ -66,7 +66,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
-VERSION = "1.11.4"
+VERSION = "1.11.5"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -2496,12 +2496,35 @@ def _drain(q):
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 
 
+def check_remote_dir(path):
+    """Refuse a --remote-dir no host could use, before anything runs.
+
+    A leading `~` is never expanded: the snippets quote the path, so `mkdir
+    -p '~/mx'` makes a directory named `~` in the login directory while scp
+    puts the files in the real ~/mx, and nothing lines up (MX-004). A
+    relative path already means the same thing to ssh and scp -- the login
+    directory -- so that is the form to suggest. An empty path, or `/`,
+    cannot be a working directory that `mx clean` then removes.
+    """
+    if not path:
+        die("--remote-dir is empty")
+    if path.startswith("~"):
+        rest = path[2:] if path.startswith("~/") else ""
+        die("--remote-dir %s: a '~' is not expanded on the hosts. Give an "
+            "absolute path, or one relative to the login directory%s"
+            % (path, " (--remote-dir %s)" % rest if rest.strip("/") else ""))
+    if os.path.normpath(path) in ("/", "//"):
+        die("--remote-dir %s: that is the root directory -- mx needs a "
+            "directory of its own" % path)
+    return path
+
+
 class Fleet(object):
     def __init__(self, matrix, args):
         self.matrix = matrix
         self.user = args.user
         self.jobs = max(1, args.jobs)
-        self.dir = args.remote_dir
+        self.dir = check_remote_dir(args.remote_dir)
         self.python = args.python
         self.ssh = (args.ssh or "ssh").split()
         self.scp = (args.scp or "scp").split()
@@ -2601,10 +2624,17 @@ def _agent_flags(args):
     return flags
 
 
-# The pgrep pattern is bracketed so the very shell running it is not itself
-# a match: that shell's command line contains the literal "[m]x.py agent",
-# which the regex "mx.py agent" does not match.
-PGREP = "pgrep -f '[m]x[.]py agent'"
+# What an mx agent's command line always carries, whatever the agent file is
+# called -- `mx.py` from a checkout or a wheel, or `mx` copied out on its own
+# -- because `start` launches every one as `<python> <file> agent --matrix
+# matrix.csv --host ...`. Matching on the file name instead missed a renamed
+# agent altogether, and matched any command that merely mentioned
+# "mx.py agent" (`less mx.py agent.log`). Both patterns are written so the
+# snippet holding them is not itself a match: the bracketed space and dot,
+# and the escaped spaces, are not what they match.
+AGENT_RE = "[ ]agent --matrix matrix[.]csv "
+AGENT_GLOB = "*\\ agent\\ --matrix\\ matrix[.]csv\\ *"
+PGREP = "pgrep -f '%s'" % AGENT_RE
 
 # Which mx agents are this run's. The name is no help -- every matrix's agent
 # is `mx.py agent`, and two matrices can run on one host out of different
@@ -2619,10 +2649,19 @@ PGREP = "pgrep -f '[m]x[.]py agent'"
 #
 # It walks /proc itself rather than asking pgrep: a slim host or container
 # has no procps, and there `$(pgrep ...)` is quietly empty -- every lost pid
-# file would read as "not running" and nothing would be stopped. The name
-# is matched as `mx[.]py\ agent` for the same reason PGREP is bracketed: the
-# shell running this has the pattern in its own argv, and must not match it
-# (it skips $$ as well).
+# file would read as "not running" and nothing would be stopped. The command
+# line is matched with AGENT_GLOB, which the shell running this (it has the
+# pattern in its own argv) does not match; it skips $$ as well.
+#
+# `_mx_is_ours PID DIR` is the same test for the one pid agent.pid names,
+# and every snippet asks it before trusting that file. A pid file outlives a
+# reboot -- /var/tmp is kept across one -- and the number in it can by then
+# belong to anything of the ssh user's (anything at all, for root): `kill -0`
+# alone took a reused pid for a running agent, so `status` showed it, `start`
+# refused, and `stop`, `clean` and `reload` killed it (MX-004). The number is
+# also taken only as a plain positive pid: `-1`, `0` or `-PGID` would have
+# signalled every process the user can reach, or a whole process group.
+# Without /proc the pid file is all there is, and a live pid is trusted.
 #
 # $proc is /proc unless MX_PROC says otherwise, which the tests use to stand
 # in a host with no /proc. `_mx_scoped` says whether this host can tell
@@ -2644,9 +2683,22 @@ _mx_ours() {
         [ "$_c" = "$1" ] || [ "$_c" = "$1 (deleted)" ] || continue
         _a=$(tr '\\0' ' ' < "$_e/cmdline" 2>/dev/null)
         case "$_a" in
-            *mx[.]py\\ agent*) echo "$_p" ;;
+            """ + AGENT_GLOB + """) echo "$_p" ;;
         esac
     done
+}
+_mx_is_ours() {
+    case "$1" in ''|*[!0-9]*|0*|1) return 1 ;; esac
+    kill -0 "$1" 2>/dev/null || return 1
+    _mx_scoped || return 0
+    _c=$(readlink "$proc/$1/cwd" 2>/dev/null) || return 1
+    [ -n "$2" ] || return 1
+    [ "$_c" = "$2" ] || [ "$_c" = "$2 (deleted)" ] || return 1
+    _a=$(tr '\\0' ' ' < "$proc/$1/cmdline" 2>/dev/null)
+    case "$_a" in
+        """ + AGENT_GLOB + """) return 0 ;;
+    esac
+    return 1
 }
 """
 
@@ -2658,7 +2710,10 @@ def _kill_block(rdir):
 
     The pid file is the handle: this run's agent is told to stop, waited
     for, and only it -- and the workers it forked -- killed if it will not
-    go. A host running two matrices out of different --remote-dirs at once
+    go. It is trusted only once `_mx_is_ours` says the pid is an mx agent
+    running out of this directory: a stale file naming a reused pid falls
+    through to the search below, and kills nothing that is not an agent. A
+    host running two matrices out of different --remote-dirs at once
     keeps the other one running. With the pid file lost, this run's agents
     are found by their working directory (`_mx_ours`), never by name; on a
     host with no /proc that cannot be told, so nothing is killed and
@@ -2674,7 +2729,7 @@ if [ -d "$d" ]; then
     pid=""
     how=""
     [ -f "$d/{pid}" ] && pid=$(cat "$d/{pid}" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if _mx_is_ours "$pid" "$r"; then
         kill -TERM "$pid" 2>/dev/null
         status=stopped
         how=pid
@@ -2692,11 +2747,11 @@ if [ -d "$d" ]; then
     if [ "$how" = pid ]; then
         i=0
         while [ $i -lt 20 ]; do
-            kill -0 "$pid" 2>/dev/null || break
+            _mx_is_ours "$pid" "$r" || break
             sleep 0.5
             i=$((i+1))
         done
-        if kill -0 "$pid" 2>/dev/null; then
+        if _mx_is_ours "$pid" "$r"; then
             pkill -KILL -P "$pid" 2>/dev/null
             kill -KILL "$pid" 2>/dev/null
             status=killed
@@ -3235,10 +3290,11 @@ def _stamp_write(fp, flags):
 def _probe_block(rdir):
     """Shell that reports whether an agent is up here and what it was started
     with -- one round trip per host."""
-    return """
+    return OURS_FN + """
 d={d}
 cd "$d" 2>/dev/null || {{ echo 'state=absent'; exit 0; }}
-if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+r=$(pwd -P)
+if [ -f {pid} ] && _mx_is_ours "$(cat {pid} 2>/dev/null)" "$r"; then
     echo 'state=running'
 else
     echo 'state=stopped'
@@ -3375,10 +3431,11 @@ def cmd_start(args):
                % (shlex.quote(fleet.python), os.path.basename(agent_src),
                   MATRIX_NAME, shlex.quote(host), REPORT_NAME,
                   " ".join(shlex.quote(f) for f in flags), LOG_NAME))
-        script = """
+        script = OURS_FN + """
 d={d}
 cd "$d" 2>/dev/null || {{ echo 'not deployed (drop --no-deploy)'; exit 1; }}
-if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+r=$(pwd -P)
+if [ -f {pid} ] && _mx_is_ours "$(cat {pid} 2>/dev/null)" "$r"; then
     echo 'already running -- mx stop first'; exit 1
 fi
 rm -f {log} {report} {pid} {stampfile}
@@ -3430,24 +3487,26 @@ def _stop_pid_block(rdir):
     1.11.3 the fallback was a pkill over every mx agent by name, which
     matched this shell's own argv (it holds the literal "mx.py agent") and
     killed the reload mid-flight. The pid is known here (the host reported
-    it running), so use it and nothing else.
+    it running), so use it and nothing else -- once `_mx_is_ours` says it is
+    still an mx agent running out of this directory.
     """
-    return """
+    return OURS_FN + """
 d={d}
 cd "$d" 2>/dev/null || {{ echo 'not deployed'; exit 1; }}
+r=$(pwd -P)
 status=not-running
 if [ -f {pid} ]; then
     agent=$(cat {pid} 2>/dev/null)
-    if [ -n "$agent" ] && kill -0 "$agent" 2>/dev/null; then
+    if _mx_is_ours "$agent" "$r"; then
         kill -TERM "$agent" 2>/dev/null
         status=stopped
         i=0
         while [ $i -lt 60 ]; do
-            kill -0 "$agent" 2>/dev/null || break
+            _mx_is_ours "$agent" "$r" || break
             sleep 0.25
             i=$((i+1))
         done
-        if kill -0 "$agent" 2>/dev/null; then
+        if _mx_is_ours "$agent" "$r"; then
             kill -KILL "$agent" 2>/dev/null
             status=killed
         fi
@@ -3600,11 +3659,12 @@ fi
 def cmd_status(args):
     m = load_matrix(args.matrix)
     fleet = Fleet(m, args)
-    script = """
+    script = OURS_FN + """
 d={d}
 [ -d "$d" ] || {{ echo NOT-DEPLOYED; exit 0; }}
 cd "$d"
-if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+r=$(pwd -P)
+if [ -f {pid} ] && _mx_is_ours "$(cat {pid} 2>/dev/null)" "$r"; then
     tail -n 1 {log} 2>/dev/null || echo 'running (no report yet)'
 else
     echo NOT-RUNNING
@@ -3679,10 +3739,16 @@ def cmd_clean(args):
             return 1
     # The directory is kept while an agent that may be this run's is still
     # in it (`unscoped`): it is the only trace left of whose agent that is.
+    # A --remote-dir that is a symlink loses only the link to `rm -rf`, and
+    # everything mx wrote stays where it pointed: that is a leftover too, not
+    # a clean (MX-004). What clean deletes is unchanged; it says so instead.
     script = _kill_block(fleet.dir) + """
 if [ "$status" = unscoped ]; then echo {msg}; exit 1; fi
 rm -rf "$d"
 if [ -e "$d" ]; then echo "LEFTOVER: $d still exists"; exit 1; fi
+if [ -n "$r" ] && [ -e "$r" ]; then
+    echo "LEFTOVER: $d was a symlink; $r, where mx's files are, still exists"; exit 1
+fi
 if [ -n "$(_mx_ours "$r")" ]; then echo 'LEFTOVER: an agent is still running'; exit 1; fi
 echo "clean (was: $status)"
 """.format(msg=shlex.quote("LEFTOVER: " + UNSCOPED))
@@ -5164,13 +5230,20 @@ def cmd_run(args):
         log("")
         log("[mx] interrupted -- summarizing what ran so far")
     args.window = max(args.window, int(min(wait, 300)))
+    # The closing stop's result is the run's: a host that could not be
+    # stopped is still sending, and exiting 0 over that (as before 1.11.5)
+    # told a script the fleet was quiet when it was not (MX-004).
+    rc = stopped = 0
     try:
-        cmd_summarize(args)
+        rc = cmd_summarize(args)
     finally:
         if not args.keep:
             log("")
-            cmd_stop(args)
-    return 0
+            stopped = cmd_stop(args)
+    if stopped:
+        log("[mx] not every agent could be stopped -- they may still be "
+            "sending: mx status, then mx stop")
+    return rc or stopped
 
 
 def cmd_doctor(args):
@@ -5215,7 +5288,7 @@ running=no
 r=$(cd "$d" 2>/dev/null && pwd -P)
 if [ -n "$r" ]; then
     pid=$(cat "$d/{pid}" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if _mx_is_ours "$pid" "$r"; then
         running=yes
     elif ! _mx_scoped; then
         _mx_any && running="unknown(no-/proc)"
@@ -5435,7 +5508,8 @@ def _add_fleet_flags(p):
     p.add_argument("--jobs", type=int, default=int(_env("MX_JOBS", "64")),
                    help="ssh fan-out concurrency (default: %(default)s)")
     p.add_argument("--remote-dir", default=_env("MX_REMOTE_DIR", DEFAULT_REMOTE_DIR),
-                   help="working directory on each host (default: %(default)s)")
+                   help="working directory on each host, mx's own: `mx clean` "
+                        "deletes it whole (default: %(default)s)")
     p.add_argument("--python", default=_env("MX_PYTHON", "python3"),
                    help="python on the hosts (default: %(default)s)")
     p.add_argument("--ssh", default=_env("MX_SSH", "ssh"), help=argparse.SUPPRESS)
@@ -5674,7 +5748,22 @@ def build_parser():
     lg.add_argument("--output", "-o", default="logs",
                     help="local directory (default: %(default)s)")
 
-    cl = sub.add_parser("clean", help="stop, then delete every trace from the hosts")
+    cl = sub.add_parser(
+        "clean", help="stop, then delete every trace from the hosts",
+        description="Stop this --remote-dir's agent, then delete the whole "
+                    "--remote-dir on every host (rm -rf): everything in it, "
+                    "not only the files mx wrote there (the agent, "
+                    "matrix.csv, agent.log, report.csv, agent.pid, "
+                    "agent.stamp, disk.dat). Give mx a directory of its own, "
+                    "never a disk's mount point or a directory that holds "
+                    "anything else. clean fails, and says what is left, when "
+                    "the directory or an agent in it survives; when "
+                    "--remote-dir is a symlink (only the link goes, and what "
+                    "it points to stays); and on a host with no /proc whose "
+                    "agent.pid is lost while an mx agent runs, where it "
+                    "deletes nothing because it cannot tell whose agent that "
+                    "is. A --remote-dir that is empty, starts with ~, or is / "
+                    "is refused before any host is touched.")
     _add_fleet_flags(cl)
     cl.add_argument("--yes", "-y", action="store_true", help="do not ask")
 

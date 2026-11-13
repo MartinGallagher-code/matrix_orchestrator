@@ -172,9 +172,11 @@ host's file and waits for all of them before it starts any agent, so no
 host is still writing a gigabyte while its peers are already sending to it.
 Later runs find the file in place and reuse it. `--disk-size` sets the size
 (default `1G`; bigger spreads the random I/O over more of the disk). To test
-a particular disk, point `--remote-dir` at it, since the file lives there.
-`mx stop` leaves the file for the next run, and `mx clean` removes it with
-everything else.
+a particular disk, point `--remote-dir` at a directory of mx's own on it,
+since the file lives there: `--remote-dir /mnt/nvme0/mx`, never the mount
+point `/mnt/nvme0` itself, because `mx clean` deletes the whole
+`--remote-dir`, whatever else is in it. `mx stop` leaves the file for the
+next run, and `mx clean` removes it with everything else.
 
 **What gets reported.** The `mx status` line shows each host's disk read
 and write rate, IOPS, and `busy`: the share of its time the busiest worker
@@ -605,8 +607,26 @@ mx summarize    # and the reports
 mx clean        # stop everything, remove the directory, verify it is gone
 ```
 
+**What `mx clean` deletes: the whole `--remote-dir`, with `rm -rf`.** That
+is everything in it, not only the files mx wrote there (the agent,
+`matrix.csv`, `agent.log`, `report.csv`, `agent.pid`, `agent.stamp`,
+`disk.dat`). So give mx a directory of its own: never a disk's mount point,
+a home directory, or anything that holds other files.
+
 `mx clean` refuses to report success unless the directory is actually
-gone and no agent is still running out of it.
+gone and no agent is still running out of it. It fails, and says what is
+left, when:
+
+- the directory, or an agent running out of it, survives;
+- `--remote-dir` is a symlink: `rm -rf` removes only the link, and the
+  directory it points to, with mx's files in it, stays;
+- a host has no `/proc` and the agent's `agent.pid` is lost while an mx
+  agent is running there. It cannot tell whose agent that is, so it deletes
+  nothing.
+
+A `--remote-dir` that is empty, starts with `~` (it is never expanded on
+the hosts; a relative path already means the login directory), or is `/` is
+refused before any host is touched.
 
 Two matrices can run on the same hosts at once from different
 `--remote-dir`s (and ports). `stop`, `clean` and `doctor` touch only the
@@ -614,6 +634,14 @@ agent of their own `--remote-dir`: by its `agent.pid`, or with that lost,
 by the agent's working directory in `/proc`. On a host with no `/proc` a
 lost pid file cannot be told apart from the other matrix's agent, so
 `stop` and `clean` kill nothing and say to kill it by hand.
+
+An `agent.pid` is believed only when its number is a plain pid and, where
+there is a `/proc`, that process is an mx agent running out of this
+`--remote-dir`. The file outlives a reboot (`/var/tmp` is kept across one),
+and by then its number can belong to any process of the ssh user's. No
+command signals that process, and `status`, `start`, `reload` and `doctor`
+do not take it for the agent. On a host with no `/proc` a live pid in the
+file is all there is to go on, and it is believed.
 
 ---
 
