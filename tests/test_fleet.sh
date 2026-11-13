@@ -497,25 +497,160 @@ test_a_lost_pid_file_finds_an_agent_file_not_named_mx_py() {
     done
 }
 
-test_clean_of_a_symlinked_remote_dir_reports_what_is_left() {
-    # rm -rf on a symlink removes the link, not what it points to: every file
-    # mx wrote stays there. clean said "nothing of mx remains"; it now says
-    # what is left and fails. (What clean deletes is unchanged.)
+# ---- MX-005: clean deletes what mx wrote, and nothing else -------------------
+
+# Everything a run can leave in --remote-dir, and so all that clean deletes:
+# the agent, the matrix, the log, the report, the pid file, the stamp, the
+# data file and a half-written one.
+MX_FILES="mx.py matrix.csv agent.log report.csv agent.pid agent.stamp disk.dat disk.dat.4242.tmp"
+
+# plant_mx_files DIR -- the files a run leaves, without running one.
+plant_mx_files() {
+    local f
+    mkdir -p "$1"
+    for f in $MX_FILES; do echo planted > "$1/$f"; done
+}
+
+# no_mx_files DIR WHAT -- every one of them is gone.
+no_mx_files() {
+    local f
+    for f in $MX_FILES; do
+        assert_no_file "$1/$f" "$2: clean left mx's $f" || return 1
+    done
+}
+
+test_clean_keeps_what_mx_did_not_write() {
+    # MX-004's suspect 1: clean ran rm -rf on the whole --remote-dir, so a
+    # directory that also held someone's data lost it, and clean said
+    # "nothing of mx remains". It now deletes mx's files, keeps the rest and
+    # the directory, and fails, naming what it kept.
     setup_fleet "$(pick_port)" --pps 300 || return 1
-    local h
+    run_mx start --interval 2 --duration 30
+    assert_status 0 "$RUN_RC" "start" || return 1
+    sleep 2
+    local d
+    d=$(host_dir 127.0.0.1)
+    mkdir -p "$d/projects"
+    echo precious > "$d/projects/data.txt"
+    echo mine > "$d/notes.txt"
+    run_mx clean --yes
+    assert_status 1 "$RUN_RC" "clean must fail when it keeps the directory" || return 1
+    assert_contains "$RUN_OUT" "LEFTOVER: kept $d: it holds 2 thing(s) mx did not write: notes.txt projects" || return 1
+    assert_not_contains "$RUN_OUT" "nothing of mx remains" || return 1
+    assert_contains "$RUN_OUT" "beta   clean (was: stopped)" "the other host is clean" || return 1
+    assert_file_exists "$d/projects/data.txt" "clean deleted data mx did not write" || return 1
+    assert_file_exists "$d/notes.txt" "clean deleted a file mx did not write" || return 1
+    no_mx_files "$d" "alpha" || return 1
+    assert_no_file "$(host_dir 127.0.0.2)" "beta's directory, mx's alone, is gone" || return 1
+    run_mx status
+    assert_contains "$RUN_OUT" "alpha  NOT-RUNNING" "the agent was still stopped" || return 1
+    # Again: the same answer, and still nothing of the user's lost.
+    run_mx clean --yes
+    assert_status 1 "$RUN_RC" "a second clean" || return 1
+    assert_contains "$RUN_OUT" "LEFTOVER: kept $d" || return 1
+    assert_file_exists "$d/projects/data.txt" "a second clean deleted the data" || return 1
+    # And once the user has taken their files away, the directory goes.
+    rm -r "$d/projects" "$d/notes.txt"
+    run_mx clean --yes
+    assert_status 0 "$RUN_RC" "clean of an emptied directory" || return 1
+    assert_no_file "$d" "the directory is removed once it is empty" || return 1
+}
+
+test_clean_removes_every_file_a_run_can_leave() {
+    # The list clean deletes by is the whole list: a name missing from it
+    # would keep the directory and fail every clean.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    plant_mx_files "$(host_dir 127.0.0.1)"
+    plant_mx_files "$(host_dir 127.0.0.2)"
+    run_mx clean --yes
+    assert_status 0 "$RUN_RC" "clean" || return 1
+    assert_contains "$RUN_OUT" "nothing of mx remains" || return 1
+    assert_no_file "$(host_dir 127.0.0.1)" || return 1
+    assert_no_file "$(host_dir 127.0.0.2)" || return 1
+}
+
+test_clean_reports_an_mx_file_it_could_not_delete() {
+    # A directory by one of mx's names is not mx's: it stays, with what is in
+    # it, and clean says that mx's own trace is not gone.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local d
+    d=$(host_dir 127.0.0.1)
+    plant_mx_files "$d"
+    rm "$d/report.csv"
+    mkdir "$d/report.csv"
+    echo kept > "$d/report.csv/inside"
+    run_mx clean --yes
+    assert_status 1 "$RUN_RC" "clean" || return 1
+    assert_contains "$RUN_OUT" "LEFTOVER: could not delete report.csv in $d" || return 1
+    assert_file_exists "$d/report.csv/inside" || return 1
+}
+
+test_clean_through_a_symlink_deletes_only_mx_files() {
+    # A symlinked --remote-dir: rm -rf took only the link and left every
+    # file mx wrote (MX-004), and with a trailing slash, `rm -rf link/`, GNU
+    # rm emptied the directory it points to, the user's files with it. Now,
+    # either way, mx's files go through the link, and the link and its
+    # directory, which mx did not make, stay with everything else in them.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local h real slash
     for h in 127.0.0.1 127.0.0.2; do
         mkdir -p "$FAKE_ROOT/$h/data/real" "$(dirname "$(host_dir "$h")")"
+        echo mine > "$FAKE_ROOT/$h/data/real/keep.txt"
         ln -s "$FAKE_ROOT/$h/data/real" "$(host_dir "$h")"
     done
-    run_mx start --interval 2 --duration 20
-    assert_status 0 "$RUN_RC" "start through the link" || return 1
+    real="$FAKE_ROOT/127.0.0.1/data/real"
+    for slash in / ""; do
+        run_mx start --interval 2 --duration 20
+        assert_status 0 "$RUN_RC" "start through the link" || return 1
+        assert_file_exists "$real/mx.py" "start deploys through the link" || return 1
+        run_mx clean --yes --remote-dir "$MX_REMOTE_DIR$slash"
+        # What was lost first: that is the failure that matters.
+        assert_file_exists "$real/keep.txt" "clean of 'link$slash' deleted a file mx did not write" || return 1
+        [ -L "$(host_dir 127.0.0.1)" ] || { echo "clean of 'link$slash' removed the link" >&2; return 1; }
+        assert_status 0 "$RUN_RC" "clean of 'link$slash': mx's files are all gone" || return 1
+        assert_contains "$RUN_OUT" "kept $(host_dir 127.0.0.1), a symlink, and $real, where it points: mx made neither; $real still holds 1 thing(s) mx did not write: keep.txt" || return 1
+        no_mx_files "$real" "link$slash" || return 1
+        run_mx status
+        assert_contains "$RUN_OUT" "alpha  NOT-RUNNING" "clean of 'link$slash' stopped the agent" || return 1
+    done
+}
+
+test_clean_keeps_a_directory_rmdir_cannot_remove() {
+    # A mount point given as --remote-dir: rm -rf emptied it, then failed on
+    # the directory itself. Now mx's files go, and the directory with
+    # whatever rmdir says. (Stood in by an rmdir that fails as a mount
+    # point's does, EBUSY, since a test cannot mount anything.)
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    plant_mx_files "$(host_dir 127.0.0.1)"
+    cat > "$FAKE_BIN/rmdir" <<'SHIM'
+#!/bin/sh
+echo "rmdir: failed to remove '$1': Device or resource busy" >&2
+exit 1
+SHIM
+    chmod +x "$FAKE_BIN/rmdir"
     run_mx clean --yes
-    assert_status 1 "$RUN_RC" "clean must not claim success" || return 1
-    assert_contains "$RUN_OUT" "LEFTOVER" || return 1
-    assert_contains "$RUN_OUT" "was a symlink" || return 1
-    assert_not_contains "$RUN_OUT" "nothing of mx remains" || return 1
-    assert_file_exists "$FAKE_ROOT/127.0.0.1/data/real/mx.py" \
-        "the files are where the link pointed" || return 1
+    rm "$FAKE_BIN/rmdir"
+    assert_status 1 "$RUN_RC" "clean" || return 1
+    assert_contains "$RUN_OUT" "LEFTOVER: kept $(host_dir 127.0.0.1): rmdir: failed to remove" || return 1
+    assert_contains "$RUN_OUT" "Device or resource busy" || return 1
+    no_mx_files "$(host_dir 127.0.0.1)" "a mount point" || return 1
+}
+
+test_clean_leaves_a_remote_dir_that_is_not_a_directory() {
+    # A file, or a symlink to nothing, is not mx's working directory: start
+    # cannot have used it, and rm -rf deleted it all the same.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local a b
+    a=$(host_dir 127.0.0.1)
+    b=$(host_dir 127.0.0.2)
+    mkdir -p "$(dirname "$a")" "$(dirname "$b")"
+    echo mine > "$a"
+    ln -s "$FAKE_ROOT/nowhere" "$b"
+    run_mx clean --yes
+    assert_status 0 "$RUN_RC" "clean" || return 1
+    assert_contains "$RUN_OUT" "$a is not a directory, so not mx's: left alone" || return 1
+    assert_file_exists "$a" "clean deleted a file mx did not write" || return 1
+    [ -L "$b" ] || { echo "clean deleted a dangling symlink mx did not make" >&2; return 1; }
 }
 
 # The ~ below is meant literally: an unexpanded ~ is what mx must refuse.
@@ -820,7 +955,12 @@ run_test test_reload_does_not_kill_a_reused_pid
 run_test test_a_pid_file_that_is_not_a_plain_pid_signals_nothing
 run_test test_a_lost_pid_file_does_not_take_a_command_that_names_mx_for_the_agent
 run_test test_a_lost_pid_file_finds_an_agent_file_not_named_mx_py
-run_test test_clean_of_a_symlinked_remote_dir_reports_what_is_left
+run_test test_clean_keeps_what_mx_did_not_write
+run_test test_clean_removes_every_file_a_run_can_leave
+run_test test_clean_reports_an_mx_file_it_could_not_delete
+run_test test_clean_through_a_symlink_deletes_only_mx_files
+run_test test_clean_keeps_a_directory_rmdir_cannot_remove
+run_test test_clean_leaves_a_remote_dir_that_is_not_a_directory
 run_test test_a_remote_dir_no_host_can_use_is_refused
 run_test test_run_fails_when_its_closing_stop_fails
 run_test test_clean_removes_every_trace
