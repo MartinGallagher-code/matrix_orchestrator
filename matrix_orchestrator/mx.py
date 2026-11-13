@@ -2271,6 +2271,28 @@ def resolve_streams(spec):
     return n
 
 
+def _worker_context():
+    """How the agent starts its workers: forked, where the default would be
+    a forkserver.
+
+    Python 3.14 made forkserver the default on Linux. A worker's parent is
+    then the forkserver, not the agent, and every forkserver child holds a
+    copy of the pipe whose closing tells the forkserver to exit -- so with
+    the agent SIGKILLed the forkserver lived on, the workers' parent never
+    changed, their `getppid()` check never fired, and they kept sending, for
+    good under `mx run`, which gives them no --duration (MX-007). Forked,
+    they are the agent's own children again, as on every Python before it.
+    The agent is a single thread when it forks (a DiskPool's threads start
+    in the workers), which is what fork needs. Elsewhere -- spawn, the macOS
+    default -- the workers are the agent's children already.
+    """
+    ctx = multiprocessing.get_context()
+    if (ctx.get_start_method() == "forkserver"
+            and "fork" in multiprocessing.get_all_start_methods()):
+        return multiprocessing.get_context("fork")
+    return ctx
+
+
 def cmd_agent(args):
     if args.prepare_disk:
         # `mx start` runs this on every host before it starts any agent, so
@@ -2406,13 +2428,13 @@ def cmd_agent(args):
             shards[i % nworkers].append(spec)
 
     view = WorkerView(matrix, me)
-    stop = multiprocessing.Event()
-    queue = multiprocessing.Queue()
+    mp = _worker_context()
+    stop = mp.Event()
+    queue = mp.Queue()
     procs = []
     for wid in range(nworkers):
-        p = multiprocessing.Process(target=_worker, name="mx-worker-%d" % wid,
-                                    args=(wid, view, me, cfg, shards[wid],
-                                          stop, queue))
+        p = mp.Process(target=_worker, name="mx-worker-%d" % wid,
+                       args=(wid, view, me, cfg, shards[wid], stop, queue))
         p.daemon = True
         p.start()
         procs.append(p)

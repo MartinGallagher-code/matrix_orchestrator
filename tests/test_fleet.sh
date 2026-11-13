@@ -935,20 +935,28 @@ test_reload_reuses_the_flags_the_agent_was_started_with() {
 
 # ---- MX-007: one agent per directory, and what run, status and names do ----
 
-# agent_roots HOST -- the pid of every mx agent running out of HOST's
-# --remote-dir that is not another one's worker (or, on Python 3.14+, its
-# forkserver): one per agent launched. A healthy host has one, or none.
-agent_roots() {
-    local dir e p c pp pids="" out=""
+# agent_procs HOST -- every process running out of HOST's --remote-dir with
+# an agent's command line: the agents, and the workers they forked.
+agent_procs() {
+    local dir e p c pids=""
     dir=$(cd "$(host_dir "$1")" 2>/dev/null && pwd -P) || return 0
     for e in /proc/[0-9]*; do
         p=${e##*/}
         c=$(readlink "$e/cwd" 2>/dev/null) || continue
         [ "$c" = "$dir" ] || continue
+        running "$p" || continue
         case "$(tr '\0' ' ' < "$e/cmdline" 2>/dev/null)" in
             *" agent --matrix matrix.csv "*) pids="$pids $p" ;;
         esac
     done
+    echo "${pids# }"
+}
+
+# agent_roots HOST -- of those, the ones that are not another one's worker:
+# one per agent launched. A healthy host has one, or none.
+agent_roots() {
+    local p pp pids out=""
+    pids=$(agent_procs "$1")
     for p in $pids; do
         pp=$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | cut -d' ' -f2)
         case " $pids " in *" $pp "*) ;; *) out="$out $p" ;; esac
@@ -975,6 +983,34 @@ no_agents() {
         roots=$(agent_roots "$h")
         if [ -n "$roots" ]; then
             echo "$1: $h still runs agent(s) $roots" >&2
+            return 1
+        fi
+    done
+}
+
+test_a_killed_agent_leaves_no_worker_sending() {
+    # A worker stops when its parent goes: that is what keeps a SIGKILLed
+    # agent's traffic off the network. On Python 3.14, whose default start
+    # method is forkserver, the parent was the forkserver, which outlived
+    # the agent, and the workers sent on until --duration -- for good under
+    # mx run (MX-007). CI runs this on 3.14.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 60 --workers 2
+    assert_status 0 "$RUN_RC" "start" || return 1
+    local h procs i=0
+    for h in 127.0.0.1 127.0.0.2; do
+        kill -KILL "$(cat "$(host_dir "$h")/agent.pid")"
+    done
+    while [ -n "$(agent_procs 127.0.0.1)$(agent_procs 127.0.0.2)" ] && [ $i -lt 20 ]; do
+        sleep 0.25
+        i=$((i + 1))
+    done
+    for h in 127.0.0.1 127.0.0.2; do
+        procs=$(agent_procs "$h")
+        if [ -n "$procs" ]; then
+            echo "5 s after its agent was killed, $h still runs: $procs" >&2
+            # shellcheck disable=SC2086
+            kill -KILL $procs
             return 1
         fi
     done
@@ -1241,6 +1277,7 @@ run_test test_run_does_the_whole_thing
 run_test test_doctor_checks_the_hosts
 run_test test_dry_run_touches_nothing
 run_test test_a_matrix_by_another_name_is_still_deployed_as_matrix_csv
+run_test test_a_killed_agent_leaves_no_worker_sending
 run_test test_start_with_a_lost_pid_file_does_not_start_a_second_agent
 run_test test_status_sees_an_agent_whose_pid_file_is_lost
 run_test test_stop_also_stops_an_agent_its_pid_file_does_not_name

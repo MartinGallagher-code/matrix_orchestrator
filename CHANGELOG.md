@@ -49,6 +49,15 @@ their own change (MX-007). Nothing `mx` measures changed.
 - **A host name cannot contain `/`.** A name is the name of the host's log
   and report files, and `../../escaped` had `mx logs` write outside
   `--output`. `mx gen` and every command that reads the matrix refuse one.
+- **A killed agent's workers stop on Python 3.14 too.** 3.14 made
+  forkserver multiprocessing's default start method on Linux. A worker's
+  parent was then the forkserver, which every one of its children keeps
+  alive (each holds a copy of the pipe whose closing tells it to exit), so
+  with the agent SIGKILLed the forkserver lived on, the workers' parent
+  never changed, their `getppid()` check never fired, and they kept sending
+  until `--duration`, or for good under `mx run`. The agent now forks its
+  workers wherever the default would be a forkserver, as every Python
+  before 3.14 did.
 - **Nothing reaches ssh or scp as an option.** A server-list address, or
   `--user`, that starts with `-` was read by ssh as an option: with OpenSSH
   9.6, `-V` made `status` print ssh's version and call that host fine. ssh
@@ -67,21 +76,21 @@ their own change (MX-007). Nothing `mx` measures changed.
   directory), so a crashed test's agents were left running. The sleep now
   goes with its watchdog, and teardown kills whatever still runs out of the
   test's directory, read from `/proc`.
-- **CI runs the suite on Python 3.14 too.** It is the first whose
-  multiprocessing starts workers from a forkserver on Linux. MX-007 checked
-  it by hand on 3.14.6: the forkserver and the workers carry the agent's
-  command line (`sys_argv`), so a lost pid file still finds them, and with
-  the agent killed they are all gone within a second.
+- **CI runs the suite on Python 3.14 too.** Its first run is what found
+  the forkserver defect above: the existing
+  `test_reload_does_not_kill_a_reused_pid` kills the agents and found their
+  workers still running.
 - **README:** host-name rules, one agent per `--remote-dir`, what `run` does
   when start fails, `status`'s exit status, and that a `--remote-dir` with
   spaces or shell characters needs scp's SFTP mode (OpenSSH 9.0+): with
   `scp -O` a space fails the copy and `$(...)` runs on the host. That last
   one is documented, not changed.
-- **Ten new tests**, each failing on 1.11.6: eight in `tests/test_fleet.sh`
+- **Eleven new tests**, each failing on 1.11.6: nine in `tests/test_fleet.sh`
   (a second start with the pid file lost, status without it, stop with a
   stray agent, two starts at once, reload without the pid file, run after a
-  partial start, status with a host unreachable, and names, addresses and
-  users ssh would read as options) and two in `tests/test_harness.sh`.
+  partial start, status with a host unreachable, names, addresses and users
+  ssh would read as options, and a killed agent's workers, which fails on
+  Python 3.14 only) and two in `tests/test_harness.sh`.
 
 ## [1.11.6] - 2026-11-13
 
