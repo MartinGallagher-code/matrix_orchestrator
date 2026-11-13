@@ -9,6 +9,55 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.5] - 2026-11-13
+
+An adversarial pass over the commands that kill and delete on the fleet's
+hosts (MX-004). Nothing `mx` measures changed.
+
+### Fixed
+
+- **A stale `agent.pid` no longer gets an unrelated process killed.** The
+  file is kept across a reboot in the default `/var/tmp/mx`, and by then its
+  number can belong to any process of the ssh user's (any process at all,
+  for root). `kill -0` was the only test, so `stop`, `clean` and `reload`
+  sent TERM, then KILL to it and its children, while `status` showed it as
+  running, `doctor` said `agent_running=yes` and `start` refused with
+  "already running". `reload` also left a host whose agent was dead
+  "unchanged, left running". A pid is now believed only when it is a plain
+  positive pid and, where there is a `/proc`, an mx agent running out of
+  this `--remote-dir` (`_mx_is_ours`, used by every snippet that reads the
+  file). A file holding `-1`, `0` or `-PGID` could have signalled every
+  process the user can reach, or a whole process group; now it signals
+  nothing.
+- **A lost `agent.pid` finds the agent by its command line, not its file
+  name.** An agent deployed from a copy of `mx` not named `mx.py` was
+  invisible to the search, so `stop` and `clean` left it running and called
+  that a success. A command that merely named it, such as `less mx.py
+  agent.log` run from inside `--remote-dir`, was taken for an agent and
+  stopped.
+- **`mx run` fails when its closing `mx stop` does.** It exited 0 while a
+  host it could not reach was still sending.
+- **`mx clean` on a symlinked `--remote-dir` says what is left.** `rm -rf`
+  removes the link, not what it points to, so every file mx wrote stayed
+  there while clean reported "nothing of mx remains". What clean deletes is
+  unchanged; it now fails with a `LEFTOVER` line naming the directory.
+- **A `--remote-dir` no host can use is refused before any host is
+  touched:** an empty one, `/`, and any starting with `~`. A quoted `~` is
+  never expanded on the hosts, so `mkdir` made a directory named `~` in the
+  login directory while scp wrote to the real `~/mx`. The message suggests
+  the relative form, which ssh and scp both read from the login directory.
+
+### Changed
+
+- **The README, `mx clean --help` and `--remote-dir`'s help say what
+  `clean` deletes:** the whole `--remote-dir`, with everything in it, not
+  only mx's own files. The `--disk` section no longer says to "point
+  `--remote-dir` at" a disk; it says to give mx a directory of its own on
+  it, never the mount point.
+- **Eight new fleet tests** (`tests/test_fleet.sh`), each shown failing on
+  1.11.4 first and caught by a mutation of its fix. Where a regression
+  could send a real signal, the test stands `kill` in with an echo.
+
 ## [1.11.4] - 2026-11-10
 
 Every change moves the version; and a release can be traced to its commit.

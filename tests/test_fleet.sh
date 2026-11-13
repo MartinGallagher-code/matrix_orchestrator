@@ -320,6 +320,256 @@ test_doctor_reports_only_this_matrix_agent() {
     stop_b
 }
 
+# ---- MX-004: what a stale agent.pid, an odd one, or an odd --remote-dir does
+
+# A harmless process of the test's own, standing in for whatever has the pid
+# a stale agent.pid names after a reboot: same user, working directory
+# elsewhere, not an mx agent. Sets VICTIM, and kills it when the test exits.
+start_victim() {
+    ( cd / && exec sleep 300 ) &
+    VICTIM=$!
+    trap 'kill "$VICTIM" 2>/dev/null' EXIT
+}
+
+# Write $1 into every host's agent.pid.
+plant_pid() {
+    local h
+    for h in 127.0.0.1 127.0.0.2; do
+        mkdir -p "$(host_dir "$h")"
+        printf '%s\n' "$1" > "$(host_dir "$h")/agent.pid"
+    done
+}
+
+test_a_reused_pid_is_not_taken_for_the_agent() {
+    # /var/tmp keeps agent.pid across a reboot; by then its number can be any
+    # process of the ssh user's. kill -0 alone said "running": status showed
+    # it, doctor said agent_running=yes, start refused, and stop and clean
+    # killed it.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 30
+    assert_status 0 "$RUN_RC" "start" || return 1
+    run_mx stop
+    start_victim
+    plant_pid "$VICTIM"
+    run_mx status
+    assert_contains "$RUN_OUT" "NOT-RUNNING" "a reused pid is not the agent" || return 1
+    run_mx doctor
+    assert_contains "$RUN_OUT" "agent_running=no" || return 1
+    run_mx start --no-deploy --interval 2 --duration 30
+    assert_status 0 "$RUN_RC" "start is not refused over someone else's pid" || return 1
+    run_mx stop
+    assert_status 0 "$RUN_RC" "stop" || return 1
+    running "$VICTIM" || { echo "stop killed a process that was not an agent" >&2; return 1; }
+    plant_pid "$VICTIM"
+    run_mx clean --yes
+    assert_status 0 "$RUN_RC" "clean" || return 1
+    running "$VICTIM" || { echo "clean killed a process that was not an agent" >&2; return 1; }
+    assert_no_file "$(host_dir 127.0.0.1)" "clean still removes the directory" || return 1
+}
+
+test_reload_does_not_kill_a_reused_pid() {
+    # reload's probe and its stop used kill -0 too: it took the reused pid
+    # for a running agent, TERMed it, and left a host whose agent was dead
+    # "unchanged, left running".
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 60
+    assert_status 0 "$RUN_RC" "start" || return 1
+    local h
+    for h in 127.0.0.1 127.0.0.2; do
+        kill -KILL "$(cat "$(host_dir "$h")/agent.pid")"
+    done
+    sleep 1
+    start_victim
+    plant_pid "$VICTIM"
+    awk -F, 'BEGIN{OFS=","} /^alpha=/{$3=900} {print}' matrix.csv > m.new \
+        && mv m.new matrix.csv
+    run_mx reload
+    assert_status 0 "$RUN_RC" "reload" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "not running, will start: 2 host(s)" \
+        "neither host's agent is running" || { run_mx stop; return 1; }
+    running "$VICTIM" || { echo "reload killed a process that was not an agent" >&2; run_mx stop; return 1; }
+    run_mx stop
+}
+
+test_a_pid_file_that_is_not_a_plain_pid_signals_nothing() {
+    # `kill -TERM -1` is every process the ssh user can signal (for root,
+    # the host); `0` and `00` are the snippet's own process group. A pid
+    # file is only ever a plain positive pid. kill, pkill and sleep are
+    # stood in on the "hosts" for this test -- signal 0 still asks the real
+    # kill -- so a regression prints what it would have done, not does it.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    # A real start and stop first, so each host has a stamp and reload has
+    # something to restart.
+    run_mx start --interval 2 --duration 30
+    assert_status 0 "$RUN_RC" "start" || return 1
+    run_mx stop
+    mv "$FAKE_BIN/ssh" "$FAKE_BIN/ssh.real"
+    cat > "$FAKE_BIN/ssh" <<'SHIM'
+#!/usr/bin/env bash
+args=("$@"); n=${#args[@]}
+pre='kill() { if [ "$1" = -0 ]; then builtin kill "$@"; else echo "WOULD SIGNAL: kill $*"; fi; }
+pkill() { echo "WOULD SIGNAL: pkill $*"; }
+sleep() { :; }'
+args[$((n-1))]="$pre
+${args[$((n-1))]}"
+exec "$(dirname "$0")/ssh.real" "${args[@]}"
+SHIM
+    chmod +x "$FAKE_BIN/ssh"
+    # The real ssh, for stopping what reload starts.
+    real_stop() { MX_SSH="$FAKE_BIN/ssh.real" run_mx stop >/dev/null 2>&1; }
+    local c i=0 pgid
+    pgid=$(awk '{print $5}' "/proc/$$/stat" 2>/dev/null)
+    for c in -1 0 00 1 +1 "-${pgid:-1}"; do
+        i=$((i + 1))
+        plant_pid "$c"
+        run_mx stop
+        assert_not_contains "$RUN_OUT" "WOULD SIGNAL" "stop, agent.pid=$c" || return 1
+        # Without /proc a live pid is all there is to go on, so this is
+        # where only the plain-pid check stands in the way.
+        plant_pid "$c"
+        MX_PROC="$TEST_TMPDIR/no-proc" run_mx stop
+        assert_not_contains "$RUN_OUT" "WOULD SIGNAL" "stop without /proc, agent.pid=$c" || return 1
+        plant_pid "$c"
+        MX_PROC="$TEST_TMPDIR/no-proc" run_mx status
+        assert_contains "$RUN_OUT" "NOT-RUNNING" "status without /proc, agent.pid=$c" || return 1
+        plant_pid "$c"
+        run_mx status
+        assert_contains "$RUN_OUT" "NOT-RUNNING" "status, agent.pid=$c" || return 1
+        run_mx doctor
+        assert_not_contains "$RUN_OUT" "agent_running=yes" "doctor, agent.pid=$c" || return 1
+        # A changed row each time, so a host taken for running is restarted.
+        awk -F, -v r=$((900 + i)) 'BEGIN{OFS=","} /^alpha=/{$3=r} {print}' \
+            matrix.csv > m.new && mv m.new matrix.csv
+        run_mx reload
+        assert_not_contains "$RUN_OUT" "WOULD SIGNAL" "reload, agent.pid=$c" || { real_stop; return 1; }
+        real_stop
+    done
+    plant_pid -1
+    run_mx clean --yes
+    assert_not_contains "$RUN_OUT" "WOULD SIGNAL" "clean, agent.pid=-1" || return 1
+}
+
+test_a_lost_pid_file_does_not_take_a_command_that_names_mx_for_the_agent() {
+    # Without agent.pid, agents are found by working directory and command
+    # line. "mx.py agent" anywhere in the command line used to be enough, so
+    # a pager reading the log from inside --remote-dir was stopped as one.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 30
+    run_mx stop
+    ( cd "$(host_dir 127.0.0.1)" && exec -a "less mx.py agent.log" sleep 300 ) &
+    VICTIM=$!
+    trap 'kill "$VICTIM" 2>/dev/null' EXIT
+    sleep 0.5
+    run_mx stop
+    assert_status 0 "$RUN_RC" || return 1
+    running "$VICTIM" || { echo "stop killed a pager that only named mx.py" >&2; return 1; }
+    assert_contains "$RUN_OUT" "not-running" || return 1
+}
+
+test_a_lost_pid_file_finds_an_agent_file_not_named_mx_py() {
+    # `mx` is one self-contained file, and a copy of it need not be called
+    # mx.py; the agent is deployed under the name it has. Its agents were
+    # invisible to the lost-pid search, so stop and clean left them running
+    # and said so was fine.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    mkdir -p alt && cp "$MX" alt/mx
+    MX="$TEST_TMPDIR/alt/mx" run_mx start --interval 2 --duration 30
+    assert_status 0 "$RUN_RC" "start from a copy named mx" || return 1
+    assert_file_exists "$(host_dir 127.0.0.1)/mx" "deployed as mx" || return 1
+    local h pids=""
+    for h in 127.0.0.1 127.0.0.2; do
+        pids="$pids $(cat "$(host_dir "$h")/agent.pid")"
+        rm -f "$(host_dir "$h")/agent.pid"
+    done
+    MX="$TEST_TMPDIR/alt/mx" run_mx stop
+    local pid
+    if [ "$RUN_RC" -ne 0 ] || [[ "$RUN_OUT" != *stopped* ]]; then
+        printf 'stop did not find the agents (rc=%s):\n%s\n' "$RUN_RC" "$RUN_OUT" >&2
+        for pid in $pids; do kill "$pid" 2>/dev/null; done
+        return 1
+    fi
+    for pid in $pids; do
+        if running "$pid"; then
+            echo "agent $pid outlived stop with its pid file lost" >&2
+            kill "$pid"
+            return 1
+        fi
+    done
+}
+
+test_clean_of_a_symlinked_remote_dir_reports_what_is_left() {
+    # rm -rf on a symlink removes the link, not what it points to: every file
+    # mx wrote stays there. clean said "nothing of mx remains"; it now says
+    # what is left and fails. (What clean deletes is unchanged.)
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local h
+    for h in 127.0.0.1 127.0.0.2; do
+        mkdir -p "$FAKE_ROOT/$h/data/real" "$(dirname "$(host_dir "$h")")"
+        ln -s "$FAKE_ROOT/$h/data/real" "$(host_dir "$h")"
+    done
+    run_mx start --interval 2 --duration 20
+    assert_status 0 "$RUN_RC" "start through the link" || return 1
+    run_mx clean --yes
+    assert_status 1 "$RUN_RC" "clean must not claim success" || return 1
+    assert_contains "$RUN_OUT" "LEFTOVER" || return 1
+    assert_contains "$RUN_OUT" "was a symlink" || return 1
+    assert_not_contains "$RUN_OUT" "nothing of mx remains" || return 1
+    assert_file_exists "$FAKE_ROOT/127.0.0.1/data/real/mx.py" \
+        "the files are where the link pointed" || return 1
+}
+
+# The ~ below is meant literally: an unexpanded ~ is what mx must refuse.
+# shellcheck disable=SC2088
+test_a_remote_dir_no_host_can_use_is_refused() {
+    # A quoted ~ is never expanded on the hosts: ssh made a directory named
+    # "~" while scp wrote to the real home. Refused up front, with the form
+    # that does work; so are an empty path and /. --dry-run, so that nothing
+    # would run even where the refusal is missing.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --dry-run --remote-dir '~/mx'
+    assert_status 2 "$RUN_RC" "~/mx" || return 1
+    assert_contains "$RUN_OUT" "not expanded" || return 1
+    assert_contains "$RUN_OUT" "--remote-dir mx" "it names the form that works" || return 1
+    run_mx clean --yes --dry-run --remote-dir '~'
+    assert_status 2 "$RUN_RC" "~" || return 1
+    run_mx clean --yes --dry-run --remote-dir ''
+    assert_status 2 "$RUN_RC" "an empty --remote-dir" || return 1
+    run_mx clean --yes --dry-run --remote-dir /
+    assert_status 2 "$RUN_RC" "/" || return 1
+    assert_contains "$RUN_OUT" "root directory" || return 1
+    MX_REMOTE_DIR='~/mx' run_mx status --dry-run
+    assert_status 2 "$RUN_RC" "MX_REMOTE_DIR=~/mx" || return 1
+    if [ -s "$FAKE_ROOT/calls.log" ]; then
+        echo "a refused --remote-dir still reached a host:" >&2
+        cat "$FAKE_ROOT/calls.log" >&2
+        return 1
+    fi
+}
+
+test_run_fails_when_its_closing_stop_fails() {
+    # run discarded stop's result: a host it could not stop was still
+    # sending, and run exited 0.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    mv "$FAKE_BIN/ssh" "$FAKE_BIN/ssh.real"
+    cat > "$FAKE_BIN/ssh" <<'SHIM'
+#!/usr/bin/env bash
+# The stop snippet (only it starts from "not-deployed") cannot reach beta.
+case "$*" in
+    *127.0.0.2*status=not-deployed*)
+        echo "ssh: connect to host 127.0.0.2 port 22: Connection timed out"
+        exit 255 ;;
+esac
+exec "$(dirname "$0")/ssh.real" "$@"
+SHIM
+    chmod +x "$FAKE_BIN/ssh"
+    run_mx run --for 4 --interval 2
+    local rc=$RUN_RC out=$RUN_OUT
+    mv "$FAKE_BIN/ssh.real" "$FAKE_BIN/ssh"
+    run_mx stop
+    assert_status 1 "$rc" "run must fail when its stop did" || { printf '%s\n' "$out" >&2; return 1; }
+    assert_contains "$out" "not every agent could be stopped" || return 1
+}
+
 test_clean_removes_every_trace() {
     setup_fleet "$(pick_port)" --pps 500 || return 1
     run_mx start --interval 2 --duration 30
@@ -565,6 +815,14 @@ run_test test_stop_with_a_lost_pid_file_stops_only_this_matrix
 run_test test_clean_with_a_lost_pid_file_cleans_only_this_matrix
 run_test test_a_lost_pid_file_without_proc_refuses_to_guess
 run_test test_doctor_reports_only_this_matrix_agent
+run_test test_a_reused_pid_is_not_taken_for_the_agent
+run_test test_reload_does_not_kill_a_reused_pid
+run_test test_a_pid_file_that_is_not_a_plain_pid_signals_nothing
+run_test test_a_lost_pid_file_does_not_take_a_command_that_names_mx_for_the_agent
+run_test test_a_lost_pid_file_finds_an_agent_file_not_named_mx_py
+run_test test_clean_of_a_symlinked_remote_dir_reports_what_is_left
+run_test test_a_remote_dir_no_host_can_use_is_refused
+run_test test_run_fails_when_its_closing_stop_fails
 run_test test_clean_removes_every_trace
 run_test test_clean_works_when_nothing_is_running
 run_test test_clean_on_a_never_deployed_fleet_is_harmless
