@@ -59,7 +59,44 @@ test_the_limit_can_be_turned_off() {
     assert_contains "$out" "PASS  test_case" || return 1
 }
 
+test_a_finished_test_does_not_hold_the_suite_open() {
+    # The watchdog's sleep outlived the watchdog it was killed with, and
+    # held the suite's output open for the whole limit: run_tests.sh's
+    # `out=$(bash test_x.sh)` waited MX_TEST_TIMEOUT seconds after every
+    # file's last test (MX-007).
+    local inner="$TEST_TMPDIR/inner.sh"
+    write_inner "$inner" 'true'
+    local out began ended
+    began=$(date +%s)
+    out=$(MX_TEST_TIMEOUT=20 bash "$inner" 2>&1)
+    ended=$(date +%s)
+    assert_contains "$out" "PASS  test_case" || return 1
+    if [ $((ended - began)) -ge 10 ]; then
+        echo "a test that passed at once held its suite open for $((ended - began))s" >&2
+        return 1
+    fi
+}
+
+test_teardown_kills_what_a_test_left_running() {
+    # teardown's sweep, `pkill -f "[m]x[.]py agent --matrix $TEST_TMPDIR"`,
+    # never matched an agent: they are started with `--matrix matrix.csv`.
+    # A test that crashed left its agents sending at the runner (MX-007).
+    local inner="$TEST_TMPDIR/inner.sh" pidfile="$TEST_TMPDIR/left.pid"
+    write_inner "$inner" "mkdir -p \"\$TEST_TMPDIR/h\" && ( cd \"\$TEST_TMPDIR/h\" && exec -a 'python3 mx.py agent --matrix matrix.csv --host a' sleep 300 ) < /dev/null > /dev/null 2>&1 & echo \$! > '$pidfile'"
+    MX_TEST_TIMEOUT=0 bash "$inner" > /dev/null 2>&1
+    local left
+    left=$(cat "$pidfile" 2>/dev/null)
+    [ -n "$left" ] || { echo "the inner test started nothing" >&2; return 1; }
+    if [ -r "/proc/$left/status" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$left/status"; then
+        echo "teardown left the test's agent running ($left)" >&2
+        kill "$left" 2>/dev/null
+        return 1
+    fi
+}
+
 run_test test_a_hung_test_is_killed_by_the_default_time_limit
 run_test test_a_fast_test_is_unaffected_by_the_limit
 run_test test_the_limit_can_be_turned_off
+run_test test_a_finished_test_does_not_hold_the_suite_open
+run_test test_teardown_kills_what_a_test_left_running
 report_tests

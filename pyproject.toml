@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matrix-orchestrator"
-version = "1.11.6"
+version = "1.11.7"
 description = "Request/response traffic matrix across a fleet, measured in packets per second"
 readme = "README.md"
 requires-python = ">=3.6"
@@ -43,6 +43,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Networking",
     "Topic :: System :: Networking :: Monitoring",
     "Topic :: System :: Benchmark",
