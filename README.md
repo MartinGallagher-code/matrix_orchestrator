@@ -89,7 +89,7 @@ no packages, no root. Key-based SSH must already work
 | `mx status` | One line per host: the live ticker, or `NOT-RUNNING`. |
 | `mx summarize` | Collect the reports and print pps, Gbps, loss, latency — and what to do next. |
 | `mx stop` | Stop the agents. Reports and logs stay on the hosts. |
-| `mx clean` | Stop, then delete everything. No trace left. |
+| `mx clean` | Stop, then delete everything mx put on the hosts. No trace left. |
 
 And seven more when you want them: `mx run` (all of the above in one
 shot), `mx reload` (an edited matrix onto a *running* fleet — see
@@ -173,10 +173,12 @@ host is still writing a gigabyte while its peers are already sending to it.
 Later runs find the file in place and reuse it. `--disk-size` sets the size
 (default `1G`; bigger spreads the random I/O over more of the disk). To test
 a particular disk, point `--remote-dir` at a directory of mx's own on it,
-since the file lives there: `--remote-dir /mnt/nvme0/mx`, never the mount
-point `/mnt/nvme0` itself, because `mx clean` deletes the whole
-`--remote-dir`, whatever else is in it. `mx stop` leaves the file for the
-next run, and `mx clean` removes it with everything else.
+since the file lives there: `--remote-dir /mnt/nvme0/mx`. Not the mount
+point `/mnt/nvme0` itself: `mx clean` deletes only mx's own files, so nothing
+else on the disk is lost, but it cannot remove a mount point (or the
+`lost+found` in it), and it would fail with a `LEFTOVER` line on every
+clean. `mx stop` leaves the file for the next run, and `mx clean` removes it
+with mx's other files.
 
 **What gets reported.** The `mx status` line shows each host's disk read
 and write rate, IOPS, and `busy`: the share of its time the busiest worker
@@ -604,22 +606,36 @@ file is written.
 ```bash
 mx logs         # take the logs first if you want them
 mx summarize    # and the reports
-mx clean        # stop everything, remove the directory, verify it is gone
+mx clean        # stop everything, delete mx's files and the directory, verify
 ```
 
-**What `mx clean` deletes: the whole `--remote-dir`, with `rm -rf`.** That
-is everything in it, not only the files mx wrote there (the agent,
-`matrix.csv`, `agent.log`, `report.csv`, `agent.pid`, `agent.stamp`,
-`disk.dat`). So give mx a directory of its own: never a disk's mount point,
-a home directory, or anything that holds other files.
+**What `mx clean` deletes: the files mx wrote, and nothing else.** Those
+are the agent (`mx.py`), `matrix.csv`, `agent.log`, `report.csv`,
+`agent.pid`, `agent.stamp`, `disk.dat`, and a half-written
+`disk.dat.<pid>.tmp` if preparing the data file was cut short. Then the
+directory goes too, with `rmdir`, which removes it only once it is empty.
+Anything else in `--remote-dir` stays where it is.
 
-`mx clean` refuses to report success unless the directory is actually
-gone and no agent is still running out of it. It fails, and says what is
-left, when:
+- **The directory holds something else** (your files, a core dump, a disk's
+  `lost+found`): clean keeps it, with everything mx did not write, and fails
+  with a line that names what is there, such as `LEFTOVER: kept /var/tmp/mx:
+  it holds 2 thing(s) mx did not write: notes.txt projects`. Move them, and
+  the next `mx clean` removes the directory.
+- **The directory cannot be removed** for another reason, such as being a
+  mount point: clean keeps it and fails with `rmdir`'s reason.
+- **`--remote-dir` is a symlink**, with or without a trailing slash: clean
+  deletes mx's files in the directory it points to, then keeps the link and
+  that directory, since mx made neither (its `mkdir -p` cannot make a
+  symlink). It says so, and does not fail.
+- **`--remote-dir` is not a directory** (a file, or a symlink to nothing):
+  start could never have used it, and clean leaves it alone.
 
-- the directory, or an agent running out of it, survives;
-- `--remote-dir` is a symlink: `rm -rf` removes only the link, and the
-  directory it points to, with mx's files in it, stays;
+Give mx a directory of its own all the same: one it made is one clean can
+remove. Clean also refuses to report success, and says what is left, when:
+
+- one of mx's own files could not be deleted (a directory by that name, or
+  one the ssh user has no right to remove), or an agent running out of the
+  directory survives;
 - a host has no `/proc` and the agent's `agent.pid` is lost while an mx
   agent is running there. It cannot tell whose agent that is, so it deletes
   nothing.

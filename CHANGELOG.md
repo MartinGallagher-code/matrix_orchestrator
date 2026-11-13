@@ -9,6 +9,51 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.6] - 2026-11-13
+
+`mx clean` deletes what mx wrote, and nothing else (MX-005). Nothing `mx`
+measures changed.
+
+### Fixed
+
+- **`mx clean` no longer deletes files mx did not write.** It ran `rm -rf`
+  on the whole `--remote-dir`, so a directory that also held someone's
+  data lost it, and clean still said "nothing of mx remains" (MX-004's
+  suspect 1). It now deletes mx's own files by name: the agent (`mx.py`, or
+  the name of the copy that deployed it), `matrix.csv`, `agent.log`,
+  `report.csv`, `agent.pid`, `agent.stamp`, `disk.dat` and a half-written
+  `disk.dat.<pid>.tmp`. Then it removes the directory with `rmdir`, which
+  succeeds only once the directory is empty. A directory still holding
+  anything else is kept, with everything in it, and clean fails with
+  `LEFTOVER: kept DIR: it holds N thing(s) mx did not write: ...`. A
+  directory rmdir cannot remove, such as a mount point, is kept too, and
+  clean fails with rmdir's reason. It used to empty a mount point first.
+- **A symlinked `--remote-dir` no longer loses what it points to.** With a
+  trailing slash (`link/`), GNU `rm -rf` emptied the directory the link
+  points to, files mx did not write included, and every later clean
+  reported `LEFTOVER`. Without one, only the link went and mx's files
+  stayed. Either way, clean now follows the link to delete mx's files, then
+  keeps the link and its directory, since mx made neither, says so, and
+  succeeds.
+- **A `--remote-dir` that is not a directory is left alone.** `rm -rf`
+  deleted a file, or a dangling symlink, that start could never have used.
+- **An mx file clean cannot delete fails the clean.** A directory by one of
+  mx's names, or a file the ssh user may not remove, is reported as
+  `LEFTOVER: could not delete NAME in DIR`.
+
+### Changed
+
+- **The README ("Leaving no trace", `--disk`, the command table), `mx clean
+  --help`, its prompt, and `--remote-dir`'s help** say what clean now
+  deletes, and what it keeps.
+- **Six new fleet tests** (`tests/test_fleet.sh`) replace MX-004's symlink
+  test, whose expected behaviour this changes. Five fail on 1.11.5: foreign
+  data in the directory, both symlink forms, a mount point (an `rmdir`
+  stand-in that fails with EBUSY), a `--remote-dir` that is a file or a
+  dangling link, and an mx name clean cannot delete. The sixth plants every
+  file a run can leave and checks the directory goes, so a name missing
+  from clean's list fails it.
+
 ## [1.11.5] - 2026-11-13
 
 An adversarial pass over the commands that kill and delete on the fleet's

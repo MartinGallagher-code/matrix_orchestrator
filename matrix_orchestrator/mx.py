@@ -66,7 +66,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
-VERSION = "1.11.5"
+VERSION = "1.11.6"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -3723,11 +3723,103 @@ def cmd_logs(args):
     return 1 if failed else 0
 
 
+def _own_files():
+    """Every name mx writes into --remote-dir, and so all that `clean`
+    deletes there: the agent file (under this copy's own name, which is what
+    start pushed, and as mx.py, the name every checkout and wheel has), the
+    matrix, the log, the report, the pid file, the stamp and the data file.
+    A data file whose writing was cut short leaves `disk.dat.<pid>.tmp`, so
+    that pattern is mx's too (DISK_TMP)."""
+    names = []
+    for name in (os.path.basename(_agent_source()), "mx.py", MATRIX_NAME,
+                 LOG_NAME, REPORT_NAME, PID_NAME, STAMP_NAME, DISK_NAME):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+# The half-written data file `disk_prepare` leaves if it is killed before
+# its rename: "<DISK_NAME>.<pid>.tmp". A shell glob, so it goes in unquoted.
+DISK_TMP = DISK_NAME.replace(".", "[.]") + "[.][0-9]*[.]tmp"
+
+
+def _clean_block(rdir):
+    """Shell that stops the agent, then deletes what mx wrote in --remote-dir
+    and nothing else (MX-005). It used to `rm -rf` the whole directory,
+    whatever was in it: a --remote-dir that also held someone's data lost it,
+    and `link/`, a symlink with a trailing slash, had GNU rm empty the
+    directory it points to.
+
+    - mx's own files go (`_own_files`), then the directory with `rmdir`, which
+      removes it only if nothing else is left. If anything is, the directory
+      and everything else in it are kept, and clean fails with a LEFTOVER line
+      naming them. So does a directory rmdir cannot remove for another reason,
+      such as a mount point (EBUSY).
+    - A symlink is followed to delete mx's files, and then kept, with the
+      directory it points to: mx makes neither (start's `mkdir -p` cannot
+      make a symlink), so they are the user's. Trailing slashes are dropped
+      first, so `link/` is seen as the link it is.
+    - Something that is not a directory is not mx's, and is left alone.
+    - An mx file clean could not delete (a directory by that name, say) fails
+      with a LEFTOVER line too: mx's own trace is not gone.
+
+    The directory is kept while an agent that may be this run's is still in
+    it (`unscoped`): it is the only trace left of whose agent that is.
+    """
+    own = " ".join(shlex.quote(n) for n in _own_files())
+    return _kill_block(rdir.rstrip("/") or rdir) + """
+if [ "$status" = unscoped ]; then echo {msg}; exit 1; fi
+if [ ! -d "$d" ]; then
+    if [ -e "$d" ] || [ -L "$d" ]; then
+        echo "clean (was: $status); $d is not a directory, so not mx's: left alone"
+    else
+        echo "clean (was: $status)"
+    fi
+    exit 0
+fi
+(
+    cd "$d" || exit 1
+    rm -f -- {own} {tmp} 2>/dev/null
+    left=""
+    for f in {own} {tmp}; do
+        if [ -e "$f" ] || [ -L "$f" ]; then left="$left $f"; fi
+    done
+    [ -z "$left" ] || {{ echo "LEFTOVER: could not delete$left in $d"; exit 1; }}
+) || exit 1
+if [ -n "$(_mx_ours "$r")" ]; then echo 'LEFTOVER: an agent is still running'; exit 1; fi
+_mx_others() {{
+    n=$(ls -A "$1" 2>/dev/null | wc -l)
+    n=$((n))
+    [ "$n" -gt 0 ] || return 1
+    some=$(ls -A "$1" 2>/dev/null | head -n 5 | tr '\\n' ' ')
+    more=""
+    [ "$n" -le 5 ] || more=" and $((n - 5)) more"
+    echo "$n thing(s) mx did not write: ${{some% }}$more"
+}}
+if [ -L "$d" ]; then
+    what=$(_mx_others "$r") && what="; $r still holds $what"
+    echo "clean (was: $status); kept $d, a symlink, and $r, where it points: mx made neither$what"
+    exit 0
+fi
+if ! err=$(rmdir "$d" 2>&1); then
+    if what=$(_mx_others "$d"); then
+        echo "LEFTOVER: kept $d: it holds $what"
+    else
+        echo "LEFTOVER: kept $d: $err"
+    fi
+    exit 1
+fi
+if [ -e "$d" ]; then echo "LEFTOVER: $d still exists"; exit 1; fi
+echo "clean (was: $status)"
+""".format(msg=shlex.quote("LEFTOVER: " + UNSCOPED), own=own, tmp=DISK_TMP)
+
+
 def cmd_clean(args):
     m = load_matrix(args.matrix)
     fleet = Fleet(m, args)
     if not args.yes and not args.dry_run:
-        log("[mx] this stops every agent and deletes %s on %d hosts."
+        log("[mx] this stops every agent and deletes mx's files in %s on %d "
+            "hosts, then the directory if nothing else is in it."
             % (fleet.dir, len(m.hosts)))
         log("[mx] collect anything you want first (mx summarize, mx logs).")
         try:
@@ -3737,22 +3829,8 @@ def cmd_clean(args):
         if reply.strip().lower() != "yes":
             log("[mx] nothing done")
             return 1
-    # The directory is kept while an agent that may be this run's is still
-    # in it (`unscoped`): it is the only trace left of whose agent that is.
-    # A --remote-dir that is a symlink loses only the link to `rm -rf`, and
-    # everything mx wrote stays where it pointed: that is a leftover too, not
-    # a clean (MX-004). What clean deletes is unchanged; it says so instead.
-    script = _kill_block(fleet.dir) + """
-if [ "$status" = unscoped ]; then echo {msg}; exit 1; fi
-rm -rf "$d"
-if [ -e "$d" ]; then echo "LEFTOVER: $d still exists"; exit 1; fi
-if [ -n "$r" ] && [ -e "$r" ]; then
-    echo "LEFTOVER: $d was a symlink; $r, where mx's files are, still exists"; exit 1
-fi
-if [ -n "$(_mx_ours "$r")" ]; then echo 'LEFTOVER: an agent is still running'; exit 1; fi
-echo "clean (was: $status)"
-""".format(msg=shlex.quote("LEFTOVER: " + UNSCOPED))
-    failed = fleet.each(lambda h: fleet.sh(h, script), "removing every trace")
+    script = _clean_block(fleet.dir)
+    failed = fleet.each(lambda h: fleet.sh(h, script), "removing mx's files")
     if failed:
         return 1
     log("[mx] nothing of mx remains on the fleet "
@@ -5508,8 +5586,9 @@ def _add_fleet_flags(p):
     p.add_argument("--jobs", type=int, default=int(_env("MX_JOBS", "64")),
                    help="ssh fan-out concurrency (default: %(default)s)")
     p.add_argument("--remote-dir", default=_env("MX_REMOTE_DIR", DEFAULT_REMOTE_DIR),
-                   help="working directory on each host, mx's own: `mx clean` "
-                        "deletes it whole (default: %(default)s)")
+                   help="working directory on each host: `mx clean` deletes "
+                        "mx's files in it, then the directory if nothing else "
+                        "is left (default: %(default)s)")
     p.add_argument("--python", default=_env("MX_PYTHON", "python3"),
                    help="python on the hosts (default: %(default)s)")
     p.add_argument("--ssh", default=_env("MX_SSH", "ssh"), help=argparse.SUPPRESS)
@@ -5750,20 +5829,25 @@ def build_parser():
 
     cl = sub.add_parser(
         "clean", help="stop, then delete every trace from the hosts",
-        description="Stop this --remote-dir's agent, then delete the whole "
-                    "--remote-dir on every host (rm -rf): everything in it, "
-                    "not only the files mx wrote there (the agent, "
-                    "matrix.csv, agent.log, report.csv, agent.pid, "
-                    "agent.stamp, disk.dat). Give mx a directory of its own, "
-                    "never a disk's mount point or a directory that holds "
-                    "anything else. clean fails, and says what is left, when "
-                    "the directory or an agent in it survives; when "
-                    "--remote-dir is a symlink (only the link goes, and what "
-                    "it points to stays); and on a host with no /proc whose "
-                    "agent.pid is lost while an mx agent runs, where it "
-                    "deletes nothing because it cannot tell whose agent that "
-                    "is. A --remote-dir that is empty, starts with ~, or is / "
-                    "is refused before any host is touched.")
+        description="Stop this --remote-dir's agent, then delete the files "
+                    "mx wrote in --remote-dir on every host, and nothing "
+                    "else: the agent (mx.py), matrix.csv, agent.log, "
+                    "report.csv, agent.pid, agent.stamp, disk.dat and a "
+                    "half-written disk.dat.<pid>.tmp. The directory goes too "
+                    "(rmdir) once that leaves it empty. If it holds anything "
+                    "else, or cannot be removed (a mount point), it is kept "
+                    "with everything else in it, and clean fails with a "
+                    "LEFTOVER line naming what is there. A --remote-dir that "
+                    "is a symlink, with or without a trailing slash, is "
+                    "followed to delete mx's files, then kept with the "
+                    "directory it points to: mx made neither. One that is not "
+                    "a directory is left alone. clean also fails, and says "
+                    "what is left, when an mx file or an agent survives, and "
+                    "on a host with no /proc whose agent.pid is lost while an "
+                    "mx agent runs, where it deletes nothing because it "
+                    "cannot tell whose agent that is. A --remote-dir that is "
+                    "empty, starts with ~, or is / is refused before any host "
+                    "is touched.")
     _add_fleet_flags(cl)
     cl.add_argument("--yes", "-y", action="store_true", help="do not ask")
 
