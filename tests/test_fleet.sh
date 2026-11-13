@@ -674,6 +674,10 @@ test_a_remote_dir_no_host_can_use_is_refused() {
     assert_contains "$RUN_OUT" "root directory" || return 1
     MX_REMOTE_DIR='~/mx' run_mx status --dry-run
     assert_status 2 "$RUN_RC" "MX_REMOTE_DIR=~/mx" || return 1
+    # A leading '-' reached mkdir, cd and rm as an option (MX-007).
+    run_mx clean --yes --dry-run --remote-dir=-rf
+    assert_status 2 "$RUN_RC" "--remote-dir=-rf" || return 1
+    assert_contains "$RUN_OUT" "./-rf" "it names the form that works" || return 1
     if [ -s "$FAKE_ROOT/calls.log" ]; then
         echo "a refused --remote-dir still reached a host:" >&2
         cat "$FAKE_ROOT/calls.log" >&2
@@ -929,6 +933,273 @@ test_reload_reuses_the_flags_the_agent_was_started_with() {
     run_mx stop
 }
 
+# ---- MX-007: one agent per directory, and what run, status and names do ----
+
+# agent_roots HOST -- the pid of every mx agent running out of HOST's
+# --remote-dir that is not another one's worker (or, on Python 3.14+, its
+# forkserver): one per agent launched. A healthy host has one, or none.
+agent_roots() {
+    local dir e p c pp pids="" out=""
+    dir=$(cd "$(host_dir "$1")" 2>/dev/null && pwd -P) || return 0
+    for e in /proc/[0-9]*; do
+        p=${e##*/}
+        c=$(readlink "$e/cwd" 2>/dev/null) || continue
+        [ "$c" = "$dir" ] || continue
+        case "$(tr '\0' ' ' < "$e/cmdline" 2>/dev/null)" in
+            *" agent --matrix matrix.csv "*) pids="$pids $p" ;;
+        esac
+    done
+    for p in $pids; do
+        pp=$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | cut -d' ' -f2)
+        case " $pids " in *" $pp "*) ;; *) out="$out $p" ;; esac
+    done
+    echo "${out# }"
+}
+
+# one_agent_each WHAT -- fails unless each host runs exactly one agent.
+one_agent_each() {
+    local h roots
+    for h in 127.0.0.1 127.0.0.2; do
+        roots=$(agent_roots "$h")
+        if [ "$(printf '%s\n' "$roots" | wc -w)" -ne 1 ]; then
+            echo "$1: $h runs agent(s) [$roots], not one" >&2
+            return 1
+        fi
+    done
+}
+
+# no_agents WHAT -- fails unless no agent is left on either host.
+no_agents() {
+    local h roots
+    for h in 127.0.0.1 127.0.0.2; do
+        roots=$(agent_roots "$h")
+        if [ -n "$roots" ]; then
+            echo "$1: $h still runs agent(s) $roots" >&2
+            return 1
+        fi
+    done
+}
+
+test_start_with_a_lost_pid_file_does_not_start_a_second_agent() {
+    # With agent.pid lost, start's check -- the pid file alone -- found
+    # nothing running and launched a second agent beside the first. Both
+    # bind the port (SO_REUSEPORT), so each took half the traffic.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 40
+    assert_status 0 "$RUN_RC" "start" || return 1
+    rm -f "$(host_dir 127.0.0.1)/agent.pid" "$(host_dir 127.0.0.2)/agent.pid"
+    run_mx start --no-deploy --interval 2 --duration 40
+    assert_status 1 "$RUN_RC" "a second start must be refused" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "already running, though agent.pid is lost" || { run_mx stop; return 1; }
+    one_agent_each "after a second start" || { run_mx stop; return 1; }
+    run_mx stop
+    assert_status 0 "$RUN_RC" "stop" || return 1
+    no_agents "after stop" || return 1
+}
+
+test_status_sees_an_agent_whose_pid_file_is_lost() {
+    # status read the pid file alone: an agent running without one was
+    # NOT-RUNNING, while it went on sending.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 40
+    assert_status 0 "$RUN_RC" "start" || return 1
+    rm -f "$(host_dir 127.0.0.1)/agent.pid"
+    run_mx status
+    assert_status 0 "$RUN_RC" "status" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "RUNNING, but agent.pid is lost" || { run_mx stop; return 1; }
+    assert_not_contains "$RUN_OUT" "NOT-RUNNING" || { run_mx stop; return 1; }
+    run_mx stop
+}
+
+test_stop_also_stops_an_agent_its_pid_file_does_not_name() {
+    # A second agent in the directory -- one a start launched while the pid
+    # file was lost -- outlived stop, which went by the pid file alone.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 40
+    assert_status 0 "$RUN_RC" "start" || return 1
+    ( cd "$(host_dir 127.0.0.1)" && exec python3 mx.py agent --matrix matrix.csv \
+        --host alpha --report stray.csv --interval 2 --duration 40 ) \
+        < /dev/null > /dev/null 2>&1 &
+    local stray=$!
+    sleep 1
+    running "$stray" || { echo "the stray agent did not start" >&2; run_mx stop; return 1; }
+    run_mx stop
+    assert_status 0 "$RUN_RC" "stop" || { kill "$stray"; return 1; }
+    if running "$stray"; then
+        echo "stop left running an agent the pid file did not name ($stray)" >&2
+        kill "$stray"
+        return 1
+    fi
+    no_agents "after stop" || return 1
+}
+
+test_two_starts_at_once_start_one_agent_per_host() {
+    # Two starts at once each found nothing running and each launched. Each
+    # host here holds both start snippets until both have arrived, and the
+    # launch takes 0.3 s to become an agent (less than the snippet's own
+    # 0.5 s wait), so the two checks always race; the lock decides it.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local real_nohup
+    real_nohup=$(command -v nohup)
+    cat > "$FAKE_BIN/nohup" <<SHIM
+#!/usr/bin/env bash
+# Until it execs the real nohup its command line is not an agent's.
+MX_ARGS=\$(printf '%q ' "\$@")
+export MX_ARGS
+exec bash -c 'sleep 0.3; eval "exec $real_nohup \$MX_ARGS"'
+SHIM
+    mv "$FAKE_BIN/ssh" "$FAKE_BIN/ssh.real"
+    cat > "$FAKE_BIN/ssh" <<'SHIM'
+#!/usr/bin/env bash
+# Hold a start snippet until the other start's has reached the same host.
+case "$*" in
+    *"drop --no-deploy"*)
+        host=""
+        for a in "$@"; do
+            case "$a" in 127.0.0.*) host=$a; break ;; esac
+        done
+        b="$TEST_TMPDIR/barrier/$host"
+        mkdir -p "$b" && : > "$b/$$"
+        i=0
+        while [ "$(ls "$b" | wc -l)" -lt 2 ] && [ $i -lt 100 ]; do
+            sleep 0.05; i=$((i + 1))
+        done ;;
+esac
+exec "$(dirname "$0")/ssh.real" "$@"
+SHIM
+    chmod +x "$FAKE_BIN/nohup" "$FAKE_BIN/ssh"
+    python3 "$MX" start --interval 2 --duration 40 > a.out 2>&1 &
+    local a=$!
+    python3 "$MX" start --interval 2 --duration 40 > b.out 2>&1 &
+    local b=$!
+    wait "$a"; wait "$b"
+    sleep 1
+    one_agent_each "after two starts at once" || { cat a.out b.out >&2; run_mx stop; return 1; }
+    assert_contains "$(cat a.out b.out)" "another mx start or reload is running" \
+        "the start that lost the race says why" || { run_mx stop; return 1; }
+    run_mx stop
+    no_agents "after stop" || return 1
+}
+
+test_reload_with_a_lost_pid_file_does_not_start_a_second_agent() {
+    # reload's probe went by the pid file alone too: both hosts read as not
+    # running, and each got a second agent.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 60
+    assert_status 0 "$RUN_RC" "start" || return 1
+    rm -f "$(host_dir 127.0.0.1)/agent.pid" "$(host_dir 127.0.0.2)/agent.pid"
+    awk -F, 'BEGIN{OFS=","} /^alpha=/{$3=900} {print}' matrix.csv > m.new \
+        && mv m.new matrix.csv
+    run_mx reload
+    assert_status 0 "$RUN_RC" "reload" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "matrix changed for 1 host(s): alpha" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "unchanged, left running: 1 of 2" || { run_mx stop; return 1; }
+    one_agent_each "after reload" || { run_mx stop; return 1; }
+    run_mx stop
+    no_agents "after stop" || return 1
+}
+
+test_run_stops_what_it_started_when_another_host_would_not_start() {
+    # run returned on a failed start and left the hosts that had started
+    # sending, with no --duration to end them. It stops those -- but not a
+    # run someone already had going on the host that failed.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    run_mx start --interval 2 --duration 60
+    assert_status 0 "$RUN_RC" "start" || return 1
+    local theirs beta
+    theirs=$(cat "$(host_dir 127.0.0.1)/agent.pid")
+    beta=$(cat "$(host_dir 127.0.0.2)/agent.pid")
+    kill -TERM "$beta"
+    local i=0
+    while running "$beta" && [ $i -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+    run_mx run --for 30 --interval 2
+    assert_status 1 "$RUN_RC" "run fails when a host will not start" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "already running" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "stopping the 1 host(s) this run started" || { run_mx stop; return 1; }
+    running "$theirs" || { echo "run stopped alpha's agent, which it did not start" >&2; return 1; }
+    if [ -n "$(agent_roots 127.0.0.2)" ]; then
+        echo "run left the agent it started on beta running" >&2
+        run_mx stop
+        return 1
+    fi
+    run_mx stop
+    no_agents "after stop" || return 1
+}
+
+test_status_fails_when_a_host_cannot_be_asked() {
+    # status printed "FAILED on 1/2 hosts" and exited 0.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    mv "$FAKE_BIN/ssh" "$FAKE_BIN/ssh.real"
+    cat > "$FAKE_BIN/ssh" <<'SHIM'
+#!/usr/bin/env bash
+case "$*" in
+    *127.0.0.2*NOT-DEPLOYED*)
+        echo "ssh: connect to host 127.0.0.2 port 22: Connection refused"
+        exit 255 ;;
+esac
+exec "$(dirname "$0")/ssh.real" "$@"
+SHIM
+    chmod +x "$FAKE_BIN/ssh"
+    run_mx status
+    assert_status 1 "$RUN_RC" "status with a host unreachable" || return 1
+    assert_contains "$RUN_OUT" "FAILED on 1/2 hosts: beta" || return 1
+    assert_contains "$RUN_OUT" "NOT-DEPLOYED" "the host it reached is still shown" || return 1
+}
+
+test_a_host_name_or_address_that_is_not_one_is_refused() {
+    # A name is a file name too: `../../escaped` had mx logs write
+    # a/escaped.log, outside --output a/b/logs. An address or --user that
+    # starts with '-' reached ssh as an option (-oProxyCommand=...).
+    install_fake_ssh
+    local port
+    port=$(pick_port)
+    printf '../../escaped=127.0.0.1:%d\nbeta=127.0.0.2:%d\n' "$port" "$((port + 1))" > servers.txt
+    run_mx gen --servers servers.txt --pps 100
+    assert_status 2 "$RUN_RC" "gen with a name holding '/'" || return 1
+    assert_contains "$RUN_OUT" "cannot contain '/'" || return 1
+    # A matrix written by hand, or by an older mx, is refused when it is read.
+    cat > matrix.csv <<EOF
+# tx_size=64 rx_size=64 port=$port
+,../../escaped=127.0.0.1:$port,beta=127.0.0.2:$((port + 1))
+../../escaped=127.0.0.1:$port,,100
+beta=127.0.0.2:$((port + 1)),100,
+EOF
+    mkdir -p a/b
+    run_mx logs --output a/b/logs
+    assert_status 2 "$RUN_RC" "logs with a name holding '/'" || return 1
+    assert_no_file a/escaped.log "the log was written outside --output" || return 1
+    printf 'alpha=127.0.0.1:%d\nevil=-oProxyCommand=touch pwned:%d\n' "$port" "$((port + 1))" > servers.txt
+    run_mx gen --servers servers.txt --pps 100
+    assert_status 2 "$RUN_RC" "gen with an address starting with '-'" || return 1
+    assert_contains "$RUN_OUT" "cannot start with '-'" || return 1
+    printf 'alpha=127.0.0.1:%d\nbeta=127.0.0.2:%d\n' "$port" "$((port + 1))" > servers.txt
+    run_mx gen --servers servers.txt --pps 100
+    assert_status 0 "$RUN_RC" "gen" || return 1
+    run_mx status --user=-oProxyCommand=touch\ pwned
+    assert_status 2 "$RUN_RC" "a --user starting with '-'" || return 1
+    if [ -s "$FAKE_ROOT/calls.log" ]; then
+        echo "a refused name, address or user still reached a host:" >&2
+        cat "$FAKE_ROOT/calls.log" >&2
+        return 1
+    fi
+    assert_no_file pwned "ssh ran the ProxyCommand" || return 1
+    # Every ssh and scp ends its options with `--`, so nothing after it --
+    # the target, the snippet, a file -- can be read as one.
+    local t
+    for t in ssh scp; do
+        mv "$FAKE_BIN/$t" "$FAKE_BIN/$t.real"
+        # The wrapper's own $* and $0, written as they are.
+        # shellcheck disable=SC2016
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$TEST_TMPDIR/argv.log"\nexec "$(dirname "$0")/%s.real" "$@"\n' \
+            "$t" > "$FAKE_BIN/$t"
+        chmod +x "$FAKE_BIN/$t"
+    done
+    run_mx status
+    run_mx logs
+    assert_contains "$(cat argv.log)" "ConnectTimeout=8 -- 127.0.0.1 " "ssh: -- before the target" || return 1
+    assert_contains "$(cat argv.log)" "-q -- 127.0.0.1:" "scp: -- before the files" || return 1
+}
+
 run_test test_bind_retargets_the_matrix_at_data_plane_addresses
 run_test test_bind_pattern_matching_no_host_fails_before_starting
 run_test test_streams_and_workers_reach_the_remote_agents
@@ -970,4 +1241,12 @@ run_test test_run_does_the_whole_thing
 run_test test_doctor_checks_the_hosts
 run_test test_dry_run_touches_nothing
 run_test test_a_matrix_by_another_name_is_still_deployed_as_matrix_csv
+run_test test_start_with_a_lost_pid_file_does_not_start_a_second_agent
+run_test test_status_sees_an_agent_whose_pid_file_is_lost
+run_test test_stop_also_stops_an_agent_its_pid_file_does_not_name
+run_test test_two_starts_at_once_start_one_agent_per_host
+run_test test_reload_with_a_lost_pid_file_does_not_start_a_second_agent
+run_test test_run_stops_what_it_started_when_another_host_would_not_start
+run_test test_status_fails_when_a_host_cannot_be_asked
+run_test test_a_host_name_or_address_that_is_not_one_is_refused
 report_tests
