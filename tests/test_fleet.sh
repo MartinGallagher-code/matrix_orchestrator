@@ -483,8 +483,11 @@ test_a_lost_pid_file_finds_an_agent_file_not_named_mx_py() {
     done
     MX="$TEST_TMPDIR/alt/mx" run_mx stop
     local pid
-    assert_status 0 "$RUN_RC" "stop" || { kill $pids 2>/dev/null; return 1; }
-    assert_contains "$RUN_OUT" "stopped" "the agents are found" || { kill $pids 2>/dev/null; return 1; }
+    if [ "$RUN_RC" -ne 0 ] || [[ "$RUN_OUT" != *stopped* ]]; then
+        printf 'stop did not find the agents (rc=%s):\n%s\n' "$RUN_RC" "$RUN_OUT" >&2
+        for pid in $pids; do kill "$pid" 2>/dev/null; done
+        return 1
+    fi
     for pid in $pids; do
         if running "$pid"; then
             echo "agent $pid outlived stop with its pid file lost" >&2
@@ -515,6 +518,8 @@ test_clean_of_a_symlinked_remote_dir_reports_what_is_left() {
         "the files are where the link pointed" || return 1
 }
 
+# The ~ below is meant literally: an unexpanded ~ is what mx must refuse.
+# shellcheck disable=SC2088
 test_a_remote_dir_no_host_can_use_is_refused() {
     # A quoted ~ is never expanded on the hosts: ssh made a directory named
     # "~" while scp wrote to the real home. Refused up front, with the form
