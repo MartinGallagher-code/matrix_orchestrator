@@ -17,8 +17,10 @@ jobs:
         # Every version the hosted runners still provide. The declared
         # floor is 3.6, which setup-python can no longer install, so the
         # bottom of the range runs in a container in the python-floor job
-        # below; vermin covers 3.7/3.8 statically.
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        # below; vermin covers 3.7/3.8 statically. 3.14 is the first whose
+        # multiprocessing defaults to forkserver on Linux, so the agent's
+        # workers are no longer its own children there (MX-007).
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     name: test (python ${{ matrix.python-version }})
 

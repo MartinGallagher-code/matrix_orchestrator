@@ -30,11 +30,32 @@ setup_env() {
           MX_PYTHON MX_SSH MX_SCP IPERF_BIND SSH_USER
 }
 
+# sweep_tmpdir DIR -- KILL every process whose working directory is DIR or
+# under it: whatever a test left running there. Agents are started with
+# relative paths (`--matrix matrix.csv`) out of a directory under the test's
+# own, so their working directory is what gives them away; their command
+# line never names $TEST_TMPDIR, which is why the pkill this replaced never
+# matched one (MX-007). Read from /proc, not pkill: a slim container has no
+# procps.
+sweep_tmpdir() {
+    local dir="$1" e p c
+    [ -n "$dir" ] && [ -d /proc/self ] || return 0
+    for e in /proc/[0-9]*; do
+        p=${e##*/}
+        [ "$p" = "$$" ] && continue
+        [ "$p" = "${BASHPID:-$$}" ] && continue
+        c=$(readlink "$e/cwd" 2>/dev/null) || continue
+        case "$c" in
+            "$dir"|"$dir"/*|"$dir (deleted)") kill -KILL "$p" 2>/dev/null ;;
+        esac
+    done
+}
+
 teardown_env() {
-    # Anything the tests started is a child of this shell; make sure a
-    # crashed test cannot leave agents blasting packets at the runner.
-    pkill -f "[m]x[.]py agent --matrix $TEST_TMPDIR" 2>/dev/null
+    # Make sure a crashed or timed-out test cannot leave agents blasting
+    # packets at the runner, or anything else running in its directory.
     if [ -n "${TEST_TMPDIR:-}" ] && [ -d "$TEST_TMPDIR" ]; then
+        sweep_tmpdir "$TEST_TMPDIR"
         rm -rf "$TEST_TMPDIR"
     fi
 }
@@ -74,6 +95,7 @@ target=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -o) shift 2 ;;
+        --) target="$2"; shift 2; break ;;
         -*) shift ;;
         *) target="$1"; shift; break ;;
     esac
@@ -97,6 +119,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -o) shift 2 ;;
         -q|-r|-B) shift ;;
+        --) shift; args+=("$@"); break ;;
         *) args+=("$1"); shift ;;
     esac
 done
@@ -216,15 +239,23 @@ run_test() {
         # Watchdog: give the test `limit` seconds, then TERM it, and KILL if
         # it will not go. A flag file -- not the exit status -- records that
         # the limit fired, since a test can exit non-zero on its own.
+        # Its sleep is killed with it: killing the subshell alone left the
+        # sleep running for the whole limit, holding this file's output
+        # open, so `out=$(bash test_x.sh)` in run_tests.sh waited out the
+        # limit after every file's last test (MX-007). Its output goes to
+        # /dev/null too, so nothing it leaves can hold that pipe open.
         local flag="$TEST_TMPDIR/.timed_out"
         (
-            sleep "$limit"
+            trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+            sleep "$limit" &
+            nap=$!
+            wait "$nap"
             kill -0 "$pid" 2>/dev/null || exit 0
             : > "$flag"
             kill -TERM "$pid" 2>/dev/null
             sleep 2
             kill -KILL "$pid" 2>/dev/null
-        ) &
+        ) > /dev/null 2>&1 &
         local watch=$!
         wait "$pid" 2>/dev/null
         rc=$?
@@ -248,7 +279,7 @@ run_test() {
         FAILED_TESTS+=("$name")
         printf '    FAIL  %s (rc=%d)\n' "$name" "$rc"
     fi
-    # teardown_env's pkill sweeps up any agents a killed test left mid-blast.
+    # teardown_env sweeps up anything a killed test left running.
     teardown_env
 }
 

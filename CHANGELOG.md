@@ -9,6 +9,89 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.11.7] - 2026-11-13
+
+The fleet-control defects MX-004's adversarial pass found and left for
+their own change (MX-007). Nothing `mx` measures changed.
+
+### Fixed
+
+- **One agent per `--remote-dir`.** With `agent.pid` lost, `start` read
+  the pid file alone, found nothing running, and launched a second agent
+  beside the first. Both bind the port (SO_REUSEPORT), so each took a share
+  of the traffic. `stop` then stopped only the one the new pid file named,
+  and left the other and its workers running, while `status` said
+  `NOT-RUNNING`. Now:
+  - `start` also asks which agents run out of the directory (by working
+    directory and command line, as `stop` already did with the pid file
+    lost), and refuses with `already running, though agent.pid is lost`.
+  - `start` and `reload` hold a lock on the directory (`flock`) from their
+    check to their launch, so two at once cannot both find nothing running:
+    the second is refused with `another mx start or reload is running in
+    this directory`. A host without `flock` goes on without it.
+  - `stop`, `clean` and `reload` stop every other agent running out of the
+    directory after the one the pid file names.
+  - `status` shows an agent whose pid file is lost as `RUNNING, but
+    agent.pid is lost -- mx stop still stops it`, and `reload` counts it as
+    running instead of starting a second one.
+
+  None of the snippets holds an agent's command line as text any more
+  (the launch passes the matrix's name through a variable), so the check
+  cannot mistake the snippet running it, or one of its subshells, for an
+  agent.
+- **`mx run` stops what it started when `start` fails on another host.** It
+  returned 1 and left the hosts that had started sending, with no
+  `--duration` to end them. It now stops those hosts, and only those: a host
+  that failed because an agent was already running there keeps that agent.
+  `--keep` does not change this.
+- **`mx status` exits 1 when a host cannot be reached.** It printed `FAILED
+  on 1/2 hosts` and exited 0. With `--watch`, the last round counts.
+- **A host name cannot contain `/`.** A name is the name of the host's log
+  and report files, and `../../escaped` had `mx logs` write outside
+  `--output`. `mx gen` and every command that reads the matrix refuse one.
+- **A killed agent's workers stop on Python 3.14 too.** 3.14 made
+  forkserver multiprocessing's default start method on Linux. A worker's
+  parent was then the forkserver, which every one of its children keeps
+  alive (each holds a copy of the pipe whose closing tells it to exit), so
+  with the agent SIGKILLed the forkserver lived on, the workers' parent
+  never changed, their `getppid()` check never fired, and they kept sending
+  until `--duration`, or for good under `mx run`. The agent now forks its
+  workers wherever the default would be a forkserver, as every Python
+  before 3.14 did.
+- **Nothing reaches ssh or scp as an option.** A server-list address, or
+  `--user`, that starts with `-` was read by ssh as an option: with OpenSSH
+  9.6, `-V` made `status` print ssh's version and call that host fine. ssh
+  9.6 refuses the snippet as a host name before a `-oProxyCommand=` runs;
+  older ssh was not tried. Such an address, host name or user is now refused
+  before any host is touched, and every ssh and scp command ends its options
+  with `--`. A `--remote-dir` that starts with `-` reached mkdir, cd and rm as
+  an option, and is refused too (write `./-x`).
+
+### Changed
+
+- **The test harness.** Its watchdog's `sleep` outlived the watchdog and
+  held each test file's output open, so `tests/run_tests.sh` waited the
+  60 s limit after every file's last test. Its teardown sweep never matched
+  an agent (they run with `--matrix matrix.csv`, not a path under the test's
+  directory), so a crashed test's agents were left running. The sleep now
+  goes with its watchdog, and teardown kills whatever still runs out of the
+  test's directory, read from `/proc`.
+- **CI runs the suite on Python 3.14 too.** Its first run is what found
+  the forkserver defect above: the existing
+  `test_reload_does_not_kill_a_reused_pid` kills the agents and found their
+  workers still running.
+- **README:** host-name rules, one agent per `--remote-dir`, what `run` does
+  when start fails, `status`'s exit status, and that a `--remote-dir` with
+  spaces or shell characters needs scp's SFTP mode (OpenSSH 9.0+): with
+  `scp -O` a space fails the copy and `$(...)` runs on the host. That last
+  one is documented, not changed.
+- **Eleven new tests**, each failing on 1.11.6: nine in `tests/test_fleet.sh`
+  (a second start with the pid file lost, status without it, stop with a
+  stray agent, two starts at once, reload without the pid file, run after a
+  partial start, status with a host unreachable, names, addresses and users
+  ssh would read as options, and a killed agent's workers, which fails on
+  Python 3.14 only) and two in `tests/test_harness.sh`.
+
 ## [1.11.6] - 2026-11-13
 
 `mx clean` deletes what mx wrote, and nothing else (MX-005). Nothing `mx`

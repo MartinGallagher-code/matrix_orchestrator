@@ -36,6 +36,10 @@ Or all of it in one command:
 mx run --for 60
 ```
 
+If `start` fails on any host, `run` stops the hosts it did start and exits
+1, so half a fleet is not left sending. A host that failed because an agent
+was already running there keeps that agent.
+
 Not sure what to ask for? `mx hints` turns a goal into the command that
 gets you there.
 
@@ -86,7 +90,7 @@ no packages, no root. Key-based SSH must already work
 |---|---|
 | `mx gen` | Build `matrix.csv` from your server list. |
 | `mx start` | Copy the agent + matrix to every host and start them. |
-| `mx status` | One line per host: the live ticker, or `NOT-RUNNING`. |
+| `mx status` | One line per host: the live ticker, or `NOT-RUNNING`. Exits 1 if a host cannot be reached. |
 | `mx summarize` | Collect the reports and print pps, Gbps, loss, latency — and what to do next. |
 | `mx stop` | Stop the agents. Reports and logs stay on the hosts. |
 | `mx clean` | Stop, then delete everything mx put on the hosts. No trace left. |
@@ -264,7 +268,11 @@ Edit it by hand for anything non-uniform:
 Then `mx start` again — or `mx reload` if the fleet is already running
 and you want to keep it that way. Host tokens are `name[=addr[:port]]`,
 so a bare list of IPs works, and `hostA=10.0.0.10:5399` works when the
-name, the address and the port all differ.
+name, the address and the port all differ. A name is also the name of the
+host's files (`logs/<name>.log`, `reports/<name>.csv`), so it cannot
+contain `/`; and neither a name nor an address can start with `-`, which
+ssh would read as an option. `mx gen`, and every command that reads the
+matrix, refuses one.
 
 ---
 
@@ -641,8 +649,15 @@ remove. Clean also refuses to report success, and says what is left, when:
   nothing.
 
 A `--remote-dir` that is empty, starts with `~` (it is never expanded on
-the hosts; a relative path already means the login directory), or is `/` is
-refused before any host is touched.
+the hosts; a relative path already means the login directory), starts with
+`-` (write `./-x`), or is `/` is refused before any host is touched, and so
+is a `--user` that starts with `-`.
+
+**A `--remote-dir` with spaces or shell characters** (`$`, quotes, `;`)
+needs scp's SFTP mode, the default since OpenSSH 9.0. Older OpenSSH, and
+`scp -O`, pass the remote path through the host's shell unquoted: a space
+fails the copy with `ambiguous target`, and `$(...)` runs there. On such a
+controller, keep `--remote-dir` to plain characters.
 
 Two matrices can run on the same hosts at once from different
 `--remote-dir`s (and ports). `stop`, `clean` and `doctor` touch only the
@@ -650,6 +665,17 @@ agent of their own `--remote-dir`: by its `agent.pid`, or with that lost,
 by the agent's working directory in `/proc`. On a host with no `/proc` a
 lost pid file cannot be told apart from the other matrix's agent, so
 `stop` and `clean` kill nothing and say to kill it by hand.
+
+**One agent per `--remote-dir`.** With its `agent.pid` lost, an agent still
+running there is still seen: `start` refuses (`already running, though
+agent.pid is lost`), `status` shows `RUNNING, but agent.pid is lost`,
+`reload` counts it as running, and `stop` and `clean` stop it. `stop`,
+`clean` and `reload` also stop any *other* agent running out of the
+directory, one the pid file does not name. Two `start`s (or a `start` and
+a `reload`) at once take turns: where the host has `flock` (util-linux,
+busybox), the second is refused with `another mx start or reload is
+running in this directory`. On a host with no `/proc`, the pid file is all
+there is.
 
 An `agent.pid` is believed only when its number is a plain pid and, where
 there is a `/proc`, that process is an mx agent running out of this
@@ -957,7 +983,9 @@ commands in a local sandbox. No second machine required.
 
 Each test has a **60-second wall-clock limit** so a hung agent fails that
 one test loudly instead of wedging the run. Override it with
-`MX_TEST_TIMEOUT` (seconds); `MX_TEST_TIMEOUT=0` turns it off.
+`MX_TEST_TIMEOUT` (seconds); `MX_TEST_TIMEOUT=0` turns it off. After each
+test, anything still running out of its temporary directory, such as the
+agents of a test that crashed, is killed.
 
 ---
 
