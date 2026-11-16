@@ -9,6 +9,57 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [1.12.0] - 2026-11-16
+
+The `--remote-dir` is checked on every host before mx writes to it, runs
+from it, or deletes in it (shared_tools ticket MX-006, found by MX-004's
+adversarial pass). The same checks iperf_orchestrator 2.7.0 makes
+(IO-003).
+
+### Changed
+
+- **A `--remote-dir` that another user owns, or can write to, is
+  refused.** The default `/var/tmp/mx` is a name any user on a host can
+  create first, and nothing checked who owned it: MX-004 showed `mx
+  start` exiting 0 and deploying into a `nobody:nogroup 0777` directory.
+  Whoever owns or can write to it could swap `mx.py` between the copy and
+  the start, and so run their code as the ssh user, or plant an
+  `agent.pid`. Now `start` (its copy, its disk preparation and its
+  launch, each checked again), `reload`, `stop`, `clean`, `status`,
+  `doctor` and `run` first check, on each host, that the directory is a
+  real directory (not a symlink, not a file), owned by the ssh user (`id
+  -u`) and not writable by group or others. If it is not, that host fails
+  with a `REFUSED:` line naming the directory, its owner, its mode and the
+  ssh user's uid, and nothing is written, run, signalled or deleted there.
+  **This refuses directories that worked before**: one another user owns,
+  one made group- or world-writable by hand (`chmod go-w` it), and a
+  symlinked `--remote-dir`, which `start` used to deploy through and
+  `clean` (1.11.6) to clean through; give the real path instead.
+  `clean` of a file or a dangling symlink at `--remote-dir` now fails
+  (it left it alone and exited 0); it still leaves it alone.
+- **A new `--remote-dir` is created private**, `mkdir -p -m 700`.
+- **The agent and the matrix are copied into a private staging directory
+  and renamed into place**, after whatever stood at their names is
+  removed, so a symlink planted at `mx.py` is replaced, never written
+  through. `clean` removes a staging directory a cut-short copy left.
+
+### Added
+
+- **`--allow-shared-remote-dir`** (or `MX_ALLOW_SHARED_REMOTE_DIR=1`) on
+  every fleet command lets `--remote-dir` be group-writable, for a
+  directory a group shares on purpose. It lifts that one check: the
+  directory must still be the ssh user's, not a symlink, and not writable
+  by others.
+- Six tests in `tests/test_fleet.sh`, each failing on 1.11.7: a host
+  directory another user owns, mode 0777 (chowned to `nobody` where the
+  run can, as root or with password-less sudo; otherwise another uid
+  stood in by an `id` shim), refused by start, stop, clean, status,
+  reload, `start --no-deploy` and doctor with nothing touched; a group-
+  or world-writable one; a new one made 0700 under umask 000; an `mx.py`
+  swapped after the copy and before the launch, not run; the opt-out; and
+  a staging directory cleaned up. The MX-005 symlink and not-a-directory
+  tests now expect the refusal.
+
 ## [1.11.7] - 2026-11-13
 
 The fleet-control defects MX-004's adversarial pass found and left for

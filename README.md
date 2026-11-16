@@ -631,12 +631,10 @@ Anything else in `--remote-dir` stays where it is.
   the next `mx clean` removes the directory.
 - **The directory cannot be removed** for another reason, such as being a
   mount point: clean keeps it and fails with `rmdir`'s reason.
-- **`--remote-dir` is a symlink**, with or without a trailing slash: clean
-  deletes mx's files in the directory it points to, then keeps the link and
-  that directory, since mx made neither (its `mkdir -p` cannot make a
-  symlink). It says so, and does not fail.
-- **`--remote-dir` is not a directory** (a file, or a symlink to nothing):
-  start could never have used it, and clean leaves it alone.
+- **`--remote-dir` is a symlink** (with or without a trailing slash), **or
+  not a directory** (a file, a symlink to nothing): clean refuses it, as
+  every other command does since 1.12.0 (next section), and leaves it and
+  whatever it points to alone.
 
 Give mx a directory of its own all the same: one it made is one clean can
 remove. Clean also refuses to report success, and says what is left, when:
@@ -652,6 +650,50 @@ A `--remote-dir` that is empty, starts with `~` (it is never expanded on
 the hosts; a relative path already means the login directory), starts with
 `-` (write `./-x`), or is `/` is refused before any host is touched, and so
 is a `--user` that starts with `-`.
+
+**A `--remote-dir` that another user owns, or can write to, is refused.**
+The default `/var/tmp/mx` sits in a world-writable directory, so any user
+on a host can create it first. Whoever owns it, or can write to it, could
+swap `mx.py` between the copy and the start (they are separate ssh round
+trips), and so run their code as the ssh user, or plant an `agent.pid`.
+Since 1.12.0, every host checks the directory before mx writes to it, runs
+from it, signals what its pid file names, or deletes anything in it:
+`start` (deploy, disk preparation and launch, each checked again),
+`reload`, `stop`, `clean`, `status`, `doctor`, and `run`, which is `start`
+and `stop`. It must be:
+
+- a real directory: not a symlink (a trailing slash is dropped first, so
+  `link/` is the link), not a file;
+- owned by the ssh user (`id -u` on the host);
+- not writable by its group or by others.
+
+If it is not, that host fails with a line naming the directory, its
+owner, its mode and the ssh user's uid, such as `REFUSED: --remote-dir
+/var/tmp/mx is owned by nobody (uid 65534), mode drwxrwxrwx; the ssh user
+is uid 1000: it is not owned by the ssh user; others can write to it; its
+group can write to it`, and nothing is written there, run from there,
+signalled or deleted. A missing directory is not refused: `start` makes
+it with `mkdir -m 700`, so only the ssh user can use it (missing parents
+get the login shell's umask, as before), and `stop`, `clean` and `status`
+call it not deployed, as before.
+
+mx copies the agent and the matrix into a private staging directory in
+`--remote-dir` (`.mx-stage.<pid>.<random>`) and then renames them over
+their real names, after removing whatever stood there, so a symlink at
+`mx.py` is replaced, never written through. `clean` removes a staging
+directory a cut-short copy left.
+
+**This refuses directories that worked before.** If another user already
+holds `/var/tmp/mx` on a host, pick a `--remote-dir` of your own (one in
+the ssh user's home is safest) or have it removed. A directory made group-
+or world-writable by hand needs `chmod go-w`. A symlinked `--remote-dir`
+needs the real path it points to. **On a directory a group shares on
+purpose** (an NFS directory a team uses), pass `--allow-shared-remote-dir`
+(or set `MX_ALLOW_SHARED_REMOTE_DIR=1`): it lifts the group-write check
+only. The directory must still be the ssh user's, not a symlink, and not
+writable by others, and anyone in the group can still swap `mx.py`, so use
+it only with a group you trust. iperf_orchestrator makes the same checks
+on its `REMOTE_DIR` (2.7.0), with the same opt-out.
 
 **A `--remote-dir` with spaces or shell characters** (`$`, quotes, `;`)
 needs scp's SFTP mode, the default since OpenSSH 9.0. Older OpenSSH, and
@@ -731,7 +773,9 @@ mx hints --servers servers.txt --pps-per-host 2000000 --tx-size 64
 Every fleet command takes `--user`, `--jobs`, `--remote-dir`, `--python`
 and `--dry-run`; each has an `MX_*` environment variable
 (`MX_USER`, `MX_JOBS`, `MX_REMOTE_DIR`, `MX_PYTHON`, `MX_MATRIX`,
-`MX_SERVERS`, `MX_REPORTS`). `--dry-run` prints the ssh and scp commands
+`MX_SERVERS`, `MX_REPORTS`). `--allow-shared-remote-dir`
+(`MX_ALLOW_SHARED_REMOTE_DIR=1`) lets `--remote-dir` be group-writable;
+see *Leaving no trace*. `--dry-run` prints the ssh and scp commands
 instead of running them. `mx help` prints every switch of every command
 on one page.
 

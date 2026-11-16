@@ -585,33 +585,41 @@ test_clean_reports_an_mx_file_it_could_not_delete() {
     assert_file_exists "$d/report.csv/inside" || return 1
 }
 
-test_clean_through_a_symlink_deletes_only_mx_files() {
+test_a_symlinked_remote_dir_is_refused() {
     # A symlinked --remote-dir: rm -rf took only the link and left every
     # file mx wrote (MX-004), and with a trailing slash, `rm -rf link/`, GNU
-    # rm emptied the directory it points to, the user's files with it. Now,
-    # either way, mx's files go through the link, and the link and its
-    # directory, which mx did not make, stay with everything else in them.
+    # rm emptied the directory it points to. MX-005 had clean delete mx's
+    # files through the link instead. Since MX-006 a symlink is refused
+    # outright, with or without the slash, as iperf_orchestrator refuses one
+    # (IO-003): another user can plant one in /var/tmp pointing anywhere, so
+    # start would write, and clean delete, wherever it leads. Nothing is
+    # written through it, nothing deleted, and the link stays.
     setup_fleet "$(pick_port)" --pps 300 || return 1
     local h real slash
     for h in 127.0.0.1 127.0.0.2; do
         mkdir -p "$FAKE_ROOT/$h/data/real" "$(dirname "$(host_dir "$h")")"
+        chmod 0700 "$FAKE_ROOT/$h/data/real"
         echo mine > "$FAKE_ROOT/$h/data/real/keep.txt"
+        echo theirs > "$FAKE_ROOT/$h/data/real/mx.py"
         ln -s "$FAKE_ROOT/$h/data/real" "$(host_dir "$h")"
     done
     real="$FAKE_ROOT/127.0.0.1/data/real"
     for slash in / ""; do
-        run_mx start --interval 2 --duration 20
-        assert_status 0 "$RUN_RC" "start through the link" || return 1
-        assert_file_exists "$real/mx.py" "start deploys through the link" || return 1
+        run_mx start --interval 2 --duration 20 --remote-dir "$MX_REMOTE_DIR$slash"
+        assert_status 1 "$RUN_RC" "start through 'link$slash'" || { run_mx stop; return 1; }
+        assert_contains "$RUN_OUT" "is a symlink or not a directory" || return 1
+        assert_eq theirs "$(cat "$real/mx.py")" "start through 'link$slash' wrote mx.py" || return 1
+        assert_no_file "$real/matrix.csv" "start through 'link$slash' wrote the matrix" || return 1
         run_mx clean --yes --remote-dir "$MX_REMOTE_DIR$slash"
-        # What was lost first: that is the failure that matters.
+        assert_status 1 "$RUN_RC" "clean of 'link$slash'" || return 1
+        assert_contains "$RUN_OUT" "REFUSED: --remote-dir $(host_dir 127.0.0.1) is a symlink" || return 1
         assert_file_exists "$real/keep.txt" "clean of 'link$slash' deleted a file mx did not write" || return 1
+        assert_file_exists "$real/mx.py" "clean of 'link$slash' deleted through the link" || return 1
         [ -L "$(host_dir 127.0.0.1)" ] || { echo "clean of 'link$slash' removed the link" >&2; return 1; }
-        assert_status 0 "$RUN_RC" "clean of 'link$slash': mx's files are all gone" || return 1
-        assert_contains "$RUN_OUT" "kept $(host_dir 127.0.0.1), a symlink, and $real, where it points: mx made neither; $real still holds 1 thing(s) mx did not write: keep.txt" || return 1
-        no_mx_files "$real" "link$slash" || return 1
-        run_mx status
-        assert_contains "$RUN_OUT" "alpha  NOT-RUNNING" "clean of 'link$slash' stopped the agent" || return 1
+        run_mx stop --remote-dir "$MX_REMOTE_DIR$slash"
+        assert_status 1 "$RUN_RC" "stop through 'link$slash'" || return 1
+        run_mx status --remote-dir "$MX_REMOTE_DIR$slash"
+        assert_status 1 "$RUN_RC" "status through 'link$slash'" || return 1
     done
 }
 
@@ -638,7 +646,8 @@ SHIM
 
 test_clean_leaves_a_remote_dir_that_is_not_a_directory() {
     # A file, or a symlink to nothing, is not mx's working directory: start
-    # cannot have used it, and rm -rf deleted it all the same.
+    # cannot have used it, and rm -rf deleted it all the same. Since MX-006
+    # clean refuses it, as start does, and leaves it where it is.
     setup_fleet "$(pick_port)" --pps 300 || return 1
     local a b
     a=$(host_dir 127.0.0.1)
@@ -647,10 +656,14 @@ test_clean_leaves_a_remote_dir_that_is_not_a_directory() {
     echo mine > "$a"
     ln -s "$FAKE_ROOT/nowhere" "$b"
     run_mx clean --yes
-    assert_status 0 "$RUN_RC" "clean" || return 1
-    assert_contains "$RUN_OUT" "$a is not a directory, so not mx's: left alone" || return 1
+    assert_status 1 "$RUN_RC" "clean" || return 1
+    assert_contains "$RUN_OUT" "REFUSED: --remote-dir $a is a symlink or not a directory (-rw" || return 1
+    assert_contains "$RUN_OUT" "REFUSED: --remote-dir $b is a symlink or not a directory (lrw" || return 1
     assert_file_exists "$a" "clean deleted a file mx did not write" || return 1
     [ -L "$b" ] || { echo "clean deleted a dangling symlink mx did not make" >&2; return 1; }
+    run_mx start --interval 2 --duration 20
+    assert_status 1 "$RUN_RC" "start into a file" || { run_mx stop; return 1; }
+    assert_no_file "$FAKE_ROOT/nowhere" "start made the dangling link's target" || return 1
 }
 
 # The ~ below is meant literally: an unexpanded ~ is what mx must refuse.
@@ -1236,6 +1249,188 @@ EOF
     assert_contains "$(cat argv.log)" "-q -- 127.0.0.1:" "scp: -- before the files" || return 1
 }
 
+# ---- MX-006: a --remote-dir another user owns or can write to ----------------
+#
+# The default /var/tmp/mx sits in a world-writable sticky directory, so any
+# user on a host can make it first. Each test here failed on 1.11.7.
+
+# ls, not stat: stat's flags differ between GNU and BSD.
+# shellcheck disable=SC2012
+dir_mode() { ls -ld -- "$1" | cut -c1-10; }
+
+# give_away DIR -- make DIR another user's: chown it to nobody where this
+# run can (as root, or with sudo that asks for no password, as on CI), and
+# otherwise stand another user in with an `id` on the hosts' PATH that gives
+# the ssh user a uid that does not own it. Prints which it did.
+give_away() {
+    if chown nobody "$1" 2>/dev/null || sudo -n chown nobody "$1" 2>/dev/null; then
+        echo chown
+        return 0
+    fi
+    # shellcheck disable=SC2016
+    printf '#!/bin/sh\n[ "${1:-}" = -u ] && { echo 4242; exit 0; }\nexec /usr/bin/id "$@"\n' \
+        > "$FAKE_BIN/id"
+    chmod +x "$FAKE_BIN/id"
+    echo id
+}
+
+test_a_remote_dir_another_user_owns_is_refused() {
+    # MX-004's reproduction: the host directory nobody:nogroup 0777, and
+    # `mx start` exited 0 and deployed into it. Now every command that
+    # writes to it, runs from it, signals what it names or deletes in it
+    # refuses, naming the owner and the mode, and leaves it as it was.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local h d how
+    for h in 127.0.0.1 127.0.0.2; do
+        d=$(host_dir "$h")
+        plant_mx_files "$d"
+        chmod 0777 "$d"
+        how=$(give_away "$d")
+    done
+    d=$(host_dir 127.0.0.1)
+    run_mx start --interval 2 --duration 20
+    assert_status 1 "$RUN_RC" "start into another user's 0777 dir" || { run_mx stop; return 1; }
+    assert_eq planted "$(cat "$d/mx.py")" "start overwrote mx.py in another user's dir" || return 1
+    assert_eq planted "$(cat "$d/matrix.csv")" "start overwrote the matrix" || return 1
+    assert_contains "$RUN_OUT" "REFUSED: --remote-dir $d is owned by" || return 1
+    assert_contains "$RUN_OUT" "mode drwxrwxrwx" "it names the mode" || return 1
+    assert_contains "$RUN_OUT" "it is not owned by the ssh user; others can write to it; its group can write to it" || return 1
+    if [ "$how" = chown ]; then
+        assert_contains "$RUN_OUT" "is owned by nobody (uid" "it names the owner" || return 1
+    else
+        assert_contains "$RUN_OUT" "the ssh user is uid 4242" || return 1
+    fi
+    local cmd
+    for cmd in "stop" "clean --yes" "status" "reload" "start --no-deploy" "doctor"; do
+        # shellcheck disable=SC2086
+        run_mx $cmd
+        assert_status 1 "$RUN_RC" "mx $cmd" || return 1
+        assert_contains "$RUN_OUT" "REFUSED: --remote-dir $d is owned by" "mx $cmd" || return 1
+    done
+    for h in 127.0.0.1 127.0.0.2; do
+        for f in $MX_FILES; do
+            assert_eq planted "$(cat "$(host_dir "$h")/$f")" "$f on $h was touched" || return 1
+        done
+    done
+}
+
+test_a_group_or_world_writable_remote_dir_is_refused() {
+    # The ssh user's own directory, but one others can write to: whoever can
+    # write there can swap mx.py, so it is refused just the same.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local d
+    d=$(host_dir 127.0.0.1)
+    mkdir -p "$d" "$(host_dir 127.0.0.2)"
+    chmod 0777 "$d"
+    chmod 0770 "$(host_dir 127.0.0.2)"
+    run_mx start --interval 2 --duration 20
+    assert_status 1 "$RUN_RC" "start" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "mode drwxrwxrwx; the ssh user is uid $(id -u): others can write to it; its group can write to it" || return 1
+    assert_contains "$RUN_OUT" "mode drwxrwx---; the ssh user is uid $(id -u): its group can write to it." || return 1
+    assert_no_file "$d/mx.py" "start deployed into a world-writable dir" || return 1
+}
+
+test_a_new_remote_dir_is_made_private() {
+    # When mx makes the directory, it makes it 0700, whatever the umask, and
+    # the copy leaves no staging directory behind.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    (umask 000 && run_mx start --interval 2 --duration 20 && exit "$RUN_RC")
+    assert_status 0 $? "start" || { run_mx stop; return 1; }
+    local h
+    for h in 127.0.0.1 127.0.0.2; do
+        assert_eq drwx------ "$(dir_mode "$(host_dir "$h")")" "the new dir on $h" || { run_mx stop; return 1; }
+        assert_file_exists "$(host_dir "$h")/mx.py" || { run_mx stop; return 1; }
+        [ -z "$(find "$(host_dir "$h")" -name '.mx-stage.*')" ] || { echo "a staging dir was left on $h" >&2; run_mx stop; return 1; }
+    done
+    run_mx clean --yes
+    assert_status 0 "$RUN_RC" "clean" || return 1
+}
+
+test_mx_py_swapped_after_deploy_is_not_run() {
+    # The attack MX-004 could not carry out as another uid: deploy and start
+    # are separate ssh round trips, and whoever can write to the directory
+    # swaps mx.py in between, so start runs their code as the ssh user. A
+    # wrapper around the fake ssh plays them: just before start's launch it
+    # makes alpha's directory world-writable and swaps mx.py.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local d
+    d=$(host_dir 127.0.0.1)
+    mv "$FAKE_BIN/ssh" "$FAKE_BIN/ssh.real"
+    cat > "$FAKE_BIN/ssh" <<SHIM
+#!/usr/bin/env bash
+case "\$*" in
+    *nohup*)
+        if [ ! -e "$TEST_TMPDIR/swapped" ] && [ -d "$d" ]; then
+            touch "$TEST_TMPDIR/swapped"
+            chmod 0777 "$d"
+            printf 'open("$TEST_TMPDIR/MARK", "w")\\n' > "$d/mx.py"
+        fi ;;
+esac
+exec "\$(dirname "\$0")/ssh.real" "\$@"
+SHIM
+    chmod +x "$FAKE_BIN/ssh"
+    run_mx start --interval 2 --duration 20
+    local rc=$RUN_RC out=$RUN_OUT
+    mv "$FAKE_BIN/ssh.real" "$FAKE_BIN/ssh"
+    chmod 0700 "$d"
+    run_mx stop
+    [ -e "$TEST_TMPDIR/swapped" ] || { echo "the swap never happened, so this tested nothing" >&2; return 1; }
+    assert_no_file "$TEST_TMPDIR/MARK" "start ran the swapped mx.py" || return 1
+    assert_status 1 "$rc" "start" || return 1
+    assert_contains "$out" "others can write to it" || return 1
+}
+
+test_the_shared_remote_dir_opt_out_lifts_the_group_check_only() {
+    # --allow-shared-remote-dir (or MX_ALLOW_SHARED_REMOTE_DIR=1) lets a
+    # group-writable directory through, as for one a team shares. A symlink
+    # someone in the group planted at mx.py is replaced, never followed (scp
+    # would have written through it). A world-writable one is still refused.
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local h d target="$TEST_TMPDIR/important.py"
+    printf 'keep me\n' > "$target"
+    for h in 127.0.0.1 127.0.0.2; do
+        d=$(host_dir "$h")
+        mkdir -p "$d" && chmod 0770 "$d"
+        ln -s "$target" "$d/mx.py"
+    done
+    d=$(host_dir 127.0.0.1)
+    run_mx start --interval 2 --duration 20
+    assert_status 1 "$RUN_RC" "a group-writable dir without the opt-out" || { run_mx stop; return 1; }
+    assert_contains "$RUN_OUT" "its group can write to it" || return 1
+    assert_contains "$RUN_OUT" "--allow-shared-remote-dir" "the refusal names the opt-out" || return 1
+    run_mx start --interval 2 --duration 20 --allow-shared-remote-dir
+    assert_status 0 "$RUN_RC" "a group-writable dir with the opt-out" || { run_mx stop --allow-shared-remote-dir; return 1; }
+    assert_eq "keep me" "$(cat "$target")" "the planted symlink was followed" || { run_mx stop --allow-shared-remote-dir; return 1; }
+    if [ ! -f "$d/mx.py" ] || [ -L "$d/mx.py" ]; then
+        echo "the symlink was not replaced by the agent" >&2
+        run_mx stop --allow-shared-remote-dir
+        return 1
+    fi
+    MX_ALLOW_SHARED_REMOTE_DIR=1 run_mx status
+    assert_status 0 "$RUN_RC" "status with MX_ALLOW_SHARED_REMOTE_DIR=1" || { run_mx stop --allow-shared-remote-dir; return 1; }
+    chmod 0777 "$d"
+    MX_ALLOW_SHARED_REMOTE_DIR=1 run_mx stop
+    assert_status 1 "$RUN_RC" "a world-writable dir even with the opt-out" || return 1
+    assert_contains "$RUN_OUT" "others can write to it" || return 1
+    assert_not_contains "$RUN_OUT" "its group can write" "the group check is lifted" || return 1
+    chmod 0770 "$d"
+    run_mx stop --allow-shared-remote-dir
+    assert_status 0 "$RUN_RC" "stop with the opt-out" || return 1
+    run_mx clean --yes --allow-shared-remote-dir
+    assert_status 0 "$RUN_RC" "clean with the opt-out" || return 1
+}
+
+test_clean_removes_a_staging_dir_a_cut_short_deploy_left() {
+    setup_fleet "$(pick_port)" --pps 300 || return 1
+    local d
+    d=$(host_dir 127.0.0.1)
+    plant_mx_files "$d"
+    mkdir -p "$d/.mx-stage.123.abcd" && echo half > "$d/.mx-stage.123.abcd/mx.py"
+    run_mx clean --yes
+    assert_status 0 "$RUN_RC" "clean" || return 1
+    assert_no_file "$d" "the directory, mx's alone, is gone" || return 1
+}
+
 run_test test_bind_retargets_the_matrix_at_data_plane_addresses
 run_test test_bind_pattern_matching_no_host_fails_before_starting
 run_test test_streams_and_workers_reach_the_remote_agents
@@ -1265,7 +1460,7 @@ run_test test_a_lost_pid_file_finds_an_agent_file_not_named_mx_py
 run_test test_clean_keeps_what_mx_did_not_write
 run_test test_clean_removes_every_file_a_run_can_leave
 run_test test_clean_reports_an_mx_file_it_could_not_delete
-run_test test_clean_through_a_symlink_deletes_only_mx_files
+run_test test_a_symlinked_remote_dir_is_refused
 run_test test_clean_keeps_a_directory_rmdir_cannot_remove
 run_test test_clean_leaves_a_remote_dir_that_is_not_a_directory
 run_test test_a_remote_dir_no_host_can_use_is_refused
@@ -1286,4 +1481,10 @@ run_test test_reload_with_a_lost_pid_file_does_not_start_a_second_agent
 run_test test_run_stops_what_it_started_when_another_host_would_not_start
 run_test test_status_fails_when_a_host_cannot_be_asked
 run_test test_a_host_name_or_address_that_is_not_one_is_refused
+run_test test_a_remote_dir_another_user_owns_is_refused
+run_test test_a_group_or_world_writable_remote_dir_is_refused
+run_test test_a_new_remote_dir_is_made_private
+run_test test_mx_py_swapped_after_deploy_is_not_run
+run_test test_the_shared_remote_dir_opt_out_lifts_the_group_check_only
+run_test test_clean_removes_a_staging_dir_a_cut_short_deploy_left
 report_tests

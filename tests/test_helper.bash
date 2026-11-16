@@ -27,7 +27,7 @@ setup_env() {
     mkdir -p "$FAKE_BIN" "$FAKE_ROOT"
     # Never let a stray environment leak into a test run.
     unset MX_MATRIX MX_SERVERS MX_REMOTE_DIR MX_REPORTS MX_JOBS MX_USER \
-          MX_PYTHON MX_SSH MX_SCP IPERF_BIND SSH_USER
+          MX_PYTHON MX_SSH MX_SCP MX_ALLOW_SHARED_REMOTE_DIR IPERF_BIND SSH_USER
 }
 
 # sweep_tmpdir DIR -- KILL every process whose working directory is DIR or

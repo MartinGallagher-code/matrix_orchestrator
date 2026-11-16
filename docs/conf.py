@@ -74,6 +74,7 @@ def _generate_cli_reference():
         "Each is the default for the matching flag:",
         "`MX_MATRIX`, `MX_SERVERS`, `MX_REPORTS`, `MX_REMOTE_DIR`,",
         "`MX_USER` (falls back to `SSH_USER`), `MX_JOBS`, `MX_PYTHON`,",
+        "`MX_ALLOW_SHARED_REMOTE_DIR` (`1` sets `--allow-shared-remote-dir`),",
         "and `IPERF_BIND` (the same variable iperf-orchestrator uses).",
         "",
     ]
