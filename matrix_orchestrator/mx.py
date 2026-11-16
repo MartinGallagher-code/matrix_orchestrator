@@ -66,7 +66,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
-VERSION = "1.11.7"
+VERSION = "1.12.0"
 
 # ---------------------------------------------------------------------------
 # Wire format
@@ -2577,6 +2577,9 @@ class Fleet(object):
         self.ssh = (args.ssh or "ssh").split()
         self.scp = (args.scp or "scp").split()
         self.dry_run = getattr(args, "dry_run", False)
+        # --allow-shared-remote-dir: a group-writable --remote-dir is let
+        # through (MX-006); every other check of `_dir_guard` still holds.
+        self.shared = bool(getattr(args, "allow_shared_remote_dir", False))
 
     def target(self, host):
         addr = self.matrix.addrs[host]
@@ -2800,6 +2803,119 @@ _mx_lock() {
     exit 1
 }
 """
+
+
+# The guard on --remote-dir (MX-006). The default /var/tmp/mx sits in a
+# world-writable sticky directory, so any user on a host can make it first.
+# Whoever owns it, or can write to it, can swap mx.py between deploy and
+# start (separate ssh round trips) and so run their code as the ssh user,
+# plant an agent.pid, or leave a symlink where scp writes. So before mx
+# writes to it, runs from it, signals what its pid file names, or deletes
+# in it, each host checks that it is:
+#   * a real directory -- not a symlink (a trailing slash is dropped first,
+#     so `link/` is the link), not a file;
+#   * owned by the ssh user (`id -u` there);
+#   * writable by nobody else: no group-write, no other-write bit.
+#     --allow-shared-remote-dir (MX_ALLOW_SHARED_REMOTE_DIR=1) lifts the
+#     group-write rule only, for a directory a group shares on purpose; the
+#     symlink, owner and other-write rules always hold.
+# `ls -ldn` rather than stat, whose flags differ between GNU and BSD.
+# Missing is not refused here: start makes it (mkdir -m 700), and stop,
+# clean and status report it as never deployed, as they always did. The
+# same check as iperf_orchestrator's `_remote_dir_guard` (IO-003).
+DIR_CHECK_FN = """
+_mx_dir_check() {
+    _mx_bad=""
+    if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
+        _mx_bad="$1 is a symlink or not a directory ($(ls -ld -- "$1" 2>/dev/null | cut -c1-10))"
+        return 1
+    fi
+    [ -d "$1" ] || return 0
+    _mx_dm=$(ls -ldn -- "$1" | awk 'NR==1 {print $1}')
+    _mx_du=$(ls -ldn -- "$1" | awk 'NR==1 {print $3}')
+    _mx_dn=$(ls -ld -- "$1" | awk 'NR==1 {print $3}')
+    _mx_id=$(id -u)
+    _mx_why=""
+    [ "$_mx_du" = "$_mx_id" ] || _mx_why="it is not owned by the ssh user"
+    case "$_mx_dm" in
+        ????????w*) _mx_why="${_mx_why:+$_mx_why; }others can write to it" ;;
+    esac
+    if [ "$_mx_shared" != 1 ]; then
+        case "$_mx_dm" in
+            ?????w*) _mx_why="${_mx_why:+$_mx_why; }its group can write to it" ;;
+        esac
+    fi
+    [ -n "$_mx_why" ] || return 0
+    _mx_bad="$1 is owned by $_mx_dn (uid $_mx_du), mode $_mx_dm; the ssh user is uid $_mx_id: $_mx_why"
+    return 1
+}
+"""
+
+REFUSED_HOW = ("mx will not deploy to it, run from it, stop what it names "
+               "or clean it: remove it, chmod go-w it, or pick another "
+               "--remote-dir (a group-shared one needs "
+               "--allow-shared-remote-dir)")
+
+
+def _dir_path(rdir):
+    """--remote-dir with any trailing slash dropped: `link/` names the
+    directory a symlink points to, and it is the link that is checked."""
+    return rdir.rstrip("/") or rdir
+
+
+def _dir_guard(fleet, create=False):
+    """Shell that refuses this host's --remote-dir unless it is safe to use
+    (`DIR_CHECK_FN`), printing one REFUSED line naming the directory, its
+    owner and its mode, and exiting 1 so nothing after it runs. With
+    `create`, a directory that does not exist yet is made first, mode 700
+    (its missing parents get the login shell's umask)."""
+    d = shlex.quote(_dir_path(fleet.dir))
+    s = DIR_CHECK_FN + "_mx_shared=%s\n" % ("1" if fleet.shared else "0")
+    if create:
+        s += ("if [ ! -e %s ] && [ ! -L %s ]; then\n"
+              "    mkdir -p -m 700 -- %s || { echo 'could not create "
+              "--remote-dir'; exit 1; }\n"
+              "fi\n" % (d, d, d))
+    s += ("_mx_dir_check %s || { echo \"REFUSED: --remote-dir $_mx_bad. "
+          "%s\"; exit 1; }\n" % (d, REFUSED_HOW))
+    return s
+
+
+# What deploy copies into: a directory of mx's own inside --remote-dir,
+# made private, whose contents are then renamed over the real names. scp
+# follows a symlink at the name it writes to, so a symlink planted at
+# mx.py (possible in a group-shared directory) would have it overwrite the
+# file the link points to; rm -f then mv replaces the link instead. A
+# glob, so it goes in unquoted; `clean` removes any a cut-short deploy left.
+STAGE_PREFIX = ".mx-stage."
+STAGE_GLOB = ".mx-stage.*"   # a leading dot only an explicit "." matches
+
+
+def _deploy(fleet, host, local_paths):
+    """Copy `local_paths` into --remote-dir on `host`, making the directory
+    if need be, each under its own basename. Returns (rc, error text)."""
+    stage = STAGE_PREFIX + "%d.%s" % (os.getpid(), os.urandom(4).hex())
+    names = [os.path.basename(p) for p in local_paths]
+    d = shlex.quote(_dir_path(fleet.dir))
+    rc, out = fleet.sh(host, _dir_guard(fleet, create=True)
+                       + "cd %s && mkdir -m 700 -- %s\n" % (d, stage))
+    if rc != 0:
+        return rc, out if out.startswith("REFUSED") else "mkdir failed: %s" % out
+    rc, out = fleet.push(host, local_paths, stage + "/")
+    if rc != 0:
+        fleet.sh(host, _dir_guard(fleet) + "cd %s && rm -rf -- %s\n"
+                 % (d, stage))
+        return rc, "copy failed: %s" % out
+    moves = " && ".join("rm -f -- %s && mv -f -- %s/%s %s"
+                        % (shlex.quote(n), stage, shlex.quote(n),
+                           shlex.quote(n)) for n in names)
+    rc, out = fleet.sh(host, _dir_guard(fleet) + "cd %s && %s && rmdir -- %s\n"
+                       % (d, moves, stage))
+    if rc != 0:
+        fleet.sh(host, _dir_guard(fleet) + "cd %s && rm -rf -- %s\n"
+                 % (d, stage))
+        return rc, out if out.startswith("REFUSED") else "copy failed: %s" % out
+    return 0, ""
 
 
 def _kill_block(rdir):
@@ -3476,7 +3592,7 @@ def _disk_prep_script(fleet, flags):
     """Shell that has the agent write its data file, or find it written,
     with the --disk-size the agent itself will be started with."""
     size = _flag_value(flags, "--disk-size")
-    return ("cd %s && %s %s agent --prepare-disk%s"
+    return _dir_guard(fleet) + ("cd %s && %s %s agent --prepare-disk%s"
             % (shlex.quote(fleet.dir), shlex.quote(fleet.python),
                os.path.basename(_agent_source()),
                " --disk-size %s" % shlex.quote(size) if size else ""))
@@ -3515,13 +3631,8 @@ def cmd_start(args, started=None):
         matrix_src, staged, tmpdir = _stage_matrix(fleet, args, m)
 
         def deploy(host):
-            rc, out = fleet.sh(host, "mkdir -p %s" % shlex.quote(fleet.dir))
-            if rc != 0:
-                return rc, "mkdir failed: %s" % out
-            rc, out = fleet.push(host, [agent_src, matrix_src])
-            if rc != 0:
-                return rc, "copy failed: %s" % out
-            return 0, "deployed"
+            rc, out = _deploy(fleet, host, [agent_src, matrix_src])
+            return (rc, out) if rc != 0 else (0, "deployed")
 
         try:
             if fleet.each(deploy, "deploying agent + matrix", quiet=True):
@@ -3539,8 +3650,9 @@ def cmd_start(args, started=None):
         # the agents running out of this directory: the pid file alone let
         # a second start launch a second agent beside the first (MX-007).
         # The lock makes the check and the launch one step, so two starts
-        # at once cannot both find nothing running.
-        script = OURS_FN + """
+        # at once cannot both find nothing running. The directory is checked
+        # again first: what runs is what is in it now (MX-006).
+        script = _dir_guard(fleet) + OURS_FN + """
 d={d}
 cd "$d" 2>/dev/null || {{ echo 'not deployed (drop --no-deploy)'; exit 1; }}
 r=$(pwd -P)
@@ -3679,7 +3791,8 @@ def cmd_reload(args):
         seen = {}
 
         def probe(host):
-            rc, out = fleet.sh(host, _probe_block(fleet.dir))
+            rc, out = fleet.sh(host, _dir_guard(fleet)
+                               + _probe_block(fleet.dir))
             seen[host] = _parse_stamp(out)
             return (rc, "" if rc == 0 else out)
 
@@ -3730,15 +3843,12 @@ def cmd_reload(args):
 
         def apply(host):
             flags = shlex.split(seen[host].get("flags", ""))
-            rc, out = fleet.sh(host, "mkdir -p %s" % shlex.quote(fleet.dir))
-            if rc != 0:
-                return rc, "mkdir failed: %s" % out
             # Only hosts that are about to restart get the new file: leaving
             # an untouched host's copy alone keeps what is on its disk and
             # what its agent holds in memory the same thing.
-            rc, out = fleet.push(host, [agent_src, matrix_src])
+            rc, out = _deploy(fleet, host, [agent_src, matrix_src])
             if rc != 0:
-                return rc, "copy failed: %s" % out
+                return rc, out
             if staged.disk != "off":
                 # While the old agent still runs: an edit that turns --disk
                 # on should not leave this host writing its file after the
@@ -3752,7 +3862,7 @@ def cmd_reload(args):
             # a reload is one run continuing under an edited matrix, and the
             # reporter appends, so the history either side of the edit stays
             # in one file for `summarize --window` to scope.
-            script = _stop_pid_block(fleet.dir) + """
+            script = _dir_guard(fleet) + _stop_pid_block(fleet.dir) + """
 {cmd}
 agent_pid=$!
 echo "$agent_pid" > {pid}
@@ -3787,7 +3897,7 @@ fi
 def cmd_status(args):
     m = load_matrix(args.matrix)
     fleet = Fleet(m, args)
-    script = OURS_FN + """
+    script = _dir_guard(fleet) + OURS_FN + """
 d={d}
 [ -d "$d" ] || {{ echo NOT-DEPLOYED; exit 0; }}
 cd "$d"
@@ -3826,7 +3936,7 @@ fi
 def _stop_hosts(fleet, hosts=None, label="stopping agents"):
     """Stop the agents on `hosts` (every host, by default); returns the
     number of hosts that failed."""
-    script = _kill_block(fleet.dir) + """
+    script = _dir_guard(fleet) + _kill_block(fleet.dir) + """
 if [ "$status" = unscoped ]; then echo {msg}; exit 1; fi
 echo "$status"
 """.format(msg=shlex.quote("pid file lost: " + UNSCOPED))
@@ -3895,11 +4005,13 @@ def _clean_block(rdir):
       and everything else in it are kept, and clean fails with a LEFTOVER line
       naming them. So does a directory rmdir cannot remove for another reason,
       such as a mount point (EBUSY).
-    - A symlink is followed to delete mx's files, and then kept, with the
-      directory it points to: mx makes neither (start's `mkdir -p` cannot
-      make a symlink), so they are the user's. Trailing slashes are dropped
-      first, so `link/` is seen as the link it is.
-    - Something that is not a directory is not mx's, and is left alone.
+    - A staging directory a cut-short deploy left (`STAGE_GLOB`) goes too.
+    - `cmd_clean` puts `_dir_guard` in front of this, so a symlink, or
+      something that is not a directory, is refused before anything here
+      runs (MX-006). The branches below for them stay as a second line: a
+      symlink is followed to delete mx's files, and then kept, with the
+      directory it points to; something that is not a directory is left
+      alone. Trailing slashes are dropped first, so `link/` is the link.
     - An mx file clean could not delete (a directory by that name, say) fails
       with a LEFTOVER line too: mx's own trace is not gone.
 
@@ -3907,7 +4019,7 @@ def _clean_block(rdir):
     it (`unscoped`): it is the only trace left of whose agent that is.
     """
     own = " ".join(shlex.quote(n) for n in _own_files())
-    return _kill_block(rdir.rstrip("/") or rdir) + """
+    return _kill_block(_dir_path(rdir)) + """
 if [ "$status" = unscoped ]; then echo {msg}; exit 1; fi
 if [ ! -d "$d" ]; then
     if [ -e "$d" ] || [ -L "$d" ]; then
@@ -3920,8 +4032,9 @@ fi
 (
     cd "$d" || exit 1
     rm -f -- {own} {tmp} 2>/dev/null
+    rm -rf -- {stage} 2>/dev/null
     left=""
-    for f in {own} {tmp}; do
+    for f in {own} {tmp} {stage}; do
         if [ -e "$f" ] || [ -L "$f" ]; then left="$left $f"; fi
     done
     [ -z "$left" ] || {{ echo "LEFTOVER: could not delete$left in $d"; exit 1; }}
@@ -3951,7 +4064,8 @@ if ! err=$(rmdir "$d" 2>&1); then
 fi
 if [ -e "$d" ]; then echo "LEFTOVER: $d still exists"; exit 1; fi
 echo "clean (was: $status)"
-""".format(msg=shlex.quote("LEFTOVER: " + UNSCOPED), own=own, tmp=DISK_TMP)
+""".format(msg=shlex.quote("LEFTOVER: " + UNSCOPED), own=own, tmp=DISK_TMP,
+           stage=STAGE_GLOB)
 
 
 def cmd_clean(args):
@@ -3969,7 +4083,7 @@ def cmd_clean(args):
         if reply.strip().lower() != "yes":
             log("[mx] nothing done")
             return 1
-    script = _clean_block(fleet.dir)
+    script = _dir_guard(fleet) + _clean_block(fleet.dir)
     failed = fleet.each(lambda h: fleet.sh(h, script), "removing mx's files")
     if failed:
         return 1
@@ -5515,7 +5629,9 @@ extra="; disk_free=$((${{kb:-0}} / 1048576))G$low"
     # agent_running is about this --remote-dir's agent: by its pid file, as
     # `status` does, or with that lost by its working directory. Another
     # matrix's agent on the same host does not make this one busy.
-    script = OURS_FN + """
+    # The --remote-dir is checked as start will check it (MX-006), so a host
+    # whose directory start would refuse is not called ready.
+    script = OURS_FN + DIR_CHECK_FN + """
 extra=""{disk}
 py=$({py} -V 2>&1 || echo 'MISSING python')
 d={d}
@@ -5536,14 +5652,20 @@ low=""
 [ "$fds" != unlimited ] && [ "$fds" -lt {need} ] 2>/dev/null \
     && low=" FDS-TOO-LOW(need>{need})"
 echo "$py; cores=$(nproc 2>/dev/null || echo ?); nofile_hard=$fds$low; agent_running=$running$extra"
+_mx_shared={shared}
+_mx_dir_check {dp} || {{ echo "REFUSED: --remote-dir $_mx_bad. {how}"; exit 1; }}
 """.format(py=shlex.quote(fleet.python), need=need_fds,
-           disk=disk_check, d=shlex.quote(fleet.dir), pid=PID_NAME)
+           disk=disk_check, d=shlex.quote(fleet.dir), pid=PID_NAME,
+           shared="1" if fleet.shared else "0",
+           dp=shlex.quote(_dir_path(fleet.dir)), how=REFUSED_HOW)
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
                         "checking hosts (ssh + python + fd limit)")
     if failed:
-        log("[mx] fix ssh/python on those hosts first: key-based ssh must work "
-            "non-interactively (ssh-copy-id) and `%s` must exist." % fleet.python)
+        log("[mx] fix those hosts first: key-based ssh must work "
+            "non-interactively (ssh-copy-id), `%s` must exist, and a "
+            "--remote-dir marked REFUSED must be the ssh user's own."
+            % fleet.python)
         return 1
     if need_fds > 512:
         log("[mx] every peer is one socket (~%d per agent here, more with "
@@ -5746,6 +5868,13 @@ def _add_fleet_flags(p):
                    help="working directory on each host: `mx clean` deletes "
                         "mx's files in it, then the directory if nothing else "
                         "is left (default: %(default)s)")
+    p.add_argument("--allow-shared-remote-dir", action="store_true",
+                   default=_env("MX_ALLOW_SHARED_REMOTE_DIR", "") == "1",
+                   help="let --remote-dir be group-writable, for a directory "
+                        "a group shares on purpose. Without it a --remote-dir "
+                        "that is a symlink, is not the ssh user's, or that "
+                        "group or others can write to is refused on that "
+                        "host; this lifts the group-write check only")
     p.add_argument("--python", default=_env("MX_PYTHON", "python3"),
                    help="python on the hosts (default: %(default)s)")
     p.add_argument("--ssh", default=_env("MX_SSH", "ssh"), help=argparse.SUPPRESS)
